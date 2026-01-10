@@ -191,8 +191,9 @@ class Trainer:
 
                 B, T, _ = current_states.shape
 
-                # 使用预构建的图（在GPU上）
+                # 将图数据传输到GPU（在CPU worker进程构建）
                 graph_data = batch['graph_data']
+                graph_data = graph_data.to(self.device)
 
                 # 通过GNN提取特征
                 gnn_output_dict = model.risk_gnn(

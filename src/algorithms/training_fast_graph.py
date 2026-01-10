@@ -41,7 +41,8 @@ class FastGraphBuilder:
         positions: torch.Tensor,      # [B, 2] x, y
         velocities: torch.Tensor,     # [B, 2] vx, vy
         accelerations: torch.Tensor,  # [B, 2] ax, ay
-        lane_indices: torch.Tensor    # [B] lane_index
+        lane_indices: torch.Tensor,   # [B] lane_index
+        timestamps: torch.Tensor = None  # [B] timestamps (optional)
     ) -> Data:
         """
         GPU加速批量图构建
@@ -70,12 +71,16 @@ class FastGraphBuilder:
             )
 
         # ========== 1. 构建节点特征 [B, 9] ==========
+        # 如果没有提供timestamps，使用0填充
+        if timestamps is None:
+            timestamps = torch.zeros(B, device=self.device)
+
         node_features = torch.cat([
             positions,                        # [B, 2] x, y
             velocities,                       # [B, 2] vx, vy
             accelerations,                    # [B, 2] ax, ay
             lane_indices.unsqueeze(1).float(), # [B, 1] lane_index
-            torch.ones(B, 1, device=self.device)  # [B, 1] is_icv（训练时都为1）
+            timestamps.unsqueeze(1).float()    # [B, 1] timestamp (归一化时间)
         ], dim=1)  # [B, 9]
 
         # ========== 2. GPU加速：计算距离矩阵 [B, B] ==========
@@ -197,17 +202,23 @@ class FastGraphBuilder:
         return edge_index[:, selected_indices], edge_attr[selected_indices]
 
 
-def create_collate_fn_with_fast_graph(device: str = 'cuda'):
+class FastGraphCollate:
     """
-    创建带有快速图构建的collate函数
+    可序列化的Collate类 - 用于Windows多进程DataLoader
 
-    在DataLoader的多进程中使用，提前构建图结构
+    关键：
+    - 必须可pickle才能在Windows多进程中工作
+    - 在CPU上构建图，然后传输到GPU
     """
-    fast_builder = FastGraphBuilder(device=device)
 
-    def collate_fn(batch_list: List[Dict]):
+    def __init__(self, device: str = 'cuda'):
+        self.device = device
+        # 在CPU上构建图（worker进程只有CPU）
+        self.graph_builder = FastGraphBuilder(device='cpu')
+
+    def __call__(self, batch_list: List[Dict]) -> Dict:
         """
-        优化的collate函数 - 快速构建图
+        处理一个batch的数据（在CPU worker进程中进行）
         """
         batch_size = len(batch_list)
 
@@ -220,7 +231,7 @@ def create_collate_fn_with_fast_graph(device: str = 'cuda'):
         B, T, _ = all_current.shape
 
         # 提取最后一步状态
-        last_position = all_current[:, -1, 0:2]  # [B, 2] x, y（注意：这里取2维）
+        last_position = all_current[:, -1, 0:2]  # [B, 2] x, y
         if last_position.shape[1] == 1:
             # 如果只有1维，补充y=0
             last_position = np.concatenate([
@@ -231,6 +242,7 @@ def create_collate_fn_with_fast_graph(device: str = 'cuda'):
         last_speed = all_current[:, -1, 1:2]      # [B, 1] vx
         last_accel = all_current[:, -1, 2:3]     # [B, 1] ax
         last_lanes = all_lanes[:, -1]            # [B]
+        last_timestamps = all_timestamps[:, -1]  # [B] - 最后一步的时间戳
 
         # 构造velocity和acceleration（2维）
         velocities = np.concatenate([
@@ -243,21 +255,26 @@ def create_collate_fn_with_fast_graph(device: str = 'cuda'):
             np.zeros((B, 1))  # ay = 0
         ], axis=1)
 
-        # 转换为tensor
-        positions = torch.from_numpy(last_position).float()  # [B, 2]
-        velocities = torch.from_numpy(velocities).float()    # [B, 2]
-        accelerations = torch.from_numpy(accelerations).float()  # [B, 2]
-        lane_indices = torch.from_numpy(last_lanes).long()   # [B]
+        # 转换为CPU tensor（worker进程只能访问CPU）
+        positions = torch.from_numpy(last_position).float()  # [B, 2] - CPU
+        velocities = torch.from_numpy(velocities).float()    # [B, 2] - CPU
+        accelerations = torch.from_numpy(accelerations).float()  # [B, 2] - CPU
+        lane_indices = torch.from_numpy(last_lanes).long()   # [B] - CPU
+        timestamps = torch.from_numpy(last_timestamps).float()  # [B] - CPU
 
-        # 🔥 使用快速图构建器（GPU加速）
-        graph_data = fast_builder.build_batch_graph_fast(
+        # 归一化时间戳（除以最大时间360秒）
+        timestamps_normalized = timestamps / 360.0
+
+        # 🔥 使用快速图构建器（在CPU上构建）
+        graph_data = self.graph_builder.build_batch_graph_fast(
             positions=positions,
             velocities=velocities,
             accelerations=accelerations,
-            lane_indices=lane_indices
+            lane_indices=lane_indices,
+            timestamps=timestamps_normalized
         )
 
-        # 准备其他数据
+        # 准备其他数据（CPU tensor）
         current_tensor = torch.from_numpy(all_current).float()
         future_tensor = torch.from_numpy(all_future).float()
 
@@ -268,43 +285,12 @@ def create_collate_fn_with_fast_graph(device: str = 'cuda'):
             'batch_size': batch_size
         }
 
-    return collate_fn
 
+# 保留向后兼容的函数
+def create_collate_fn_with_fast_graph(device: str = 'cuda'):
+    """
+    创建带有快速图构建的collate函数
 
-# ========== 性能测试 ==========
-if __name__ == "__main__":
-    print("🚀 快速图构建器性能测试")
-
-    # 测试数据
-    B = 512  # batch size
-    positions = torch.randn(B, 2).cuda() * 100  # [B, 2]
-    velocities = torch.randn(B, 2).cuda() * 10  # [B, 2]
-    accelerations = torch.randn(B, 2).cuda() * 2  # [B, 2]
-    lane_indices = torch.randint(0, 5, (B,)).cuda()  # [B]
-
-    # 测试快速构建
-    builder = FastGraphBuilder(device='cuda')
-
-    # 预热
-    for _ in range(10):
-        graph = builder.build_batch_graph_fast(
-            positions, velocities, accelerations, lane_indices
-        )
-
-    # 测试
-    torch.cuda.synchronize()
-    start = time.time()
-
-    for _ in range(100):
-        graph = builder.build_batch_graph_fast(
-            positions, velocities, accelerations, lane_indices
-        )
-
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
-
-    print(f"✅ 构建图 100 次耗时: {elapsed:.3f}s")
-    print(f"   平均每次: {elapsed/100*1000:.2f}ms")
-    print(f"   吞吐量: {B/elapsed*100:.0f} nodes/s")
-    print(f"   节点数: {graph.x.size(0)}")
-    print(f"   边数: {graph.edge_index.size(1)}")
+    注意：返回一个类实例而不是嵌套函数，确保可pickle
+    """
+    return FastGraphCollate(device=device)
