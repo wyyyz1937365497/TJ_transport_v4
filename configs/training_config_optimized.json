@@ -55,6 +55,7 @@
     "warmup_epochs": 5,
     "phase1_model_path": "models/world_model_phase1.pth",
     "use_mixed_precision": true,
+    "use_fast_graph": true,
     "accumulate_grad_batches": 1
   },
   "phase2": {

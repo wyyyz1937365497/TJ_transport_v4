@@ -16,7 +16,6 @@ import shutil
 
 from ..models import TrafficController, create_model_from_config, WorldModelLoss
 from ..env import SumoEnvironment, EfficientDataCollector, TrajectoryDataset, collect_parallel_data_optimized
-from ..utils.multi_gpu import setup_multi_gpu_training, adjust_hyperparameters_for_multi_gpu, print_gpu_info, monitor_gpu_usage
 
 
 class Trainer:
@@ -67,24 +66,8 @@ class Trainer:
         print("🔄 阶段1：世界模型预训练")
         print("="*70)
 
-        # 打印GPU信息并设置多GPU训练
-        print_gpu_info()
-
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        if num_gpus > 1:
-            print(f"\n🚀 检测到 {num_gpus} 张GPU，启用多GPU训练")
-            model = setup_multi_gpu_training(model)
-
-            # 调整超参数
-            phase1_config = {
-                'batch_size': batch_size,
-                'lr': learning_rate
-            }
-            adjusted_config = adjust_hyperparameters_for_multi_gpu(phase1_config, num_gpus)
-            batch_size = adjusted_config['batch_size']
-            learning_rate = adjusted_config['lr']
-        else:
-            model = model.to(self.device)
+        # 设置模型
+        model = model.to(self.device)
 
         start_time = time.time()
 
@@ -132,58 +115,46 @@ class Trainer:
 
         # 数据加载配置优化（充分利用大batch size）
         num_workers = self.config.get('phase1', {}).get('num_parallel_workers', 8)
+
+        # 🔥 使用快速图构建器（GPU加速，保持完整边信息）
+        print(f"   🚀 使用快速图构建器（GPU加速，完整边信息）")
+        from .training_fast_graph import create_collate_fn_with_fast_graph
+        collate_fn = create_collate_fn_with_fast_graph(device=str(self.device))
+
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,           # 启用pin_memory加速传输
-            persistent_workers=True,   # 保持worker进程，避免重复创建
-            prefetch_factor=4 if num_workers > 0 else None,  # 预取更多batch
-            drop_last=True  # 确保batch大小一致
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            drop_last=True,
+            collate_fn=collate_fn
         )
-        print(f"   - 数据加载: {num_workers} workers, prefetch_factor=4, pin_memory=True")
+        print(f"   - 数据加载: {num_workers} workers, prefetch_factor=4")
 
-        # 3. 设置模型（已经设置过多GPU了，不需要再.to(device)）
-        # 注意：DataParallel包装后需要通过.module访问原始模型
-        model_to_use = model.module if hasattr(model, 'module') else model
-        model_to_use.set_world_model_phase(1)
+        # 设置模型
+        model.set_world_model_phase(1)
+        model.freeze_component('controller')
+        model.freeze_component('safety')
 
-        # 冻结其他组件，只训练世界模型
-        model_to_use.freeze_component('controller')
-        model_to_use.freeze_component('safety')
-
-        # 4. 优化器和损失
-        # 注意：需要通过.module访问模型的参数
-        actual_model = model.module if hasattr(model, 'module') else model
-
+        # 优化器
         optimizer = torch.optim.AdamW(
-            actual_model.world_model.parameters(),
+            model.world_model.parameters(),
             lr=learning_rate,
             weight_decay=1e-5
         )
 
         criterion = nn.MSELoss()
 
-        # 🔥 修复DataParallel问题：不使用DataParallel处理变长图数据
-        # DataParallel无法处理不同GPU返回不同shape的张量
-        # 对于变长图数据（不同batch中车辆数量不同），使用单GPU训练
-        if hasattr(model, 'module') and num_gpus > 1:
-            print(f"\n⚠️  检测到 {num_gpus} 张GPU，但由于图数据维度可变，")
-            print(f"   WorldModel将使用单GPU训练（避免DataParallel的shape不匹配问题）")
-            # 解包模型，使用单GPU
-            model = actual_model
-            model = model.to(self.device)
-
-        wrapped_world_model = actual_model.world_model
-
-        # 5. 设置混合精度训练（节省显存，加速训练）
+        # 混合精度训练
         use_amp = self.config.get('phase1', {}).get('use_mixed_precision', False)
         scaler = torch.cuda.amp.GradScaler() if use_amp else None
         if use_amp:
-            print(f"\n🔥 已启用混合精度训练（FP16）- 显存节省约40%")
+            print(f"\n🔥 已启用混合精度训练（FP16）")
 
-        # 6. 学习率调度器（warmup + cosine annealing）
+        # 学习率调度器（warmup + cosine annealing）
         warmup_epochs = self.config.get('phase1', {}).get('warmup_epochs', 5)
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
@@ -196,138 +167,60 @@ class Trainer:
             eta_min=learning_rate * 0.01
         )
 
-        # 7. 训练循环
+        # 训练循环
         best_loss = float('inf')
         phase1_history = []
 
         print(f"\n🏋️  开始训练 ({epochs} epochs)...")
-        print(f"   - Batch size: {batch_size} (充分利用GPU显存)")
-        print(f"   - 学习率: {learning_rate:.6f} (已针对大batch优化)")
+        print(f"   - Batch size: {batch_size}")
+        print(f"   - 学习率: {learning_rate:.6f}")
         print(f"   - 总样本数: {len(dataset)}")
         print(f"   - Warmup epochs: {warmup_epochs}")
-        print(f"   - 梯度裁剪: {self.config.get('phase1', {}).get('gradient_clip', 1.0)}")
 
         for epoch in range(epochs):
             epoch_start = time.time()
-            actual_model.world_model.train()
+            model.world_model.train()
 
             total_loss = 0
             num_batches = 0
 
             for batch_idx, batch in enumerate(dataloader):
-                # ========== 🔥 关键优化：异步GPU传输 ==========
-                # 使用non_blocking=True让CPU和GPU并行工作，大幅提升GPU利用率
-
-                current_states = batch['current'].to(self.device, non_blocking=True)  # [B, T, 3]
-                future_states = batch['future'].to(self.device, non_blocking=True)    # [B, T_future, 3]
-
-                # 提取车道和时间信息
-                current_lane_indices = batch['current_lane_indices']
-                current_timestamps = batch['current_timestamps']
+                # 异步GPU传输
+                current_states = batch['current'].to(self.device, non_blocking=True)
+                future_states = batch['future'].to(self.device, non_blocking=True)
 
                 B, T, _ = current_states.shape
 
-                # ========== 优化：在GPU上快速提取特征 ==========
-                # 1. 从当前状态序列中提取最后一步的状态
-                current_position = current_states[:, -1, 0:1]  # [B, 1]
-                current_speed = current_states[:, -1, 1:2]     # [B, 1]
-                current_accel = current_states[:, -1, 2:3]     # [B, 1]
+                # 使用预构建的图（在GPU上）
+                graph_data = batch['graph_data']
 
-                # 2. 提取车道和时间信息
-                if isinstance(current_lane_indices, np.ndarray):
-                    current_lane_indices = torch.from_numpy(current_lane_indices[:, -1]).long().to(self.device, non_blocking=True)
-                elif torch.is_tensor(current_lane_indices):
-                    current_lane_indices = current_lane_indices[:, -1].to(self.device, non_blocking=True)
-                else:
-                    current_lane_indices = torch.zeros(B, dtype=torch.long, device=self.device)
-
-                if isinstance(current_timestamps, np.ndarray):
-                    current_time = torch.from_numpy(current_timestamps[:, -1]).float().to(self.device, non_blocking=True)
-                elif torch.is_tensor(current_timestamps):
-                    current_time = current_timestamps[:, -1].to(self.device, non_blocking=True)
-                else:
-                    current_time = torch.zeros(B, device=self.device)
-
-                # 归一化时间
-                current_time_normalized = current_time / 360.0  # [B]
-
-                # 3. 计算序列统计特征（GPU并行计算）
-                position_std = current_states[:, :, 0].std(dim=1, keepdim=True)  # [B, 1]
-                speed_std = current_states[:, :, 1].std(dim=1, keepdim=True)     # [B, 1]
-                accel_std = current_states[:, :, 2].std(dim=1, keepdim=True)     # [B, 1]
-
-                # 4. 🔥 关键优化：直接使用node_features，跳过CPU图构建
-                # 原代码在CPU上构建图（非常慢），现在直接在GPU上构造节点特征
-                node_features = torch.cat([
-                    current_position,                           # [B, 1]
-                    torch.zeros_like(current_position),         # [B, 1] y位置
-                    current_speed,                              # [B, 1]
-                    current_accel,                              # [B, 1]
-                    current_lane_indices.unsqueeze(1).float(),  # [B, 1]
-                    position_std,                               # [B, 1]
-                    speed_std,                                  # [B, 1]
-                    accel_std,                                  # [B, 1]
-                    current_time_normalized.unsqueeze(1)        # [B, 1]
-                ], dim=1)  # [B, 9]
-
-                # 5. 简化图结构：使用完整连接图或基于距离的边
-                # 注意：由于每个样本是独立的车辆，我们可以简化图构建
-                actual_model = model.module if hasattr(model, 'module') else model
-
-                # ========== 🔥 优化：跳过耗时的CPU图构建 ==========
-                # 原代码的graph_builder.build_graph()在CPU上运行，是主要瓶颈
-                # 优化方案：直接使用node_features，不构建复杂的边关系
-                # 这样可以保持90%+的GPU利用率
-
-                # 创建简化的图数据（在GPU上）
-                from torch_geometric.data import Data
-                graph_data_list = []
-                for i in range(B):
-                    graph_data_list.append(Data(
-                        x=node_features[i:i+1],  # [1, 9]
-                        edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device),
-                        edge_attr=torch.empty((0, 4), dtype=torch.float32, device=self.device)
-                    ))
-
-                from torch_geometric.data import Batch as PyGBatch
-                graph_data = PyGBatch.from_data_list(graph_data_list)
-
-                # 6. 通过GNN提取特征
-                # 注意：图已经在GPU上，不需要再次传输
-                gnn_output_dict = actual_model.risk_gnn(
-                    node_features=graph_data.x,         # 已在GPU上
-                    edge_index=graph_data.edge_index,   # 已在GPU上
-                    edge_features=graph_data.edge_attr, # 已在GPU上
+                # 通过GNN提取特征
+                gnn_output_dict = model.risk_gnn(
+                    node_features=graph_data.x,
+                    edge_index=graph_data.edge_index,
+                    edge_features=graph_data.edge_attr,
                     batch=graph_data.batch
                 )
 
-                # GNN返回字典：{'node_embedding': ..., 'global_embedding': ..., 'risk_weights': ...}
-                # 提取节点嵌入用于世界模型
-                gnn_embedding = gnn_output_dict['node_embedding']  # [num_nodes, gnn_output_dim=256]
+                gnn_embedding = gnn_output_dict['node_embedding']
 
-                # 7. 通过WorldModel预测未来状态
-                predictions = wrapped_world_model(gnn_embedding)
+                # 通过WorldModel预测
+                predictions = model.world_model(gnn_embedding)
                 next_state_pred = predictions['next_state']
 
-                # 8. 计算损失（所有数据已在GPU上，无需传输）
-                # 未来状态: [B, T_future, 3]
-                future_position = future_states[:, 0, 0:1]  # [B, 1] 已在GPU
-                future_speed = future_states[:, 0, 1:2]     # [B, 1]
-                future_accel = future_states[:, 0, 2:3]     # [B, 1]
+                # 计算损失
+                future_position = future_states[:, 0, 0:1]
+                future_speed = future_states[:, 0, 1:2]
+                future_accel = future_states[:, 0, 2:3]
+                future_state = torch.cat([future_position, future_speed, future_accel], dim=1)
 
-                # 将未来状态拼接为 [B, 3]
-                future_state = torch.cat([future_position, future_speed, future_accel], dim=1)  # [B, 3]
-
-                # 预测状态需要与未来状态对齐
                 if next_state_pred.dim() == 2 and next_state_pred.size(1) == 256:
                     if not hasattr(self, 'state_projection'):
                         self.state_projection = nn.Linear(256, 3).to(self.device)
-
-                    pred_state = self.state_projection(next_state_pred)  # [B, 3]
+                    pred_state = self.state_projection(next_state_pred)
                 else:
-                    pred_state = next_state_pred  # [B, 3]
+                    pred_state = next_state_pred
 
-                # 计算MSE损失
                 loss = criterion(pred_state, future_state)
 
                 # 反向传播（支持混合精度）
@@ -337,12 +230,12 @@ class Trainer:
                 if use_amp and scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=gradient_clip)
+                    torch.nn.utils.clip_grad_norm_(model.world_model.parameters(), max_norm=gradient_clip)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=gradient_clip)
+                    torch.nn.utils.clip_grad_norm_(model.world_model.parameters(), max_norm=gradient_clip)
                     optimizer.step()
 
                 total_loss += loss.item()
@@ -371,17 +264,11 @@ class Trainer:
             print(f"   Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | LR: {current_lr:.2e} | "
                   f"Time: {epoch_time:.2f}s | Throughput: {throughput:.0f} samples/s")
 
-            # 定期显示GPU使用情况
-            if num_gpus > 1 and (epoch + 1) % 5 == 0:
-                monitor_gpu_usage()
-
             # 保存最佳模型
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 checkpoint_path = os.path.join(self.checkpoint_dir, 'world_model_phase1.pth')
-
-                # 保存时使用 actual_model（已经是解包后的）
-                actual_model.save_checkpoint(checkpoint_path, epoch, optimizer.state_dict())
+                model.save_checkpoint(checkpoint_path, epoch, optimizer.state_dict())
 
         # 保存历史
         self.history['phase1'] = phase1_history
