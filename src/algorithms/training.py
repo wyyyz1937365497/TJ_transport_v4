@@ -16,6 +16,7 @@ import shutil
 
 from ..models import TrafficController, create_model_from_config, WorldModelLoss
 from ..env import SumoEnvironment, EfficientDataCollector, TrajectoryDataset, collect_parallel_data_optimized
+from ..utils.multi_gpu import setup_multi_gpu_training, adjust_hyperparameters_for_multi_gpu, print_gpu_info, monitor_gpu_usage
 
 
 class Trainer:
@@ -57,6 +58,25 @@ class Trainer:
         print("🔄 阶段1：世界模型预训练")
         print("="*70)
 
+        # 打印GPU信息并设置多GPU训练
+        print_gpu_info()
+
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        if num_gpus > 1:
+            print(f"\n🚀 检测到 {num_gpus} 张GPU，启用多GPU训练")
+            model = setup_multi_gpu_training(model)
+
+            # 调整超参数
+            phase1_config = {
+                'batch_size': batch_size,
+                'lr': learning_rate
+            }
+            adjusted_config = adjust_hyperparameters_for_multi_gpu(phase1_config, num_gpus)
+            batch_size = adjusted_config['batch_size']
+            learning_rate = adjusted_config['lr']
+        else:
+            model = model.to(self.device)
+
         start_time = time.time()
 
         # 1. 收集数据（真正的并行处理）
@@ -97,21 +117,26 @@ class Trainer:
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,  # Windows兼容
-            pin_memory=False
+            num_workers=4 if num_gpus > 1 else 0,  # 多GPU时增加数据加载进程
+            pin_memory=True if num_gpus > 1 else False,  # 加速GPU数据传输
+            persistent_workers=True if num_gpus > 1 else False
         )
 
-        # 3. 设置模型
-        model.set_world_model_phase(1)
-        model.to(self.device)
+        # 3. 设置模型（已经设置过多GPU了，不需要再.to(device)）
+        # 注意：DataParallel包装后需要通过.module访问原始模型
+        model_to_use = model.module if hasattr(model, 'module') else model
+        model_to_use.set_world_model_phase(1)
 
         # 冻结其他组件，只训练世界模型
-        model.freeze_component('controller')
-        model.freeze_component('safety')
+        model_to_use.freeze_component('controller')
+        model_to_use.freeze_component('safety')
 
         # 4. 优化器和损失
+        # 注意：需要通过.module访问模型的参数
+        actual_model = model.module if hasattr(model, 'module') else model
+
         optimizer = torch.optim.AdamW(
-            model.world_model.parameters(),
+            actual_model.world_model.parameters(),
             lr=learning_rate,
             weight_decay=1e-5
         )
@@ -123,10 +148,13 @@ class Trainer:
         phase1_history = []
 
         print(f"\n🏋️  开始训练 ({epochs} epochs)...")
+        print(f"   - Batch size: {batch_size} (已为{num_gpus}GPU优化)")
+        print(f"   - 学习率: {learning_rate:.6f} (已为{num_gpus}GPU优化)")
+        print(f"   - 总样本数: {len(dataset)}")
 
         for epoch in range(epochs):
             epoch_start = time.time()
-            model.world_model.train()
+            actual_model.world_model.train()
 
             total_loss = 0
             num_batches = 0
@@ -142,22 +170,22 @@ class Trainer:
 
                 # 简化：假设GNN已经处理
                 # 实际应该先通过GNN，这里简化为直接嵌入
-                batch_size = x_current.size(0)
-                gnn_embedding = torch.randn(batch_size, 256, device=self.device)
+                batch_size_actual = x_current.size(0)
+                gnn_embedding = torch.randn(batch_size_actual, 256, device=self.device)
 
-                # 前向传播
-                predictions = model.world_model(gnn_embedding)
+                # 前向传播（使用actual_model）
+                predictions = actual_model.world_model(gnn_embedding)
                 next_state_pred = predictions['next_state']
 
                 # 计算损失（简化版）
                 # 将3维状态映射到256维
-                state_target = torch.randn(batch_size, 256, device=self.device)
+                state_target = torch.randn(batch_size_actual, 256, device=self.device)
                 loss = criterion(next_state_pred, state_target)
 
                 # 反向传播
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.world_model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 total_loss += loss.item()
@@ -172,13 +200,20 @@ class Trainer:
                 'time': epoch_time
             })
 
+            # 打印进度
             print(f"   Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s")
+
+            # 定期显示GPU使用情况
+            if num_gpus > 1 and (epoch + 1) % 5 == 0:
+                monitor_gpu_usage()
 
             # 保存最佳模型
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 checkpoint_path = os.path.join(self.checkpoint_dir, 'world_model_phase1.pth')
-                model.save_checkpoint(checkpoint_path, epoch, optimizer.state_dict())
+
+                # 保存时使用 actual_model（已经是解包后的）
+                actual_model.save_checkpoint(checkpoint_path, epoch, optimizer.state_dict())
 
         # 保存历史
         self.history['phase1'] = phase1_history

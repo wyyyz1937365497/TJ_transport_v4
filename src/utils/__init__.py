@@ -17,6 +17,13 @@ from .helpers import (
     save_checkpoint
 )
 
+from .multi_gpu import (
+    setup_multi_gpu_training,
+    adjust_hyperparameters_for_multi_gpu,
+    print_gpu_info,
+    monitor_gpu_usage
+)
+
 __all__ = [
     'setup_logging',
     'save_config',
@@ -29,5 +36,9 @@ __all__ = [
     'EarlyStopping',
     'AverageMeter',
     'load_checkpoint',
-    'save_checkpoint'
+    'save_checkpoint',
+    'setup_multi_gpu_training',
+    'adjust_hyperparameters_for_multi_gpu',
+    'print_gpu_info',
+    'monitor_gpu_usage'
 ]
