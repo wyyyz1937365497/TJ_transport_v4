@@ -1,0 +1,79 @@
+{
+  "device": "cuda",
+  "seed": 42,
+  "checkpoint_dir": "checkpoints",
+  "log_dir": "logs",
+
+  "environment": {
+    "sumo_cfg": "仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg",
+    "net_file": "仿真环境_初赛_1.0/仿真环境-初赛/net.xml",
+    "route_file": "仿真环境_初赛_1.0/仿真环境-初赛/routes.xml",
+    "step_length": 0.1,
+    "max_steps": 3600,
+    "control_ratio": 0.25,
+    "port": 8813,
+    "use_gui": false
+  },
+
+  "model": {
+    "node_dim": 9,
+    "edge_dim": 4,
+    "gnn_hidden_dim": 64,
+    "gnn_output_dim": 256,
+    "gnn_layers": 3,
+    "gnn_heads": 4,
+    "gnn_dropout": 0.1,
+
+    "world_hidden_dim": 128,
+    "future_steps": 5,
+    "world_dropout": 0.1,
+
+    "controller_hidden_dim": 128,
+    "global_dim": 16,
+    "action_dim": 2,
+    "top_k": 5,
+    "controller_dropout": 0.2,
+
+    "interaction_radius": 100.0,
+    "max_neighbors": 8,
+    "lane_change_distance": 50.0,
+
+    "ttc_threshold": 2.0,
+    "thw_threshold": 1.5,
+    "max_accel": 2.0,
+    "max_decel": -3.0,
+    "emergency_decel": -5.0,
+    "max_lane_change_speed": 5.0,
+
+    "cost_limit": 0.1,
+    "initial_lambda": 1.0,
+    "lambda_lr": 0.01
+  },
+
+  "phase1": {
+    "num_episodes": 20,
+    "epochs": 20,
+    "batch_size": 128,
+    "lr": 1e-4,
+    "weight_decay": 1e-5
+  },
+
+  "phase2": {
+    "num_envs": 2,
+    "total_timesteps": 10000,
+    "lr": 3e-4,
+    "gamma": 0.99,
+    "gae_lambda": 0.95
+  },
+
+  "phase3": {
+    "total_timesteps": 5000,
+    "cost_limit": 0.1,
+    "lr": 1e-4
+  },
+
+  "evaluation": {
+    "num_episodes": 5,
+    "output_dir": "results"
+  }
+}
