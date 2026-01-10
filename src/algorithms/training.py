@@ -497,47 +497,275 @@ class Trainer:
         self,
         model: TrafficController,
         total_timesteps: int = 50000,
-        cost_limit: float = 0.1,
-        learning_rate: float = 1e-4
+        learning_rate: float = 1e-5,
+        freeze_bn: bool = True
     ) -> TrafficController:
         """
-        阶段3：约束优化训练
+        阶段3：端到端微调
 
-        目标：平衡性能与成本
+        目标：联合优化所有组件（GNN + 世界模型 + 控制器）
+
+        Args:
+            model: 训练好的模型（来自Phase 2）
+            total_timesteps: 训练总步数
+            learning_rate: 学习率（使用较小的学习率进行微调，默认1e-5）
+            freeze_bn: 是否冻结BatchNorm（默认True）
+
+        Returns:
+            微调后的模型
         """
         print("\n" + "="*70)
-        print("🔄 阶段3：约束优化训练")
+        print("🔄 阶段3：端到端微调（所有组件联合优化）")
         print("="*70)
 
         start_time = time.time()
 
-        # 1. 加载阶段2权重
+        # 1. 加载Phase 2权重
         checkpoint_path = os.path.join(self.checkpoint_dir, 'ppo_phase2.pth')
         if os.path.exists(checkpoint_path):
             model.load_checkpoint(checkpoint_path)
-            print("✅ 已加载阶段2权重")
+            print("✅ 已加载Phase 2权重（PPO训练后的控制器）")
+        else:
+            print("⚠️  警告: 未找到Phase 2权重，使用当前模型")
 
-        # 2. 设置约束
-        model.cost_limit = cost_limit
+        # 2. 解冻所有组件进行端到端训练
+        print("\n🔓 解冻所有组件进行端到端训练...")
+        model.unfreeze_component('gnn')
+        model.unfreeze_component('world_model')
         model.unfreeze_component('controller')
+        print("   ✅ GNN: 可训练")
+        print("   ✅ World Model: 可训练")
+        print("   ✅ Controller: 可训练")
 
-        # 3. 优化器
+        # 3. 冻结BatchNorm层（如果需要）
+        if freeze_bn:
+            for module in model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                    module.eval()  # 保持eval模式
+            print("   ✅ BatchNorm: 已冻结（使用训练时的统计量）")
+
+        # 4. 创建优化器（所有参数）
+        # 使用较小的学习率进行微调，防止破坏预训练权重
         optimizer = torch.optim.Adam(
             model.parameters(),
-            lr=learning_rate
+            lr=learning_rate,
+            weight_decay=1e-5  # 添加权重衰减防止过拟合
         )
 
-        # 4. 训练
+        # 使用学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_timesteps,
+            eta_min=learning_rate * 0.01
+        )
+
+        print(f"\n📊 端到端微调配置:")
+        print(f"   - 总步数: {total_timesteps}")
+        print(f"   - 初始学习率: {learning_rate}")
+        print(f"   - 权重衰减: 1e-5")
+        print(f"   - 学习率调度: CosineAnnealing")
+        print(f"   - 可训练参数数: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
+        # 5. 创建环境
+        env_config = self.config.get('environment', {})
+        env = SumoEnvironment(env_config, use_gui=False)
+
+        # 6. 训练循环
         phase3_history = []
         timestep = 0
 
         episode_rewards = []
         episode_costs = []
+        episode_losses = []
 
+        print(f"\n🏋️  开始端到端微调...")
+
+        while timestep < total_timesteps:
+            episode_start = time.time()
+
+            # 重置环境
+            observation = env.reset()
+            done = False
+            episode_reward = 0
+            episode_cost = 0
+            episode_loss = 0
+            step = 0
+
+            # 存储轨迹
+            states = []
+            actions_list = []
+            rewards = []
+
+            while not done and timestep < total_timesteps:
+                # 准备batch
+                batch = self._prepare_batch(observation, env)
+
+                # 前向传播（不需要no_grad，因为要计算梯度）
+                output = model(batch)
+
+                # 获取动作
+                actions = {}
+                if output['selected_vehicle_ids']:
+                    safe_actions = output['safe_actions'].cpu().numpy()
+                    for i, veh_id in enumerate(output['selected_vehicle_ids']):
+                        actions[veh_id] = safe_actions[i]
+
+                # 执行动作
+                next_observation, reward, done, info = env.step(actions)
+
+                # 计算成本
+                cost = self._compute_cost(output, actions)
+
+                # 存储经验
+                states.append(batch)
+                actions_list.append(actions)
+                rewards.append(reward)
+
+                episode_reward += reward
+                episode_cost += cost
+
+                # 定期更新
+                if step % 32 == 0 and len(states) >= 16:
+                    # 端到端更新：更新所有组件
+                    loss = self._update_policy_e2e(model, optimizer, states, actions_list, rewards)
+                    episode_loss += loss
+                    # 更新学习率
+                    scheduler.step()
+
+                observation = next_observation
+                timestep += 1
+                step += 1
+
+                # 定期打印进度
+                if timestep % 1000 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"   Timestep {timestep}/{total_timesteps} | "
+                          f"Current LR: {current_lr:.2e} | "
+                          f"Reward: {episode_reward/(step+1):.3f}")
+
+            episode_rewards.append(episode_reward)
+            episode_costs.append(episode_cost)
+            episode_losses.append(episode_loss / max(step, 1))
+
+            episode_time = time.time() - episode_start
+
+            # 记录
+            phase3_history.append({
+                'episode': len(episode_rewards),
+                'reward': episode_reward,
+                'cost': episode_cost,
+                'loss': episode_losses[-1],
+                'timestep': timestep,
+                'time': episode_time,
+                'learning_rate': scheduler.get_last_lr()[0]
+            })
+
+            # 打印进度
+            if len(episode_rewards) % 10 == 0:
+                avg_reward = np.mean(episode_rewards[-10:])
+                avg_cost = np.mean(episode_costs[-10:])
+                avg_loss = np.mean(episode_losses[-10:])
+                print(f"   Episode {len(episode_rewards)} | "
+                      f"Avg Reward: {avg_reward:.3f} | "
+                      f"Avg Cost: {avg_cost:.4f} | "
+                      f"Avg Loss: {avg_loss:.6f} | "
+                      f"Timestep: {timestep}/{total_timesteps}")
+
+        # 保存端到端微调后的模型
+        e2e_checkpoint = os.path.join(self.checkpoint_dir, 'e2e_phase3.pth')
+        model.save_checkpoint(e2e_checkpoint, len(episode_rewards), optimizer.state_dict())
+        print(f"\n✅ 端到端微调模型已保存: {e2e_checkpoint}")
+
+        self.history['phase3'] = phase3_history
+
+        phase3_time = time.time() - start_time
+        print(f"\n✅ 阶段3完成! 耗时: {phase3_time/60:.2f} 分钟")
+        print(f"   总timesteps: {timestep}")
+        print(f"   最终奖励: {np.mean(episode_rewards[-10:]):.3f}")
+        print(f"   最终成本: {np.mean(episode_costs[-10:]):.4f}")
+        print(f"   最终损失: {np.mean(episode_losses[-10:]):.6f}")
+
+        env.close()
+
+        return model
+
+    def train_phase4(
+        self,
+        model: TrafficController,
+        total_timesteps: int = 30000,
+        cost_limit: float = 0.1,
+        learning_rate: float = 1e-4
+    ) -> TrafficController:
+        """
+        阶段4：约束优化训练
+
+        目标：平衡性能与成本（使用拉格朗日乘子法）
+
+        Args:
+            model: 端到端微调后的模型（来自Phase 3）
+            total_timesteps: 训练总步数
+            cost_limit: 成本上限
+            learning_rate: 学习率
+
+        Returns:
+            最终优化的模型
+        """
+        print("\n" + "="*70)
+        print("🔄 阶段4：约束优化训练（拉格朗日乘子法）")
+        print("="*70)
+
+        start_time = time.time()
+
+        # 1. 加载阶段3权重
+        checkpoint_path = os.path.join(self.checkpoint_dir, 'e2e_phase3.pth')
+        if os.path.exists(checkpoint_path):
+            model.load_checkpoint(checkpoint_path)
+            print("✅ 已加载Phase 3权重（端到端微调后的模型）")
+        else:
+            print("⚠️  警告: 未找到Phase 3权重，使用当前模型")
+
+        # 2. 设置约束
+        model.cost_limit = cost_limit
+        print(f"\n⚖️  约束配置:")
+        print(f"   - 成本上限: {cost_limit}")
+        print(f"   - 初始拉格朗日乘子: {model.lagrange_multiplier.item():.3f}")
+
+        # 3. 冻结GNN和世界模型，只训练控制器
+        print("\n🔒 冻结GNN和世界模型，只优化控制器...")
+        model.freeze_component('gnn')
+        model.freeze_component('world_model')
+        model.unfreeze_component('controller')
+        print("   ✅ GNN: 已冻结")
+        print("   ✅ World Model: 已冻结")
+        print("   ✅ Controller: 可训练")
+
+        # 4. 优化器（只优化controller）
+        optimizer = torch.optim.Adam(
+            model.controller.parameters(),
+            lr=learning_rate
+        )
+
+        print(f"\n📊 约束优化配置:")
+        print(f"   - 总步数: {total_timesteps}")
+        print(f"   - 学习率: {learning_rate}")
+
+        # 5. 创建环境
         env_config = self.config.get('environment', {})
         env = SumoEnvironment(env_config, use_gui=False)
 
+        # 6. 训练循环
+        phase4_history = []
+        timestep = 0
+
+        episode_rewards = []
+        episode_costs = []
+
+        print(f"\n🏋️  开始约束优化训练...")
+
         while timestep < total_timesteps:
+            episode_start = time.time()
+
+            # 重置环境
             observation = env.reset()
             done = False
             episode_reward = 0
@@ -545,17 +773,21 @@ class Trainer:
             step = 0
 
             while not done and timestep < total_timesteps:
+                # 准备batch
                 batch = self._prepare_batch(observation, env)
 
+                # 前向传播
                 with torch.no_grad():
                     output = model(batch)
 
+                # 获取动作
                 actions = {}
                 if output['selected_vehicle_ids']:
                     safe_actions = output['safe_actions'].cpu().numpy()
                     for i, veh_id in enumerate(output['selected_vehicle_ids']):
                         actions[veh_id] = safe_actions[i]
 
+                # 执行
                 next_observation, reward, done, info = env.step(actions)
 
                 # 计算成本
@@ -574,14 +806,20 @@ class Trainer:
             episode_rewards.append(episode_reward)
             episode_costs.append(episode_cost)
 
-            phase3_history.append({
+            episode_time = time.time() - episode_start
+
+            # 记录
+            phase4_history.append({
                 'episode': len(episode_rewards),
                 'reward': episode_reward,
                 'cost': episode_cost,
                 'lambda': model.lagrange_multiplier.item(),
-                'cost_limit': model.cost_limit
+                'cost_limit': model.cost_limit,
+                'timestep': timestep,
+                'time': episode_time
             })
 
+            # 打印进度
             if len(episode_rewards) % 10 == 0:
                 avg_reward = np.mean(episode_rewards[-10:])
                 avg_cost = np.mean(episode_costs[-10:])
@@ -593,15 +831,124 @@ class Trainer:
         # 保存最终模型
         final_checkpoint = os.path.join(self.checkpoint_dir, 'final_model.pth')
         model.save_checkpoint(final_checkpoint, len(episode_rewards), optimizer.state_dict())
+        print(f"\n✅ 最终模型已保存: {final_checkpoint}")
 
-        self.history['phase3'] = phase3_history
+        self.history['phase4'] = phase4_history
 
-        phase3_time = time.time() - start_time
-        print(f"\n✅ 阶段3完成! 耗时: {phase3_time/60:.2f} 分钟")
+        phase4_time = time.time() - start_time
+        print(f"\n✅ 阶段4完成! 耗时: {phase4_time/60:.2f} 分钟")
+        print(f"   总timesteps: {timestep}")
+        print(f"   最终奖励: {np.mean(episode_rewards[-10:]):.3f}")
+        print(f"   最终成本: {np.mean(episode_costs[-10:]):.4f}")
+        print(f"   最终拉格朗日乘子: {model.lagrange_multiplier.item():.3f}")
 
         env.close()
 
         return model
+
+    def _update_policy_e2e(
+        self,
+        model: TrafficController,
+        optimizer: torch.optim.Optimizer,
+        states: List,
+        actions: List,
+        rewards: List
+    ) -> float:
+        """
+        端到端策略更新 - 更新所有组件（GNN + World Model + Controller）
+
+        Args:
+            model: 完整模型（所有组件都可训练）
+            optimizer: 优化器
+            states: 状态历史
+            actions: 动作历史
+            rewards: 奖励历史
+
+        Returns:
+            total_loss: 总损失
+        """
+        if len(states) < 10:
+            return 0.0
+
+        # 准备batch
+        batch_size = min(len(states), 32)
+
+        # 计算returns（折扣累计奖励）
+        gamma = 0.99
+        returns = []
+        R = 0
+        for reward in reversed(rewards[-batch_size:]):
+            R = reward + gamma * R
+            returns.insert(0, R)
+
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+
+        # ========== 端到端训练：更新所有组件 ==========
+        total_loss = 0
+        num_updates = 0
+
+        # 随机采样多个batch进行更新
+        for _ in range(4):  # 4次更新
+            indices = np.random.permutation(min(len(states), batch_size))
+            mb_size = 8
+
+            for start in range(0, len(indices), mb_size):
+                end = min(start + mb_size, len(indices))
+                mb_indices = indices[start:end]
+
+                # 收集mini-batch数据
+                mb_states = [states[i] for i in mb_indices]
+                mb_returns = returns[mb_indices]
+
+                # 前向传播（通过整个模型）
+                all_value_preds = []
+                all_action_preds = []
+
+                for state in mb_states:
+                    output = model(state)
+
+                    # 收集输出
+                    if output['value_estimates'] is not None and output['value_estimates'].numel() > 0:
+                        all_value_preds.append(output['value_estimates'].mean())
+                    else:
+                        all_value_preds.append(torch.zeros(1, device=self.device))
+
+                    if output['selected_vehicle_ids']:
+                        all_action_preds.append(output['safe_actions'])
+                    else:
+                        # 创建dummy action
+                        dummy_action = torch.zeros(1, 2, device=self.device)
+                        all_action_preds.append(dummy_action)
+
+                # 计算损失
+                if len(all_value_preds) > 0:
+                    value_preds = torch.stack(all_value_preds)
+                    value_loss = F.mse_loss(value_preds, mb_returns)
+
+                    # 动作损失（简单的MSE，鼓励探索）
+                    if len(all_action_preds) > 0:
+                        actions_tensor = torch.cat(all_action_preds, dim=0)
+                        action_loss = -actions_tensor.mean() * mb_returns.mean()
+                    else:
+                        action_loss = torch.zeros(1, device=self.device)
+
+                    # 总损失
+                    loss = value_loss + 0.1 * action_loss
+
+                    # 反向传播（所有组件）
+                    optimizer.zero_grad()
+                    loss.backward()
+
+                    # 梯度裁剪（更保守，因为是端到端训练）
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
+
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    num_updates += 1
+
+        avg_loss = total_loss / max(num_updates, 1)
+        return avg_loss
 
     def _prepare_batch(self, observation: Dict, env: SumoEnvironment) -> Dict[str, Any]:
         """
@@ -808,7 +1155,7 @@ class Trainer:
 
 def train_full_pipeline(config: Dict[str, Any]) -> TrafficController:
     """
-    完整训练流程
+    完整训练流程（4阶段）
 
     Args:
         config: 配置字典
@@ -817,7 +1164,7 @@ def train_full_pipeline(config: Dict[str, Any]) -> TrafficController:
         训练好的模型
     """
     print("="*70)
-    print("🎯 智能交通协同控制系统 - 完整训练流程")
+    print("🎯 智能交通协同控制系统 - 完整训练流程（4阶段）")
     print("="*70)
 
     # 创建模型
@@ -826,29 +1173,48 @@ def train_full_pipeline(config: Dict[str, Any]) -> TrafficController:
     # 创建训练器
     trainer = Trainer(config)
 
-    # 阶段1
+    # ========== 阶段1：世界模型预训练 ==========
+    print("\n" + "📍"*35)
+    print("📍 训练流程: Phase 1 / 4 - 世界模型预训练")
+    print("📍"*35)
     model = trainer.train_phase1(
         model=model,
-        num_episodes=config.get('phase1_episodes', 50),
-        epochs=config.get('phase1_epochs', 30),
-        batch_size=config.get('batch_size', 128),
+        num_episodes=config.get('phase1_episodes', 5),
+        epochs=config.get('phase1_epochs', 10),
+        batch_size=config.get('batch_size', 64),
         learning_rate=config.get('phase1_lr', 1e-4)
     )
 
-    # 阶段2
+    # ========== 阶段2：PPO训练控制器 ==========
+    print("\n" + "📍"*35)
+    print("📍 训练流程: Phase 2 / 4 - PPO训练控制器")
+    print("📍"*35)
     model = trainer.train_phase2(
         model=model,
-        num_envs=config.get('num_envs', 4),
         total_timesteps=config.get('phase2_timesteps', 50000),
         learning_rate=config.get('phase2_lr', 3e-4)
     )
 
-    # 阶段3
+    # ========== 阶段3：端到端微调 ==========
+    print("\n" + "📍"*35)
+    print("📍 训练流程: Phase 3 / 4 - 端到端微调（所有组件）")
+    print("📍"*35)
     model = trainer.train_phase3(
         model=model,
         total_timesteps=config.get('phase3_timesteps', 30000),
+        learning_rate=config.get('phase3_lr', 1e-5),  # 较小的学习率
+        freeze_bn=config.get('freeze_bn', True)
+    )
+
+    # ========== 阶段4：约束优化 ==========
+    print("\n" + "📍"*35)
+    print("📍 训练流程: Phase 4 / 4 - 约束优化（拉格朗日）")
+    print("📍"*35)
+    model = trainer.train_phase4(
+        model=model,
+        total_timesteps=config.get('phase4_timesteps', 20000),
         cost_limit=config.get('cost_limit', 0.1),
-        learning_rate=config.get('phase3_lr', 1e-4)
+        learning_rate=config.get('phase4_lr', 1e-4)
     )
 
     # 保存训练历史
@@ -856,7 +1222,7 @@ def train_full_pipeline(config: Dict[str, Any]) -> TrafficController:
     trainer.save_history(history_path)
 
     print("\n" + "="*70)
-    print("🎉 训练流程完成!")
+    print("🎉 训练流程完成!（4阶段训练）")
     print("="*70)
 
     return model
