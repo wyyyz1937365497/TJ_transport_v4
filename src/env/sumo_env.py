@@ -347,15 +347,15 @@ class SumoEnvironment:
         time_headways = []
         for veh_id in traci.vehicle.getIDList():
             try:
-                leader_id = traci.vehicle.getLeader(veh_id, 100.0)  # 100米范围内
-                if leader_id:
+                leader_info = traci.vehicle.getLeader(veh_id, 100.0)  # 100米范围内
+                if leader_info:
+                    # getLeader返回 (leader_id, distance) 元组
+                    leader_id = leader_info[0]  # 提取vehicle_id
+                    distance = leader_info[1]    # 提取distance
+
+                    # 获取速度
                     leader_speed = traci.vehicle.getSpeed(leader_id)
                     ego_speed = traci.vehicle.getSpeed(veh_id)
-
-                    # 计算距离和速度差
-                    leader_pos = traci.vehicle.getPosition(leader_id)[0]
-                    ego_pos = traci.vehicle.getPosition(veh_id)[0]
-                    distance = leader_pos - ego_pos
 
                     # 避免除零
                     if ego_speed > 0.1:

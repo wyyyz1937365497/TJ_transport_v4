@@ -29,7 +29,9 @@ class ProgressiveWorldModel(nn.Module):
         input_dim: int = 256,
         hidden_dim: int = 128,
         future_steps: int = 5,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        num_layers: int = 2,
+        bidirectional: bool = False
     ):
         super().__init__()
 
@@ -37,25 +39,36 @@ class ProgressiveWorldModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.future_steps = future_steps
         self.current_phase = 1
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
 
-        # 共享编码器
+        # 共享编码器（增强容量）
+        encoder_hidden = min(hidden_dim * 2, 512)
         self.shared_encoder = nn.Sequential(
-            nn.Linear(input_dim, 192),
+            nn.Linear(input_dim, encoder_hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.LayerNorm(192),
-            nn.Linear(192, hidden_dim),
+            nn.LayerNorm(encoder_hidden),
+            nn.Linear(encoder_hidden, hidden_dim),
             nn.LayerNorm(hidden_dim)
         )
 
-        # Phase 1: 基础动力学LSTM
+        # Phase 1: 基础动力学LSTM（支持双向和多层）
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
-            num_layers=2,
+            num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if dropout > 0 else 0.0
+            dropout=dropout if dropout > 0 and num_layers > 1 else 0.0,
+            bidirectional=bidirectional
         )
+
+        # 如果是双向LSTM，需要投影层
+        if bidirectional:
+            self.bidi_projection = nn.Linear(self.lstm_output_dim, hidden_dim)
+        else:
+            self.bidi_projection = None
 
         # Phase 2: 风险演化解码器（多步）
         self.risk_decoders = nn.ModuleList([
@@ -142,7 +155,11 @@ class ProgressiveWorldModel(nn.Module):
         else:
             lstm_output, hidden_state = self.lstm(lstm_input)
 
-        lstm_output = lstm_output.squeeze(1)  # [N, hidden_dim]
+        lstm_output = lstm_output.squeeze(1)  # [N, lstm_output_dim] 或 [N, hidden_dim]
+
+        # 如果是双向LSTM，投影到hidden_dim
+        if self.bidirectional and self.bidi_projection is not None:
+            lstm_output = self.bidi_projection(lstm_output)  # [N, hidden_dim]
 
         # 预测下一状态
         next_state_pred = self.risk_decoders[0](lstm_output)  # [N, input_dim + 1]

@@ -145,8 +145,7 @@ class EfficientDataCollector:
                     'positions': [],
                     'speeds': [],
                     'accelerations': [],
-                    'lane_ids': [],
-                    'lanes': []
+                    'lane_indices': []  # 只保留lane_index（整数）
                 }
 
         for veh_id in arrived:
@@ -162,8 +161,7 @@ class EfficientDataCollector:
                     'positions': [],
                     'speeds': [],
                     'accelerations': [],
-                    'lane_ids': [],
-                    'lanes': []
+                    'lane_indices': []  # 只保留lane_index（整数）
                 }
 
             # 记录状态
@@ -171,8 +169,8 @@ class EfficientDataCollector:
             self.trajectories[veh_id]['positions'].append(state['position'])
             self.trajectories[veh_id]['speeds'].append(state['speed'])
             self.trajectories[veh_id]['accelerations'].append(state['acceleration'])
-            self.trajectories[veh_id]['lane_ids'].append(state['lane_id'])
-            self.trajectories[veh_id]['lanes'].append(state['lane_index'])
+            # 只存储lane_index（整数），不存储lane_id（字符串）
+            self.trajectories[veh_id]['lane_indices'].append(state['lane_index'])
 
     def save_data(self, filepath: str):
         """
@@ -367,7 +365,7 @@ class TrajectoryDataset:
 
         包含完整信息：
         - positions, speeds, accelerations (基本状态)
-        - lane_ids (车道信息)
+        - lane_indices (车道索引，整数)
         - timestamps (时间信息)
         """
         samples = []
@@ -376,8 +374,8 @@ class TrajectoryDataset:
             positions = np.array(traj['positions'])
             speeds = np.array(traj['speeds'])
             accelerations = np.array(traj['accelerations'])
-            lane_ids = np.array(traj['lane_ids']) if 'lane_ids' in traj and traj['lane_ids'] else np.zeros(len(positions), dtype=int)
-            lane_indices = np.array(traj['lanes']) if 'lanes' in traj and traj['lanes'] else np.zeros(len(positions), dtype=int)
+            # 使用lane_indices（整数），不使用lane_ids（字符串）
+            lane_indices = np.array(traj['lane_indices']) if 'lane_indices' in traj and traj['lane_indices'] else np.zeros(len(positions), dtype=int)
             timestamps = np.array(traj['timestamps']) if 'timestamps' in traj and traj['timestamps'] else np.arange(len(positions)) * 0.1
 
             seq_length = len(positions)
@@ -392,7 +390,6 @@ class TrajectoryDataset:
                 ], axis=-1)  # [sequence_length, 3]
 
                 # 当前车道序列
-                current_lane_ids = lane_ids[i:i+self.sequence_length]
                 current_lane_indices = lane_indices[i:i+self.sequence_length]
 
                 # 当前时间序列
@@ -410,7 +407,6 @@ class TrajectoryDataset:
                 ], axis=-1)  # [future_steps, 3]
 
                 # 未来车道
-                future_lane_ids = lane_ids[i+self.sequence_length:i+self.sequence_length+self.future_steps]
                 future_lane_indices = lane_indices[i+self.sequence_length:i+self.sequence_length+self.future_steps]
 
                 # 未来时间
@@ -419,10 +415,8 @@ class TrajectoryDataset:
                 samples.append({
                     'current': current_seq,
                     'future': future_seq,
-                    'current_lane_ids': current_lane_ids,
                     'current_lane_indices': current_lane_indices,
                     'current_timestamps': current_timestamps,
-                    'future_lane_ids': future_lane_ids,
                     'future_lane_indices': future_lane_indices,
                     'future_timestamps': future_timestamps
                 })

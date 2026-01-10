@@ -47,12 +47,21 @@ class Trainer:
         num_episodes: int = 100,
         epochs: int = 50,
         batch_size: int = 256,
-        learning_rate: float = 1e-4
+        learning_rate: float = 1e-4,
+        skip_data_collection: bool = False
     ) -> TrafficController:
         """
         阶段1：世界模型预训练
 
         目标：学习基础交通动力学
+
+        Args:
+            model: 交通控制模型
+            num_episodes: 训练episodes数量
+            epochs: 训练轮数
+            batch_size: 批大小
+            learning_rate: 学习率
+            skip_data_collection: 是否跳过SUMO数据收集，使用已生成的数据
         """
         print("\n" + "="*70)
         print("🔄 阶段1：世界模型预训练")
@@ -80,20 +89,28 @@ class Trainer:
         start_time = time.time()
 
         # 1. 收集数据（真正的并行处理）
-        print(f"\n📊 并行收集训练数据 ({num_episodes} episodes)...")
-        data_config = self.config.get('environment', {})
-        timeout = self.config.get('phase1', {}).get('data_collection_timeout', 180)
-        num_workers = self.config.get('phase1', {}).get('num_parallel_workers', None)
+        if not skip_data_collection:
+            print(f"\n📊 并行收集训练数据 ({num_episodes} episodes)...")
+            data_config = self.config.get('environment', {})
+            timeout = self.config.get('phase1', {}).get('data_collection_timeout', 180)
+            num_workers = self.config.get('phase1', {}).get('num_parallel_workers', None)
 
-        # 使用优化的并行收集器
-        all_trajectories, total_stats = collect_parallel_data_optimized(
-            config=data_config,
-            num_episodes=num_episodes,
-            max_steps=data_config.get('max_steps', 3600),
-            timeout=timeout,
-            num_workers=num_workers,  # 使用配置中的工作进程数
-            output_dir="data"
-        )
+            # 使用优化的并行收集器
+            all_trajectories, total_stats = collect_parallel_data_optimized(
+                config=data_config,
+                num_episodes=num_episodes,
+                max_steps=data_config.get('max_steps', 3600),
+                timeout=timeout,
+                num_workers=num_workers,  # 使用配置中的工作进程数
+                output_dir="data"
+            )
+        else:
+            # 跳过数据收集，使用已生成的数据
+            print(f"\n⏭️  跳过SUMO数据收集，使用已生成的数据...")
+            all_trajectories, total_stats = self._load_existing_data()
+            if len(all_trajectories) == 0:
+                print("⚠️  警告: 未找到现有数据，请先运行数据收集或移除 --skip-data-collection 标志")
+                return model
 
         # 检查收集结果
         if len(all_trajectories) == 0:
@@ -113,14 +130,19 @@ class Trainer:
             print("⚠️  警告: 数据集为空，跳过阶段1训练")
             return model
 
+        # 数据加载配置优化（充分利用大batch size）
+        num_workers = self.config.get('phase1', {}).get('num_parallel_workers', 8)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4 if num_gpus > 1 else 0,  # 多GPU时增加数据加载进程
-            pin_memory=True if num_gpus > 1 else False,  # 加速GPU数据传输
-            persistent_workers=True if num_gpus > 1 else False
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+            drop_last=True  # 确保batch大小一致
         )
+        print(f"   - 数据加载: {num_workers} workers, prefetch_factor=2")
 
         # 3. 设置模型（已经设置过多GPU了，不需要再.to(device)）
         # 注意：DataParallel包装后需要通过.module访问原始模型
@@ -143,43 +165,47 @@ class Trainer:
 
         criterion = nn.MSELoss()
 
-        # 🔥 关键修复：为多GPU训练创建包装模块
-        if hasattr(model, 'module'):
-            # 如果模型已被DataParallel包装，创建一个辅助模块来包装world_model
-            # 这样DataParallel可以正确分配工作到多个GPU
-            class WorldModelWrapper(nn.Module):
-                """包装world_model以支持DataParallel"""
-                def __init__(self, world_model):
-                    super().__init__()
-                    self.world_model = world_model
+        # 🔥 修复DataParallel问题：不使用DataParallel处理变长图数据
+        # DataParallel无法处理不同GPU返回不同shape的张量
+        # 对于变长图数据（不同batch中车辆数量不同），使用单GPU训练
+        if hasattr(model, 'module') and num_gpus > 1:
+            print(f"\n⚠️  检测到 {num_gpus} 张GPU，但由于图数据维度可变，")
+            print(f"   WorldModel将使用单GPU训练（避免DataParallel的shape不匹配问题）")
+            # 解包模型，使用单GPU
+            model = actual_model
+            model = model.to(self.device)
 
-                def forward(self, gnn_embedding):
-                    return self.world_model(gnn_embedding)
+        wrapped_world_model = actual_model.world_model
 
-            wrapped_world_model = WorldModelWrapper(actual_model.world_model)
-            # 对这个包装器应用DataParallel
-            if num_gpus > 1:
-                wrapped_world_model = nn.DataParallel(
-                    wrapped_world_model,
-                    device_ids=list(range(num_gpus)),
-                    output_device=None
-                )
-                wrapped_world_model.to(self.device)
-                print(f"\n🔥 WorldModel已启用多GPU训练 ({num_gpus} 张GPU)")
-            else:
-                wrapped_world_model = wrapped_world_model.to(self.device)
-        else:
-            # 单GPU情况
-            wrapped_world_model = actual_model.world_model
+        # 5. 设置混合精度训练（节省显存，加速训练）
+        use_amp = self.config.get('phase1', {}).get('use_mixed_precision', False)
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        if use_amp:
+            print(f"\n🔥 已启用混合精度训练（FP16）- 显存节省约40%")
 
-        # 5. 训练循环
+        # 6. 学习率调度器（warmup + cosine annealing）
+        warmup_epochs = self.config.get('phase1', {}).get('warmup_epochs', 5)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            total_iters=warmup_epochs
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs - warmup_epochs,
+            eta_min=learning_rate * 0.01
+        )
+
+        # 7. 训练循环
         best_loss = float('inf')
         phase1_history = []
 
         print(f"\n🏋️  开始训练 ({epochs} epochs)...")
-        print(f"   - Batch size: {batch_size} (已为{num_gpus}GPU优化)")
-        print(f"   - 学习率: {learning_rate:.6f} (已为{num_gpus}GPU优化)")
+        print(f"   - Batch size: {batch_size} (充分利用GPU显存)")
+        print(f"   - 学习率: {learning_rate:.6f} (已针对大batch优化)")
         print(f"   - 总样本数: {len(dataset)}")
+        print(f"   - Warmup epochs: {warmup_epochs}")
+        print(f"   - 梯度裁剪: {self.config.get('phase1', {}).get('gradient_clip', 1.0)}")
 
         for epoch in range(epochs):
             epoch_start = time.time()
@@ -194,9 +220,8 @@ class Trainer:
                 future_states = batch['future']    # [B, T_future, 3] where T_future=future_steps
 
                 # 提取车道和时间信息
-                current_lane_ids = batch['current_lane_ids']      # [B, T]
                 current_lane_indices = batch['current_lane_indices']  # [B, T]
-                current_timestamps = batch['current_timestamps']  # [B, T]
+                current_timestamps = batch['current_timestamps']      # [B, T]
 
                 B, T, _ = current_states.shape
 
@@ -208,23 +233,26 @@ class Trainer:
                 current_accel = current_states[:, -1, 2:3].float().to(self.device)   # [B, 1]
 
                 # 2. 提取车道信息（真实数据！）
-                # current_lane_ids: [B, T] -> 取最后一步 -> [B]
                 # current_lane_indices: [B, T] -> 取最后一步 -> [B]
-                if isinstance(current_lane_ids, np.ndarray):
-                    current_lane_ids = current_lane_ids[:, -1]  # [B]
-                    current_lane_indices = current_lane_indices[:, -1]  # [B]
+                if isinstance(current_lane_indices, np.ndarray):
+                    current_lane_indices = current_lane_indices[:, -1]  # [B] numpy array
+                    current_lane_indices = torch.from_numpy(current_lane_indices).long()  # 转为tensor
+                elif torch.is_tensor(current_lane_indices):
+                    current_lane_indices = current_lane_indices[:, -1]  # [B] tensor
                 else:
-                    current_lane_ids = torch.tensor(current_lane_ids[:, -1]) if hasattr(current_lane_ids, '__len__') else torch.zeros(B, dtype=torch.long)
-                    current_lane_indices = torch.tensor(current_lane_indices[:, -1]) if hasattr(current_lane_indices, '__len__') else torch.zeros(B, dtype=torch.long)
+                    current_lane_indices = torch.zeros(B, dtype=torch.long)
 
                 # 3. 提取时间信息（真实数据！）
                 if isinstance(current_timestamps, np.ndarray):
-                    current_time = current_timestamps[:, -1]  # [B]
+                    current_time = current_timestamps[:, -1]  # [B] numpy array
+                    current_time = torch.from_numpy(current_time).float()  # 转为tensor
+                elif torch.is_tensor(current_timestamps):
+                    current_time = current_timestamps[:, -1]  # [B] tensor
                 else:
-                    current_time = torch.tensor(current_timestamps[:, -1]) if hasattr(current_timestamps, '__len__') else torch.zeros(B)
+                    current_time = torch.zeros(B)
 
                 # 归一化时间（除以最大时间360秒）
-                current_time_normalized = torch.tensor(current_time, dtype=torch.float32).to(self.device) / 360.0  # [B]
+                current_time_normalized = current_time.float().to(self.device) / 360.0  # [B]
 
                 # 4. 计算序列统计特征（从历史序列计算）
                 # 位置、速度、加速度的标准差
@@ -252,15 +280,24 @@ class Trainer:
                 actual_model = model.module if hasattr(model, 'module') else model
 
                 # 创建车辆状态字典（使用真实数据）
+                # 注意：GraphBuilder期望特定的状态格式
                 vehicle_states_dict = {}
                 for i in range(B):
                     veh_id = f"veh_{i}"
+                    position = current_position[i].item()
+                    speed = current_speed[i].item()
+                    accel = current_accel[i].item()
+                    lane_idx = int(current_lane_indices[i].item())
+
                     vehicle_states_dict[veh_id] = {
-                        'position': float(current_position[i].cpu().numpy()),
-                        'speed': float(current_speed[i].cpu().numpy()),
-                        'acceleration': float(current_accel[i].cpu().numpy()),
-                        'lane_id': str(int(current_lane_ids[i])),  # 真实车道ID
-                        'lane_index': int(current_lane_indices[i]),  # 真实车道索引
+                        'x': position,         # x坐标
+                        'y': 0.0,              # y坐标（假设直线道路）
+                        'vx': speed,           # x方向速度
+                        'vy': 0.0,             # y方向速度
+                        'ax': accel,           # x方向加速度
+                        'ay': 0.0,             # y方向加速度
+                        'lane_id': f"E0_{lane_idx}",  # 车道ID（字符串）
+                        'lane_index': lane_idx,  # 车道索引
                         'road_id': 'E0'
                     }
 
@@ -269,23 +306,27 @@ class Trainer:
                 graph_data = actual_model.graph_builder.build_graph(vehicle_states_dict, icv_ids)
 
                 # 7. 通过GNN提取特征（多GPU支持）
+                # 准备batch属性（可能为None）
+                batch_tensor = graph_data.batch.to(self.device) if graph_data.batch is not None else None
+
                 if num_gpus > 1 and hasattr(model, 'module'):
-                    gnn_output = actual_model.risk_gnn(
+                    gnn_output_dict = actual_model.risk_gnn(
                         node_features=graph_data.x.to(self.device),
                         edge_index=graph_data.edge_index.to(self.device),
                         edge_features=graph_data.edge_attr.to(self.device),
-                        batch=graph_data.batch.to(self.device) if hasattr(graph_data, 'batch') else None
+                        batch=batch_tensor
                     )
                 else:
-                    gnn_output = actual_model.risk_gnn(
+                    gnn_output_dict = actual_model.risk_gnn(
                         node_features=graph_data.x.to(self.device),
                         edge_index=graph_data.edge_index.to(self.device),
                         edge_features=graph_data.edge_attr.to(self.device),
-                        batch=graph_data.batch.to(self.device) if hasattr(graph_data, 'batch') else None
+                        batch=batch_tensor
                     )
 
-                # GNN输出: [num_nodes, gnn_output_dim=256]
-                gnn_embedding = gnn_output  # [B, 256]
+                # GNN返回字典：{'node_embedding': ..., 'global_embedding': ..., 'risk_weights': ...}
+                # 提取节点嵌入用于世界模型
+                gnn_embedding = gnn_output_dict['node_embedding']  # [num_nodes, gnn_output_dim=256]
 
                 # 8. 通过WorldModel预测未来状态（多GPU）
                 predictions = wrapped_world_model(gnn_embedding)
@@ -312,11 +353,20 @@ class Trainer:
                 # 计算MSE损失
                 loss = criterion(pred_state, future_state)
 
-                # 反向传播
+                # 反向传播（支持混合精度）
                 optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=1.0)
-                optimizer.step()
+                gradient_clip = self.config.get('phase1', {}).get('gradient_clip', 1.0)
+
+                if use_amp and scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=gradient_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(actual_model.world_model.parameters(), max_norm=gradient_clip)
+                    optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -324,14 +374,23 @@ class Trainer:
             avg_loss = total_loss / num_batches if num_batches > 0 else 0
             epoch_time = time.time() - epoch_start
 
+            # 更新学习率
+            if epoch < warmup_epochs:
+                warmup_scheduler.step()
+                current_lr = warmup_scheduler.get_last_lr()[0]
+            else:
+                cosine_scheduler.step()
+                current_lr = cosine_scheduler.get_last_lr()[0]
+
             phase1_history.append({
                 'epoch': epoch,
                 'loss': avg_loss,
-                'time': epoch_time
+                'time': epoch_time,
+                'lr': current_lr
             })
 
             # 打印进度
-            print(f"   Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s")
+            print(f"   Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f} | LR: {current_lr:.2e} | Time: {epoch_time:.2f}s")
 
             # 定期显示GPU使用情况
             if num_gpus > 1 and (epoch + 1) % 5 == 0:
@@ -1145,6 +1204,51 @@ class Trainer:
             actions_list[:] = actions_list[-512:]
             rewards[:] = rewards[-512:]
             values[:] = values[-512:]
+
+    def _load_existing_data(self) -> Tuple[Dict, Dict]:
+        """
+        加载已收集的数据（用于跳过SUMO数据收集）
+
+        Returns:
+            all_trajectories, total_stats
+        """
+        import glob
+        import pickle
+
+        # 查找数据目录中最新的数据文件
+        data_dir = "data"
+        os.makedirs(data_dir, exist_ok=True)
+
+        # 查找所有.pkl文件
+        pkl_files = glob.glob(os.path.join(data_dir, "*.pkl"))
+
+        if not pkl_files:
+            print("⚠️  未找到任何数据文件")
+            return {}, {}
+
+        # 按修改时间排序，取最新的
+        pkl_files.sort(key=os.path.getmtime, reverse=True)
+        latest_file = pkl_files[0]
+
+        print(f"📂 加载数据文件: {latest_file}")
+
+        try:
+            with open(latest_file, 'rb') as f:
+                data = pickle.load(f)
+
+            all_trajectories = data.get('trajectories', {})
+            total_stats = data.get('stats', {})
+
+            print(f"✅ 数据加载成功")
+            print(f"   - 车辆数: {len(all_trajectories)}")
+            if total_stats:
+                print(f"   - 总步数: {total_stats.get('total_steps', 'N/A')}")
+
+            return all_trajectories, total_stats
+
+        except Exception as e:
+            print(f"❌ 加载数据失败: {e}")
+            return {}, {}
 
     def save_history(self, filepath: str):
         """保存训练历史"""

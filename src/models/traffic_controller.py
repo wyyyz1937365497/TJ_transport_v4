@@ -53,7 +53,9 @@ class TrafficController(nn.Module):
             input_dim=config.get('gnn_output_dim', 256),
             hidden_dim=config.get('world_hidden_dim', 128),
             future_steps=config.get('future_steps', 5),
-            dropout=config.get('world_dropout', 0.1)
+            dropout=config.get('world_dropout', 0.1),
+            num_layers=config.get('world_num_layers', 2),
+            bidirectional=config.get('world_bidirectional', False)
         )
 
         # 3. 决策层：控制器

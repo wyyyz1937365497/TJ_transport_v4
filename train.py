@@ -43,6 +43,8 @@ def main():
                        help='仅评估模式')
     parser.add_argument('--generate-xlsx', action='store_true',
                        help='生成XLSX结果文件')
+    parser.add_argument('--skip-data-collection', action='store_true',
+                       help='跳过SUMO数据收集，使用已生成的数据')
 
     args = parser.parse_args()
 
@@ -107,7 +109,8 @@ def main():
             num_episodes=config.get('phase1', {}).get('num_episodes', 20),
             epochs=config.get('phase1', {}).get('epochs', 20),
             batch_size=config.get('phase1', {}).get('batch_size', 128),
-            learning_rate=config.get('phase1', {}).get('lr', 1e-4)
+            learning_rate=config.get('phase1', {}).get('lr', 1e-4),
+            skip_data_collection=args.skip_data_collection
         )
 
     if args.phase == 'all' or args.phase == '2':
