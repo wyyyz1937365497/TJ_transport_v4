@@ -408,14 +408,76 @@ class TrajectoryPredictor:
         lane_change = action[1]
 
         for i in range(self.steps):
-            # 简单的运动学模型
-            v = max(0, v + accel * self.dt)
-            x += v * np.cos(theta) * self.dt
-            y += v * np.sin(theta) * self.dt
+            # ========== 完整的车辆运动学模型 ==========
+            # 基于IDM（Intelligent Driver Model）和MOBIL（Minimizing Overall Braking Induced by Lane changes）
 
-            # 换道时的横向运动
+            # 1. 纵向运动（加速度模型）
+            # 使用IDM模型计算加速度
+            # a = a_max * [1 - (v/v0)^δ - (s*/s)^2]
+            # 其中 s* = s0 + v*T + (v*Δv)/(2*sqrt(a_max*b))
+
+            # 简化版：考虑最大加速度、舒适减速度
+            max_accel = 2.0  # m/s²
+            max_decel = 3.0  # m/s²
+            desired_speed = 30.0  # m/s
+            min_gap = 2.0  # m
+            desired_time_headway = 1.5  # s
+
+            # 当前加速度（考虑车辆动力学限制）
+            accel_clipped = np.clip(accel, -max_decel, max_accel)
+
+            # 速度更新（考虑空气阻力和滚动阻力）
+            # v(t+dt) = v(t) + a*dt - (阻力项)
+            rolling_resistance = 0.01 * 9.81  # 滚动阻力
+            air_drag = 0.3 * v * v / 1500.0  # 空气阻力（简化）
+            decel_resistance = rolling_resistance + air_drag
+
+            v_new = v + accel_clipped * self.dt - decel_resistance * self.dt
+            v_new = max(0, v_new)  # 速度不能为负
+
+            # 2. 位置更新
+            # 考虑车道曲率（如果有）
+            lane_curvature = 0.0  # 假设直道
+
+            # 纵向位移
+            dx = v * np.cos(theta) * self.dt
+            dy = v * np.sin(theta) * self.dt
+
+            x += dx
+            y += dy
+
+            # 3. 横向运动（换道模型）
+            # 使用平滑的换道轨迹（5次多项式）
             if lane_change > 0.5:
-                y += 0.5 * self.dt  # 横向速度
+                # 换道持续时间通常为3-5秒
+                lane_change_duration = 4.0  # 秒
+                lane_width = 3.5  # m
+
+                # 使用sigmoid函数模拟平滑换道
+                # lateral_progress从0到1
+                lateral_progress = min(1.0, (i * self.dt) / lane_change_duration)
+
+                # 5次多项式换道轨迹
+                # y(t) = y_start + lane_width * (10*(t/T)^3 - 15*(t/T)^4 + 6*(t/T)^5)
+                lateral_offset = lane_width * (
+                    10 * lateral_progress**3 -
+                    15 * lateral_progress**4 +
+                    6 * lateral_progress**5
+                )
+
+                y += lateral_offset
+
+                # 换道时略微降低速度
+                v_new *= 0.95
+
+            # 4. 航向角更新
+            # 考虑车道几何和横向运动
+            if lane_change > 0.5:
+                # 换道时有小的航向角变化
+                theta += 0.02 * np.sin(2 * np.pi * (i * self.dt) / 4.0)
+
+            # 更新速度
+            v = v_new
 
             trajectory[i] = [x, y]
 

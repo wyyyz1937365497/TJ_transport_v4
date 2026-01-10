@@ -1,4 +1,5 @@
-data/
 *.pyc
 *.cpython-312.pyc
 */*pycache*/
+*.pth
+data/

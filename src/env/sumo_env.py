@@ -342,8 +342,30 @@ class SumoEnvironment:
         # 剩余车辆
         stats[12] = traci.simulation.getMinExpectedNumber()
 
-        # 平均车头时距
-        stats[13] = 0.0  # 简化
+        # 平均车头时距（完整实现）
+        # 计算所有车辆与前车之间的平均时间距离
+        time_headways = []
+        for veh_id in traci.vehicle.getIDList():
+            try:
+                leader_id = traci.vehicle.getLeader(veh_id, 100.0)  # 100米范围内
+                if leader_id:
+                    leader_speed = traci.vehicle.getSpeed(leader_id)
+                    ego_speed = traci.vehicle.getSpeed(veh_id)
+
+                    # 计算距离和速度差
+                    leader_pos = traci.vehicle.getPosition(leader_id)[0]
+                    ego_pos = traci.vehicle.getPosition(veh_id)[0]
+                    distance = leader_pos - ego_pos
+
+                    # 避免除零
+                    if ego_speed > 0.1:
+                        # 车头时距 = 距离 / 速度
+                        thw = distance / ego_speed
+                        time_headways.append(thw)
+            except:
+                continue
+
+        stats[13] = np.mean(time_headways) if time_headways else 2.0  # 默认2秒
 
         # 网络负载
         stats[14] = stats[6] / max(stats[12] + stats[6], 1)
@@ -354,25 +376,83 @@ class SumoEnvironment:
         return stats
 
     def _compute_reward(self, observation: Dict[str, Any]) -> float:
-        """计算奖励"""
-        # 简化版奖励：基于速度和流量
+        """
+        计算奖励 - 完整实现
+
+        综合考虑多个指标：
+        1. 平均速度（交通效率）
+        2. 速度标准差（交通稳定性）
+        3. OD完成率（到达目的地的车辆比例）
+        4. 碰撞惩罚（安全性）
+        5. 停车次数（流畅性）
+        """
         vehicle_states = observation['vehicle_states']
 
         if not vehicle_states:
             return 0.0
 
+        # ========== 1. 交通效率奖励 ==========
         speeds = [v['speed'] for v in vehicle_states.values()]
         avg_speed = np.mean(speeds)
 
-        # 奖励：平均速度
-        reward = avg_speed / 30.0  # 归一化
+        # 速度奖励：鼓励高平均速度（归一化到0-30m/s）
+        speed_reward = avg_speed / 30.0
 
-        # 惩罚：速度标准差（稳定性）
+        # ========== 2. 交通稳定性奖励 ==========
+        # 速度标准差越小越好（交通流更稳定）
         if len(speeds) > 1:
             speed_std = np.std(speeds)
-            reward -= 0.1 * speed_std / 10.0
+            stability_reward = -0.1 * (speed_std / 10.0)  # 惩罚速度波动
+        else:
+            stability_reward = 0.0
 
-        return float(reward)
+        # ========== 3. OD完成率奖励 ==========
+        # 统计到达的车辆数和总出发数
+        arrived_count = len(self.stats.get('arrived_vehicles', []))
+        departed_count = len(self.stats.get('departed_vehicles', []))
+
+        if departed_count > 0:
+            completion_rate = arrived_count / departed_count
+            # 完成率越高越好
+            completion_reward = 10.0 * completion_rate  # 较大权重
+        else:
+            completion_reward = 0.0
+
+        # ========== 4. 停车惩罚 ==========
+        # 统计停车（速度接近0）的车辆比例
+        stopped_vehicles = sum(1 for s in speeds if s < 0.1)
+        stopped_ratio = stopped_vehicles / len(speeds)
+        stopped_penalty = -0.5 * stopped_ratio  # 惩罚停车
+
+        # ========== 5. 碰撞/紧急刹车惩罚 ==========
+        # 统计急减速的车辆（加速度 < -3 m/s²）
+        emergency_braking = 0
+        for veh_id in vehicle_states.keys():
+            try:
+                accel = traci.vehicle.getDecel(veh_id)
+                if accel > 3.0:  # 减速度>3m/s²认为是急刹车
+                    emergency_braking += 1
+            except:
+                continue
+
+        emergency_penalty = -0.2 * (emergency_braking / max(len(speeds), 1))
+
+        # ========== 总奖励 ==========
+        # 权重设置：
+        # - 速度效率: 1.0
+        # - 稳定性: 0.1
+        # - 完成率: 10.0（最重要）
+        # - 停车: 0.5
+        # - 急刹车: 0.2
+        total_reward = (
+            1.0 * speed_reward +
+            stability_reward +
+            completion_reward +
+            stopped_penalty +
+            emergency_penalty
+        )
+
+        return float(total_reward)
 
     def _is_done(self) -> bool:
         """检查是否结束"""

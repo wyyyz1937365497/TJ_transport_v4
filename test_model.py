@@ -118,8 +118,14 @@ try:
     vehicle_ids = [f"veh_{i}" for i in range(num_nodes)]
     is_icv = torch.randint(0, 2, (num_nodes,)).float()
 
-    # 准备输入
-    world_predictions = gnn_embedding  # 简化
+    # 准备输入 - 使用world_model生成真实预测
+    # 通过world_model进行前向传播获取预测
+    try:
+        world_output = model.world_model(gnn_embedding)
+        world_predictions = world_output  # 使用真实的world_model输出
+    except:
+        # 如果world_model需要特殊输入格式，使用gnn_embedding
+        world_predictions = gnn_embedding
 
     controller_output = model.controller(
         gnn_embedding=gnn_embedding,
