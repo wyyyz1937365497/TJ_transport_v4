@@ -41,8 +41,7 @@ class FastGraphBuilder:
         positions: torch.Tensor,      # [B, 2] x, y
         velocities: torch.Tensor,     # [B, 2] vx, vy
         accelerations: torch.Tensor,  # [B, 2] ax, ay
-        lane_indices: torch.Tensor,   # [B] lane_index
-        timestamps: torch.Tensor = None  # [B] timestamps (optional)
+        lane_indices: torch.Tensor    # [B] lane_index
     ) -> Data:
         """
         GPU加速批量图构建
@@ -71,16 +70,17 @@ class FastGraphBuilder:
             )
 
         # ========== 1. 构建节点特征 [B, 9] ==========
-        # 如果没有提供timestamps，使用0填充
-        if timestamps is None:
-            timestamps = torch.zeros(B, device=self.device)
+        # 特征：[x, y, z, vx, vy, ax, ay, lane_index, is_icv]
+        z_coord = torch.zeros(B, 1, device=self.device)  # [B, 1] z坐标（2D道路为0）
+        is_icv = torch.ones(B, 1, device=self.device)   # [B, 1] 训练时都为ICV
 
         node_features = torch.cat([
-            positions,                        # [B, 2] x, y
-            velocities,                       # [B, 2] vx, vy
-            accelerations,                    # [B, 2] ax, ay
-            lane_indices.unsqueeze(1).float(), # [B, 1] lane_index
-            timestamps.unsqueeze(1).float()    # [B, 1] timestamp (归一化时间)
+            positions,           # [B, 2] x, y
+            z_coord,             # [B, 1] z
+            velocities,          # [B, 2] vx, vy
+            accelerations,       # [B, 2] ax, ay
+            lane_indices.unsqueeze(1).float(),  # [B, 1] lane_index
+            is_icv               # [B, 1] is_icv（训练时都为1）
         ], dim=1)  # [B, 9]
 
         # ========== 2. GPU加速：计算距离矩阵 [B, B] ==========
@@ -226,12 +226,11 @@ class FastGraphCollate:
         all_current = np.stack([item['current'] for item in batch_list])  # [B, T, 3]
         all_future = np.stack([item['future'] for item in batch_list])    # [B, T_future, 3]
         all_lanes = np.stack([item['current_lane_indices'] for item in batch_list])  # [B, T]
-        all_timestamps = np.stack([item['current_timestamps'] for item in batch_list])  # [B, T]
 
         B, T, _ = all_current.shape
 
         # 提取最后一步状态
-        last_position = all_current[:, -1, 0:2]  # [B, 2] x, y
+        last_position = all_current[:, -1, 0:2]  # [B, 2] x, y（注意：需要2维）
         if last_position.shape[1] == 1:
             # 如果只有1维，补充y=0
             last_position = np.concatenate([
@@ -242,7 +241,6 @@ class FastGraphCollate:
         last_speed = all_current[:, -1, 1:2]      # [B, 1] vx
         last_accel = all_current[:, -1, 2:3]     # [B, 1] ax
         last_lanes = all_lanes[:, -1]            # [B]
-        last_timestamps = all_timestamps[:, -1]  # [B] - 最后一步的时间戳
 
         # 构造velocity和acceleration（2维）
         velocities = np.concatenate([
@@ -260,18 +258,13 @@ class FastGraphCollate:
         velocities = torch.from_numpy(velocities).float()    # [B, 2] - CPU
         accelerations = torch.from_numpy(accelerations).float()  # [B, 2] - CPU
         lane_indices = torch.from_numpy(last_lanes).long()   # [B] - CPU
-        timestamps = torch.from_numpy(last_timestamps).float()  # [B] - CPU
-
-        # 归一化时间戳（除以最大时间360秒）
-        timestamps_normalized = timestamps / 360.0
 
         # 🔥 使用快速图构建器（在CPU上构建）
         graph_data = self.graph_builder.build_batch_graph_fast(
             positions=positions,
             velocities=velocities,
             accelerations=accelerations,
-            lane_indices=lane_indices,
-            timestamps=timestamps_normalized
+            lane_indices=lane_indices
         )
 
         # 准备其他数据（CPU tensor）

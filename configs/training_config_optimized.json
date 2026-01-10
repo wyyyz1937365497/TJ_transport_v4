@@ -50,7 +50,7 @@
     "lr": 3e-4,
     "weight_decay": 1e-4,
     "data_collection_timeout": 180,
-    "num_parallel_workers": 16,
+    "num_parallel_workers": 32,
     "gradient_clip": 1.0,
     "warmup_epochs": 5,
     "phase1_model_path": "models/world_model_phase1.pth",
