@@ -34,10 +34,12 @@ class SumoEnvironment:
     def __init__(
         self,
         config: Dict[str, Any],
-        use_gui: bool = False
+        use_gui: bool = False,
+        port: Optional[int] = None
     ):
         self.config = config
         self.use_gui = use_gui
+        self.port = port if port is not None else 8813  # 默认端口
 
         # SUMO配置
         self.sumo_cfg = config.get('sumo_cfg', '')
@@ -96,15 +98,13 @@ class SumoEnvironment:
             "-c", self.sumo_cfg,
             "--no-step-log", "true",
             "--no-warnings", "true",
-            "--step-length", str(self.step_length)
+            "--step-length", str(self.step_length),
+            "--remote-port", str(self.port)  # 添加端口参数
         ]
 
         # 只有在配置中明确指定了seed才添加
         if 'seed' in self.config:
             cmd.extend(["--seed", str(self.config['seed'])])
-
-        # 移除 remote-port 设置，避免与.sumocfg文件冲突
-        # SUMO会自动使用默认端口或从配置文件读取
 
         return cmd
 
@@ -116,13 +116,23 @@ class SumoEnvironment:
         if self.is_connected:
             return
 
-        try:
-            traci.start(self.sumo_cmd)
-            self.is_connected = True
-            self.current_step = 0
-            print(f"✅ SUMO已启动 (GUI: {self.use_gui})")
-        except Exception as e:
-            raise RuntimeError(f"SUMO启动失败: {e}")
+        # 尝试连接，最多重试3次
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                traci.start(self.sumo_cmd, port=self.port)
+                self.is_connected = True
+                self.current_step = 0
+                print(f"✅ SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
+                return
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    print(f"⚠️  端口 {self.port} 占用，尝试新端口...")
+                    # 尝试新端口
+                    self.port += 10
+                    self.sumo_cmd = self._build_sumo_command()
+                else:
+                    raise RuntimeError(f"SUMO启动失败（已尝试 {max_attempts} 次）: {e}")
 
     def close(self):
         """关闭SUMO仿真"""

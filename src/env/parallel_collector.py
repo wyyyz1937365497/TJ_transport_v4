@@ -15,20 +15,21 @@ from multiprocessing import Pool, Process, Queue, Manager, cpu_count
 from .sumo_env import SumoEnvironment
 
 
-def collect_single_episode(args: Tuple[Dict[str, Any], int, int, float]) -> Tuple[Dict[str, Dict], Dict[str, Any]]:
+def collect_single_episode(args: Tuple[Dict[str, Any], int, int, float, int]) -> Tuple[Dict[str, Dict], Dict[str, Any]]:
     """
     单个 episode 的数据收集（在独立进程中运行）
 
     Args:
-        args: (config, episode_id, max_steps, timeout)
+        args: (config, episode_id, max_steps, timeout, port)
 
     Returns:
         (trajectories, stats)
     """
-    config, episode_id, max_steps, timeout = args
+    config, episode_id, max_steps, timeout, port = args
 
     # 独立进程环境
     import sys
+    import traci
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
     trajectories = {}
@@ -42,8 +43,8 @@ def collect_single_episode(args: Tuple[Dict[str, Any], int, int, float]) -> Tupl
     }
 
     try:
-        # 创建环境（每个进程独立实例）
-        env = SumoEnvironment(config, use_gui=False)
+        # 创建环境（每个进程独立实例，使用指定端口）
+        env = SumoEnvironment(config, use_gui=False, port=port)
 
         start_time = time.time()
         observation = env.reset()
@@ -172,10 +173,13 @@ class ParallelDataCollector:
 
         start_time = time.time()
 
-        # 准备任务参数
+        # 准备任务参数 - 为每个episode分配不同端口
         tasks = []
+        base_port = 8813
         for i in range(num_episodes):
-            tasks.append((self.config, i, max_steps, self.timeout))
+            # 每个episode使用不同的端口，间隔10个端口
+            port = base_port + i * 10
+            tasks.append((self.config, i, max_steps, self.timeout, port))
 
         # 使用进程池并行执行
         all_trajectories = {}

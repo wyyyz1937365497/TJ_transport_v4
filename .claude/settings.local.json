@@ -3,7 +3,15 @@
     "allow": [
       "Bash(dir:*)",
       "Bash(nvidia-smi:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(killall:*)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(conda run:*)",
+      "Bash(~/miniconda3/envs/sumo/bin/python:*)",
+      "Bash(~/miniconda3/envs/sumo/bin/pip list:*)",
+      "Bash(sumo:*)"
     ]
   }
 }
