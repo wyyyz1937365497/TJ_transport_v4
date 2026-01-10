@@ -47,7 +47,8 @@ class EfficientDataCollector:
     def collect_episode(
         self,
         max_steps: int = 36000,
-        verbose: bool = True
+        verbose: bool = True,
+        timeout: float = 300.0
     ) -> Dict[str, Dict]:
         """
         收集单个episode的数据
@@ -55,12 +56,13 @@ class EfficientDataCollector:
         Args:
             max_steps: 最大步数
             verbose: 是否打印进度
+            timeout: 超时时间（秒），默认5分钟
 
         Returns:
             trajectories: 轨迹字典
         """
         if verbose:
-            print(f"🚀 开始收集数据 (最大步数: {max_steps})")
+            print(f"🚀 开始收集数据 (最大步数: {max_steps}, 超时: {timeout}s)")
 
         self.start_time = time.time()
         self.trajectories = {}
@@ -73,6 +75,13 @@ class EfficientDataCollector:
         for step in range(max_steps):
             self.current_step = step
 
+            # 检查超时
+            elapsed = time.time() - self.start_time
+            if elapsed > timeout:
+                if verbose:
+                    print(f"⏱️  达到超时时间 {timeout}s，停止收集")
+                break
+
             # 记录当前状态
             self._record_step(observation)
 
@@ -81,16 +90,27 @@ class EfficientDataCollector:
 
             # 进度报告
             if verbose and step % 100 == 0:
-                elapsed = time.time() - self.start_time
                 vehicles = len(observation['vehicle_states'])
                 print(f"[Step {step}/{max_steps}] 车辆数: {vehicles}, "
-                      f"耗时: {elapsed:.2f}s, 速度: {step/elapsed:.1f} 步/秒")
+                      f"耗时: {elapsed:.1f}s, 速度: {step/max(elapsed, 0.1):.1f} 步/秒")
 
-            # 检查是否结束
+            # 检查是否结束（没有车辆了）
+            if len(observation['vehicle_states']) == 0 and step > 100:
+                if verbose:
+                    print(f"✅ 所有车辆已完成，停止收集于步骤 {step}")
+                break
+
+            # 检查 done 标志
             if done:
                 if verbose:
                     print(f"✅ 仿真自然结束于步骤 {step}")
                 break
+
+        # 关闭环境
+        try:
+            self.env.close()
+        except:
+            pass
 
         # 计算统计信息
         self.stats['collection_time'] = time.time() - self.start_time
@@ -102,7 +122,8 @@ class EfficientDataCollector:
             print(f"   - 总步数: {self.stats['total_steps']}")
             print(f"   - 总车辆: {self.stats['total_vehicles']}")
             print(f"   - 耗时: {self.stats['collection_time']:.2f} 秒")
-            print(f"   - 平均速度: {self.stats['total_steps'] / self.stats['collection_time']:.2f} 步/秒")
+            if self.stats['collection_time'] > 0:
+                print(f"   - 平均速度: {self.stats['total_steps'] / self.stats['collection_time']:.2f} 步/秒")
 
         return self.trajectories
 

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import shutil
 
 from ..models import TrafficController, create_model_from_config, WorldModelLoss
-from ..env import SumoEnvironment, EfficientDataCollector, collect_parallel_data, TrajectoryDataset
+from ..env import SumoEnvironment, EfficientDataCollector, TrajectoryDataset, collect_parallel_data_optimized
 
 
 class Trainer:
@@ -59,22 +59,39 @@ class Trainer:
 
         start_time = time.time()
 
-        # 1. 收集数据
-        print(f"\n📊 收集训练数据 ({num_episodes} episodes)...")
+        # 1. 收集数据（真正的并行处理）
+        print(f"\n📊 并行收集训练数据 ({num_episodes} episodes)...")
         data_config = self.config.get('environment', {})
-        trajectories, data_stats = collect_parallel_data(
+        timeout = self.config.get('phase1', {}).get('data_collection_timeout', 180)
+        num_workers = self.config.get('phase1', {}).get('num_parallel_workers', None)
+
+        # 使用优化的并行收集器
+        all_trajectories, total_stats = collect_parallel_data_optimized(
             config=data_config,
             num_episodes=num_episodes,
+            max_steps=data_config.get('max_steps', 3600),
+            timeout=timeout,
+            num_workers=num_workers,  # 使用配置中的工作进程数
             output_dir="data"
         )
+
+        # 检查收集结果
+        if len(all_trajectories) == 0:
+            print("⚠️  警告: 没有收集到任何数据，跳过阶段1训练")
+            return model
 
         # 2. 创建数据集
         print(f"\n🔄 创建数据集...")
         dataset = TrajectoryDataset(
-            trajectories=trajectories,
+            trajectories=all_trajectories,
             future_steps=1,  # Phase 1只预测下一步
             sequence_length=10
         )
+
+        # 检查数据集大小
+        if len(dataset) == 0:
+            print("⚠️  警告: 数据集为空，跳过阶段1训练")
+            return model
 
         dataloader = DataLoader(
             dataset,
@@ -104,6 +121,8 @@ class Trainer:
         # 5. 训练循环
         best_loss = float('inf')
         phase1_history = []
+
+        print(f"\n🏋️  开始训练 ({epochs} epochs)...")
 
         for epoch in range(epochs):
             epoch_start = time.time()

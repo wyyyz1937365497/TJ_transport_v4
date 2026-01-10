@@ -201,22 +201,34 @@ class SumoEnvironment:
                 target_speed = max(0, current_speed + acceleration * self.step_length)
                 traci.vehicle.setSpeed(veh_id, target_speed)
 
-                # 应用换道
+                # 应用换道（安全版本）
                 if lane_change > 0.5:
-                    current_lane = traci.vehicle.getLaneIndex(veh_id)
-                    road_id = traci.vehicle.getRoadID(veh_id)
-
-                    # 随机选择左右车道
-                    lane_change_direction = np.random.choice([-1, 1])
-
                     try:
-                        traci.vehicle.changeLane(
-                            veh_id,
-                            current_lane + lane_change_direction,
-                            2.0  # 持续时间
-                        )
-                    except:
-                        pass  # 换道失败（可能是边界）
+                        current_lane = traci.vehicle.getLaneIndex(veh_id)
+                        road_id = traci.vehicle.getRoadID(veh_id)
+
+                        # 获取道路的车道数量
+                        lane_count = traci.edge.getLaneNumber(road_id)
+
+                        # 检查可以换到哪个车道
+                        possible_directions = []
+                        if current_lane > 0:
+                            possible_directions.append(-1)  # 可以向左
+                        if current_lane < lane_count - 1:
+                            possible_directions.append(1)   # 可以向右
+
+                        if possible_directions:
+                            # 随机选择一个有效的换道方向
+                            lane_change_direction = np.random.choice(possible_directions)
+
+                            traci.vehicle.changeLane(
+                                veh_id,
+                                current_lane + lane_change_direction,
+                                2.0  # 持续时间
+                            )
+                    except Exception as lane_error:
+                        # 换道失败，忽略
+                        pass
 
             except Exception as e:
                 # 忽略单个车辆的控制失败
@@ -225,25 +237,26 @@ class SumoEnvironment:
     def _get_observation(self) -> Dict[str, Any]:
         """获取当前观测"""
         # 获取所有车辆
-        vehicle_ids = traci.vehicle.getIDList()
+        all_vehicle_ids = traci.vehicle.getIDList()
 
         vehicle_states = {}
+        valid_vehicle_ids = []  # 只保留成功获取状态的车辆
         icv_ids = set()
 
-        # 根据配置选择ICV
+        # 根据配置选择ICV（从所有车辆中选择）
         control_ratio = self.config.get('control_ratio', 0.25)
-        num_icv = max(1, int(len(vehicle_ids) * control_ratio))
+        num_icv = max(1, int(len(all_vehicle_ids) * control_ratio))
 
-        if len(vehicle_ids) > 0:
+        if len(all_vehicle_ids) > 0:
             icv_indices = np.random.choice(
-                len(vehicle_ids),
-                size=min(num_icv, len(vehicle_ids)),
+                len(all_vehicle_ids),
+                size=min(num_icv, len(all_vehicle_ids)),
                 replace=False
             )
-            icv_ids = {vehicle_ids[i] for i in icv_indices}
+            icv_ids = {all_vehicle_ids[i] for i in icv_indices}
 
-        # 收集车辆状态
-        for veh_id in vehicle_ids:
+        # 收集车辆状态（只保留成功的）
+        for veh_id in all_vehicle_ids:
             try:
                 position = traci.vehicle.getPosition(veh_id)
                 speed = traci.vehicle.getSpeed(veh_id)
@@ -268,7 +281,12 @@ class SumoEnvironment:
                     'acceleration': acceleration,
                     'position': traci.vehicle.getLanePosition(veh_id)
                 }
-            except:
+
+                # 添加到有效车辆列表
+                valid_vehicle_ids.append(veh_id)
+
+            except Exception as e:
+                # 获取状态失败，跳过此车辆
                 continue
 
         # 全局统计
@@ -276,7 +294,7 @@ class SumoEnvironment:
 
         observation = {
             'vehicle_states': vehicle_states,
-            'vehicle_ids': vehicle_ids,
+            'vehicle_ids': valid_vehicle_ids,  # 使用有效车辆列表
             'icv_ids': icv_ids,
             'global_stats': global_stats,
             'step': self.current_step

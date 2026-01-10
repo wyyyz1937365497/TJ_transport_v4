@@ -50,25 +50,30 @@
   },
 
   "phase1": {
-    "num_episodes": 20,
-    "epochs": 20,
-    "batch_size": 128,
+    "num_episodes": 5,
+    "epochs": 10,
+    "batch_size": 64,
     "lr": 1e-4,
-    "weight_decay": 1e-5
+    "weight_decay": 1e-5,
+    "data_collection_timeout": 180,
+    "num_parallel_workers": 4,
+    "phase1_model_path": "models/world_model_phase1.pth"
   },
 
   "phase2": {
-    "num_envs": 2,
-    "total_timesteps": 10000,
+    "num_envs": 1,
+    "total_timesteps": 2000,
     "lr": 3e-4,
     "gamma": 0.99,
-    "gae_lambda": 0.95
+    "gae_lambda": 0.95,
+    "phase2_model_path": "models/ppo_phase2.pth"
   },
 
   "phase3": {
-    "total_timesteps": 5000,
+    "total_timesteps": 1000,
     "cost_limit": 0.1,
-    "lr": 1e-4
+    "lr": 1e-4,
+    "final_model_path": "models/constrained_final.zip"
   },
 
   "evaluation": {
