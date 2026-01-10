@@ -115,10 +115,11 @@ class TrafficController(nn.Module):
             graph_data = self.graph_builder.build_graph(vehicle_states, icv_ids)
 
         # 2. 感知层：GNN特征提取
+        # 注意：参数名需要与 RiskSensitiveGNN.forward() 匹配
         gnn_output = self.risk_gnn(
             node_features=graph_data.x,
             edge_index=graph_data.edge_index,
-            edge_attr=graph_data.edge_attr,
+            edge_features=graph_data.edge_attr,  # 修正参数名
             batch=batch.get('batch', None)
         )
 

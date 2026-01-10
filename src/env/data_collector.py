@@ -264,7 +264,7 @@ def collect_parallel_data(
         process_config = config.copy()
         process_config['process_id'] = i
         process_config['num_episodes'] = episodes
-        process_config['port'] = 8813 + i  # 使用不同端口避免冲突
+        # 移除 port 设置，让SUMO自动管理端口
         process_configs.append(process_config)
 
     # 单进程收集（简化版，避免多进程复杂度）

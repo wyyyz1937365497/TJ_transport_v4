@@ -78,17 +78,32 @@ class RiskSensitiveGNN(nn.Module):
         self.layer_norms = nn.ModuleList()
 
         for i in range(num_layers):
-            self.gnn_layers.append(
-                GATv2Conv(
-                    in_channels=hidden_dim,
-                    out_channels=hidden_dim,
-                    heads=heads,
-                    concat=False,
-                    edge_dim=hidden_dim // 2,
-                    dropout=dropout,
-                    bias=True
+            try:
+                # 尝试创建支持边特征的 GAT 层
+                self.gnn_layers.append(
+                    GATv2Conv(
+                        in_channels=hidden_dim,
+                        out_channels=hidden_dim,
+                        heads=heads,
+                        concat=False,
+                        edge_dim=hidden_dim // 2,  # 某些版本可能不支持
+                        dropout=dropout,
+                        bias=True
+                    )
                 )
-            )
+            except TypeError:
+                # 如果不支持 edge_dim，则创建不带边特征的版本
+                print(f"⚠️  警告: GATv2Conv 不支持 edge_dim，将使用不带边特征的版本")
+                self.gnn_layers.append(
+                    GATv2Conv(
+                        in_channels=hidden_dim,
+                        out_channels=hidden_dim,
+                        heads=heads,
+                        concat=False,
+                        dropout=dropout,
+                        bias=True
+                    )
+                )
             self.layer_norms.append(nn.LayerNorm(hidden_dim))
 
         # 输出投影层
@@ -152,10 +167,15 @@ class RiskSensitiveGNN(nn.Module):
         for i, gnn_layer in enumerate(self.gnn_layers):
             residual = x
 
-            # GNN传播
-            if edge_features.size(0) > 0:
-                x = gnn_layer(x, edge_index, edge_attr=edge_emb)
-            else:
+            # GNN传播（兼容不同版本的PyTorch Geometric）
+            try:
+                # 尝试使用 edge_attr 参数
+                if edge_features.size(0) > 0:
+                    x = gnn_layer(x, edge_index, edge_attr=edge_emb)
+                else:
+                    x = gnn_layer(x, edge_index)
+            except TypeError:
+                # 如果不支持 edge_attr，则不使用边特征
                 x = gnn_layer(x, edge_index)
 
             # 残差连接 + 层归一化

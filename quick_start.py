@@ -32,8 +32,7 @@ def main():
             "sumo_cfg": "仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg",
             "step_length": 0.1,
             "max_steps": 1000,  # 短时间测试
-            "control_ratio": 0.25,
-            "port": 8813
+            "control_ratio": 0.25
         },
 
         "model": {

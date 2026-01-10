@@ -96,12 +96,15 @@ class SumoEnvironment:
             "-c", self.sumo_cfg,
             "--no-step-log", "true",
             "--no-warnings", "true",
-            "--step-length", str(self.step_length),
-            "--seed", str(self.config.get('seed', 42))
+            "--step-length", str(self.step_length)
         ]
 
-        # 添加远程端口（避免冲突）
-        cmd.extend(["--remote-port", str(self.config.get('port', 8813))])
+        # 只有在配置中明确指定了seed才添加
+        if 'seed' in self.config:
+            cmd.extend(["--seed", str(self.config['seed'])])
+
+        # 移除 remote-port 设置，避免与.sumocfg文件冲突
+        # SUMO会自动使用默认端口或从配置文件读取
 
         return cmd
 
