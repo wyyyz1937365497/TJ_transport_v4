@@ -60,10 +60,16 @@
     "phase2_model_path": "models/ppo_phase2.pth"
   },
   "phase3": {
-    "total_timesteps": 1000,
+    "total_timesteps": 30000,
+    "lr": 1e-5,
+    "freeze_bn": true,
+    "phase3_model_path": "models/e2e_phase3.pth"
+  },
+  "phase4": {
+    "total_timesteps": 20000,
     "cost_limit": 0.1,
     "lr": 1e-4,
-    "final_model_path": "models/constrained_final.zip"
+    "final_model_path": "models/final_model.pth"
   },
   "evaluation": {
     "num_episodes": 5,

@@ -37,8 +37,8 @@ def main():
     parser = argparse.ArgumentParser(description='智能交通控制系统训练')
     parser.add_argument('--config', type=str, default='configs/training_config.json',
                        help='配置文件路径')
-    parser.add_argument('--phase', type=str, default='all', choices=['1', '2', '3', 'all'],
-                       help='训练阶段: 1, 2, 3, 或 all')
+    parser.add_argument('--phase', type=str, default='all', choices=['1', '2', '3', '4', 'all'],
+                       help='训练阶段: 1, 2, 3, 4, 或 all')
     parser.add_argument('--eval-only', action='store_true',
                        help='仅评估模式')
     parser.add_argument('--generate-xlsx', action='store_true',
@@ -124,20 +124,32 @@ def main():
 
     if args.phase == 'all' or args.phase == '3':
         print("\n" + "="*70)
-        print("🔄 阶段3：约束优化训练")
+        print("🔄 阶段3：端到端微调（所有组件联合优化）")
         print("="*70)
 
         model = trainer.train_phase3(
             model=model,
             total_timesteps=config.get('phase3', {}).get('total_timesteps', 5000),
-            cost_limit=config.get('phase3', {}).get('cost_limit', 0.1),
-            learning_rate=config.get('phase3', {}).get('lr', 1e-4)
+            learning_rate=config.get('phase3', {}).get('lr', 1e-5),
+            freeze_bn=config.get('phase3', {}).get('freeze_bn', True)
+        )
+
+    if args.phase == 'all' or args.phase == '4':
+        print("\n" + "="*70)
+        print("🔄 阶段4：约束优化训练（拉格朗日乘子法）")
+        print("="*70)
+
+        model = trainer.train_phase4(
+            model=model,
+            total_timesteps=config.get('phase4', {}).get('total_timesteps', 5000),
+            cost_limit=config.get('phase4', {}).get('cost_limit', 0.1),
+            learning_rate=config.get('phase4', {}).get('lr', 1e-4)
         )
 
     total_time = time.time() - start_time
 
     print("\n" + "="*70)
-    print("🎉 训练完成!")
+    print("🎉 训练完成!（4阶段训练）")
     print("="*70)
     print(f"   总耗时: {total_time/3600:.2f} 小时")
 
