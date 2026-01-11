@@ -131,9 +131,9 @@ class FullTrafficController(nn.Module):
         batch_size = vehicle_states.size(0)
 
         # 重塑车辆状态
-        # vehicle_states: [B, N*5] -> [B*N, 5]
-        num_vehicles = vehicle_states.size(1) // 5
-        vehicle_states_reshaped = vehicle_states.view(-1, 5)  # [B*N, 5]
+        # vehicle_states: [B, N*9] -> [B*N, 9] (9维Frenet特征: s, d, vs, vd, speed, acceleration, lane_index, angle, is_icv)
+        num_vehicles = vehicle_states.size(1) // 9
+        vehicle_states_reshaped = vehicle_states.view(-1, 9)  # [B*N, 9]
 
         # 构建图数据（简化版，用于批量处理）
         # 注意：在真实场景中需要为每个batch构建单独的图

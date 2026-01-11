@@ -33,8 +33,14 @@ class CompetitionSumoEnv(SumoEnvironment):
     4. 添加吞吐量和通行时间统计
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        use_gui: bool = False,
+        port: Optional[int] = None,
+        disable_port_retry: bool = False
+    ):
+        super().__init__(config, use_gui=use_gui, port=port, disable_port_retry=disable_port_retry)
 
         # 初始化优化的Frenet坐标系(基于固定路网)
         net_xml_path = config.get('net_file', '仿真环境_初赛_1.0/仿真环境-初赛/net.xml')

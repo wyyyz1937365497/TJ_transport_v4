@@ -34,7 +34,6 @@ from stable_baselines3.common.vec_env import VecEnv
 # 项目导入
 from src.env.vec_env import create_parallel_envs
 from src.models.sb3_full_policy import create_full_traffic_policy
-from src.utils.weight_transfer import WeightTransfer
 
 # Phase 1 传统训练导入（复用）
 from src.algorithms.training import Trainer
@@ -72,9 +71,6 @@ class TrainingPipelineSB3:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
-
-        # 权重传递器
-        self.weight_transfer = WeightTransfer(verbose=True)
 
         # 模型历史
         self.phase1_model = None
@@ -796,8 +792,7 @@ class TrainingPipelineSB3:
 
         history = {
             'timestamp': datetime.now().isoformat(),
-            'history': self.history,
-            'transfer_summary': self.weight_transfer.get_transfer_summary()
+            'history': self.history
         }
 
         with open(filepath, 'w', encoding='utf-8') as f:

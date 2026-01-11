@@ -6,3 +6,5 @@ data/
 logs/
 logs_sb3/
 nul
+logs_sb3/
+checkpoints_sb3_test/

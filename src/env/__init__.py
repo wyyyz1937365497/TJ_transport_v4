@@ -3,18 +3,26 @@ SUMO环境模块
 """
 
 from .sumo_env import SumoEnvironment
-from .data_collector import EfficientDataCollector, TrajectoryDataset
-from .parallel_collector import (
-    ParallelDataCollector,
-    collect_parallel_data_optimized,
-    collect_single_episode
-)
+try:
+    from .data_collector import EfficientDataCollector, TrajectoryDataset
+    _data_collector_available = True
+except ImportError:
+    _data_collector_available = False
 
-__all__ = [
-    'SumoEnvironment',
-    'EfficientDataCollector',
-    'TrajectoryDataset',
-    'ParallelDataCollector',
-    'collect_parallel_data_optimized',
-    'collect_single_episode'
-]
+try:
+    from .parallel_collector import (
+        ParallelDataCollector,
+        collect_parallel_data_optimized,
+        collect_single_episode
+    )
+    _parallel_collector_available = True
+except ImportError:
+    _parallel_collector_available = False
+
+__all__ = ['SumoEnvironment']
+
+if _data_collector_available:
+    __all__.extend(['EfficientDataCollector', 'TrajectoryDataset'])
+
+if _parallel_collector_available:
+    __all__.extend(['ParallelDataCollector', 'collect_parallel_data_optimized', 'collect_single_episode'])
