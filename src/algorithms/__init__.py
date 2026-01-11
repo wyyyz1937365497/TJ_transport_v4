@@ -2,9 +2,14 @@
 算法模块
 """
 
-from .training import Trainer, train_full_pipeline
+# 可选导入 - 避免在缺少依赖时失败
+try:
+    from .training import Trainer, train_full_pipeline
+    _training_available = True
+except ImportError:
+    _training_available = False
 
-__all__ = [
-    'Trainer',
-    'train_full_pipeline'
-]
+__all__ = []
+
+if _training_available:
+    __all__.extend(['Trainer', 'train_full_pipeline'])

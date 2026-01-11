@@ -5,6 +5,12 @@
 
 import os
 import sys
+
+# Windows UTF-8编码修复
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 import yaml
 import argparse
 from pathlib import Path
@@ -20,8 +26,10 @@ from stable_baselines3.common.callbacks import (
 )
 from stable_baselines3.common.utils import set_random_seed
 
-# 添加src到路径
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# 添加项目根目录到路径
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "src"))
 
 from src.env.vec_env import create_parallel_envs
 from src.models.sb3_policy import create_custom_policy
@@ -263,22 +271,63 @@ def train_sb3(
 
     # 关闭环境
     vec_env.close()
-    eval_env.close()
+    eval_env_wrapper.close()
 
     return model
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="使用Stable-Baselines3训练SUMO交通控制")
-    parser.add_argument("--config", type=str, default="wsl/config/base.yaml",
-                       help="配置文件路径")
-    parser.add_argument("--timesteps", type=int, default=100000,
-                       help="总训练步数")
-    parser.add_argument("--envs", type=int, default=4,
-                       help="并行环境数量")
+    parser = argparse.ArgumentParser(
+        description="使用Stable-Baselines3训练SUMO交通控制",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+性能优化示例:
+  # 使用配置文件中的高性能设置
+  python train_sb3.py --config configs/windows_high_performance.yaml
+
+  # 使用命令行参数覆盖（4个并行环境）
+  python train_sb3.py --envs 4 --batch-size 128
+
+  # 高性能配置（16个并行环境）
+  python train_sb3.py --envs 16 --batch-size 256
+
+  # 极限性能配置（32个并行环境，需要大显存GPU）
+  python train_sb3.py --envs 32 --batch-size 512
+
+  # 指定训练步数
+  python train_sb3.py --timesteps 50000
+
+配置文件选项:
+  - configs/windows_base.yaml (标准配置，4个环境)
+  - configs/windows_high_performance.yaml (高性能，16个环境)
+  - configs/windows_extreme_performance.yaml (极限性能，32个环境)
+        """
+    )
+
+    # 配置文件
+    parser.add_argument("--config", type=str, default="configs/windows_base.yaml",
+                       help="配置文件路径 (默认: configs/windows_base.yaml)")
+
+    # 性能参数（可以通过命令行覆盖配置文件）
+    parser.add_argument("--envs", type=int, default=None,
+                       help="并行环境数量 (覆盖配置文件，默认使用配置文件值)")
+    parser.add_argument("--timesteps", type=int, default=None,
+                       help="总训练步数 (覆盖配置文件，默认使用配置文件值)")
+    parser.add_argument("--batch-size", type=int, default=None,
+                       help="PPO批次大小 (覆盖配置文件)")
+    parser.add_argument("--n-steps", type=int, default=None,
+                       help="每次rollout的步数 (覆盖配置文件)")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                       help="学习率 (覆盖配置文件)")
+
+    # 其他参数
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_sb3",
-                       help="检查点目录")
+                       help="检查点目录 (默认: checkpoints_sb3)")
+    parser.add_argument("--device", type=str, choices=["cuda", "cpu", "auto"], default=None,
+                       help="训练设备 (覆盖配置文件)")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="随机种子 (覆盖配置文件)")
     parser.add_argument("--phase", type=str, choices=["phase1", "phase2", "phase3", "all"],
                        default="all", help="训练阶段")
 
@@ -287,6 +336,37 @@ def main():
     # 加载配置
     print(f"📋 加载配置: {args.config}")
     config = load_config(args.config)
+
+    # 命令行参数覆盖配置文件
+    if args.envs is not None:
+        config.setdefault('training', {}).setdefault('phase2', {})['num_envs'] = args.envs
+        print(f"   - 命令行覆盖: num_envs = {args.envs}")
+
+    if args.timesteps is not None:
+        config.setdefault('training', {}).setdefault('phase2', {})['total_timesteps'] = args.timesteps
+        print(f"   - 命令行覆盖: total_timesteps = {args.timesteps}")
+
+    if args.batch_size is not None:
+        config.setdefault('training', {}).setdefault('phase2', {})['batch_size'] = args.batch_size
+        print(f"   - 命令行覆盖: batch_size = {args.batch_size}")
+
+    if args.n_steps is not None:
+        config.setdefault('training', {}).setdefault('phase2', {})['n_steps'] = args.n_steps
+        print(f"   - 命令行覆盖: n_steps = {args.n_steps}")
+
+    if args.learning_rate is not None:
+        config.setdefault('training', {}).setdefault('phase2', {})['learning_rate'] = args.learning_rate
+        print(f"   - 命令行覆盖: learning_rate = {args.learning_rate}")
+
+    if args.device is not None:
+        config['device'] = args.device
+        print(f"   - 命令行覆盖: device = {args.device}")
+
+    if args.seed is not None:
+        config['seed'] = args.seed
+        print(f"   - 命令行覆盖: seed = {args.seed}")
+
+    print()
 
     # 根据阶段训练
     if args.phase in ["phase1", "all"]:
@@ -301,10 +381,17 @@ def main():
         print("🎯 阶段2: PPO训练（主要训练阶段）")
         print("="*70)
 
+        # 从配置文件获取默认值
+        training_config = config.get('training', {}).get('phase2', {})
+
+        # 确定最终使用的参数值（命令行 > 配置文件 > 默认值）
+        final_timesteps = args.timesteps if args.timesteps is not None else training_config.get('total_timesteps', 100000)
+        final_num_envs = args.envs if args.envs is not None else training_config.get('num_envs', 4)
+
         train_sb3(
             config=config,
-            total_timesteps=args.timesteps,
-            num_envs=args.envs,
+            total_timesteps=final_timesteps,
+            num_envs=final_num_envs,
             checkpoint_dir=args.checkpoint_dir
         )
 
