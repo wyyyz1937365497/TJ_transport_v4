@@ -1,0 +1,136 @@
+# TJ_transport_v4 - 快速测试配置
+# 用于验证训练流程是否正常工作
+
+# 基础设置
+device: cuda  # cuda, cpu, auto
+seed: 42
+precision: fp32  # 使用fp32以避免精度问题
+
+# 项目路径
+paths:
+  root_dir: .
+  data_dir: data
+  log_dir: logs
+  checkpoint_dir: checkpoints
+  result_dir: results
+
+# SUMO环境配置 - 使用测试网络
+environment:
+  # 使用SUMO内置网格网络的配置将在运行时自动生成
+  sumo_cfg: "仿真环境_初赛_1.0\\仿真环境-初赛\\sumo.sumocfg"  # 留空，自动生成测试网络
+  net_file: "仿真环境_初赛_1.0\\仿真环境-初赛\\net.xml"
+  route_file: "仿真环境_初赛_1.0\\仿真环境-初赛\\routes.xml"
+  step_length: 0.1
+  max_steps: 300  # 快速测试：每个episode最多300步
+  control_ratio: 0.25
+  use_gui: false
+  num_parallel_workers: 1  # 最小并行数
+
+# 模型架构 - 使用较小的模型
+model:
+  gnn:
+    node_dim: 9
+    edge_dim: 4
+    hidden_dim: 32  # 减小：64 -> 32
+    output_dim: 128  # 减小：256 -> 128
+    num_layers: 2    # 减少层数
+    heads: 2         # 减少注意力头
+    dropout: 0.1
+    use_batch_norm: true
+
+  world_model:
+    input_dim: 128
+    hidden_dim: 64   # 减小：128 -> 64
+    future_steps: 3   # 减少预测步数
+    num_layers: 1     # 减少层数
+    bidirectional: false
+    dropout: 0.1
+
+  controller:
+    gnn_dim: 128
+    world_dim: 128
+    global_dim: 8     # 减小：16 -> 8
+    hidden_dim: 64    # 减小：128 -> 64
+    action_dim: 2
+    top_k: 3          # 减少top-k
+    dropout: 0.2
+
+  safety:
+    ttc_threshold: 2.0
+    thw_threshold: 1.5
+    max_accel: 2.0
+    max_decel: -3.0
+    emergency_decel: -5.0
+
+  graph:
+    interaction_radius: 100.0
+    max_neighbors: 4   # 减少邻居数
+    lane_change_distance: 50.0
+
+# 训练配置 - 快速测试
+training:
+  # 阶段1: World Model预训练（最小配置）
+  phase1:
+    enabled: true
+    num_episodes: 2   # 只收集2个episodes
+    epochs: 3         # 只训练3个epochs
+    batch_size: 16    # 小batch size
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-5
+    data_collection_timeout: 60  # 1分钟超时
+    num_parallel_workers: 1
+    use_mixed_precision: false
+    gradient_clip: 1.0
+    warmup_epochs: 1
+    phase1_model_path: "checkpoints/world_model_phase1.pth"
+
+  # 阶段2: PPO训练（最小配置）
+  phase2:
+    enabled: true
+    num_envs: 1       # 单环境
+    total_timesteps: 500  # 极少步数
+    learning_rate: 3.0e-4
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_epsilon: 0.2
+    entropy_coef: 0.01
+    value_loss_coef: 0.5
+    update_epochs: 2  # 减少epochs
+    batch_size: 32
+    n_steps: 128      # 减少rollout步数
+    phase2_model_path: "checkpoints/ppo_phase2.pth"
+
+  # 阶段3: 端到端微调（最小配置）
+  phase3:
+    enabled: true
+    total_timesteps: 300  # 极少步数
+    learning_rate: 1.0e-5
+    freeze_bn: true
+    phase3_model_path: "checkpoints/e2e_phase3.pth"
+
+  # 阶段4: 约束优化训练（最小配置）
+  phase4:
+    enabled: true
+    total_timesteps: 300  # 极少步数
+    cost_limit: 0.1
+    learning_rate: 1.0e-4
+    final_model_path: "checkpoints/final_model.pth"
+
+# 评估配置
+evaluation:
+  num_episodes: 2  # 只评估2个episodes
+  generate_xlsx: false  # 不生成XLSX以加快速度
+
+# WandB配置
+wandb:
+  enabled: false
+  project: tj-transport-test
+  entity: null
+  run_name: null
+
+# 日志配置
+logging:
+  log_every_n_steps: 10
+  val_check_interval: 50
+  save_top_k: 1
+  profiler: null
