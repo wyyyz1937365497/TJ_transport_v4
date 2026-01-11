@@ -676,7 +676,8 @@ class TrainingPipelineSB3:
         self,
         total_timesteps: int,
         cost_limit: float,
-        learning_rate: float
+        learning_rate: float,
+        phase3_model: Optional[PPO] = None
     ):
         """
         Phase 4 拉格朗日 PPO 实现（主要实现）
@@ -769,9 +770,25 @@ class TrainingPipelineSB3:
 
                 return loss
 
-        # 复用 Phase 3 的环境和策略
-        vec_env = self.phase3_model.get_env()
-        policy_class = self.phase3_model.policy.__class__
+        # 为 Phase 4 创建新的并行环境，避免复用并已关闭的 Phase 3 环境
+        env_config = self.config.get('environment', {})
+        phase4_cfg = self.config.get('training', {}).get('phase4', {})
+        num_envs = phase4_cfg.get('num_envs', 2)
+
+        # 使用不同的端口范围，避免与 Phase 3 冲突（Phase 3 使用 8913-8920）
+        base_port = phase4_cfg.get('base_port', 9013)
+
+        vec_env_wrapper = create_parallel_envs(
+            config=env_config,
+            num_envs=num_envs,
+            base_port=base_port,
+            seed=self.config.get('seed', 42)
+        )
+        vec_env = vec_env_wrapper.vec_env
+
+        # 策略类与 Phase 3 保持一致
+        src_phase3_model = phase3_model if phase3_model is not None else self.phase3_model
+        policy_class = src_phase3_model.policy.__class__
 
         # 创建拉格朗日 PPO 模型
         phase4_config = self.config.get('training', {}).get('phase4', {})
@@ -801,7 +818,7 @@ class TrainingPipelineSB3:
         # 加载 Phase 3 权重
         print("\n🔄 加载 Phase 3 权重...")
         try:
-            model.set_parameters(self.phase3_model.get_parameters())
+            model.set_parameters(src_phase3_model.get_parameters())
             print("✅ 权重加载成功")
         except Exception as e:
             print(f"⚠️  权重加载失败: {e}")
@@ -837,6 +854,9 @@ class TrainingPipelineSB3:
         print("\n" + "="*70)
         print(f"✅ Phase 4 拉格朗日 PPO 训练完成！")
         print("="*70)
+
+        # 清理环境
+        vec_env.close()
 
         return model
 
