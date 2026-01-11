@@ -160,24 +160,38 @@ def train_sb3(
         **env_config
     }
 
+    # 从配置文件读取PPO参数
+    training_config = config.get('training', {}).get('phase2', {})
+
     # 创建模型
     policy_class = create_custom_policy(full_config)
+
+    # PPO超参数
+    learning_rate = training_config.get('learning_rate', 3e-4)
+    n_steps = training_config.get('n_steps', 2048)
+    batch_size = training_config.get('batch_size', 256)
+    n_epochs = training_config.get('update_epochs', 10)
+    gamma = training_config.get('gamma', 0.99)
+    gae_lambda = training_config.get('gae_lambda', 0.95)
+    clip_range = training_config.get('clip_epsilon', 0.2)
+    ent_coef = training_config.get('entropy_coef', 0.01)
+    vf_coef = training_config.get('value_loss_coef', 0.5)
 
     model = PPO(
         policy=policy_class,
         env=vec_env,
         verbose=1,
         tensorboard_log="./logs_sb3/tensorboard/",
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        n_epochs=n_epochs,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        clip_range=clip_range,
         clip_range_vf=None,
-        ent_coef=0.01,
-        vf_coef=0.5,
+        ent_coef=ent_coef,
+        vf_coef=vf_coef,
         max_grad_norm=0.5,
         target_kl=0.03,
         stats_window_size=100,
@@ -188,9 +202,10 @@ def train_sb3(
 
     print("✅ 模型创建成功")
     print(f"   - 策略: {policy_class.__name__}")
-    print(f"   - 学习率: 3e-4")
-    print(f"   - 批次大小: 64")
-    print(f"   - PPO epochs: 10")
+    print(f"   - 学习率: {learning_rate}")
+    print(f"   - 批次大小: {batch_size}")
+    print(f"   - PPO n_steps: {n_steps}")
+    print(f"   - PPO epochs: {n_epochs}")
 
     # 设置回调
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)

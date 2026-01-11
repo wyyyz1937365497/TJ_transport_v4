@@ -41,8 +41,8 @@ GNN_HEADS = 4  # 注意力头数
 GNN_DROPOUT = 0.1  # GNN Dropout率
 
 # 世界模型配置
-WORLD_MODEL_INPUT_DIM = 256  # 世界模型输入维度
-WORLD_MODEL_HIDDEN_DIM = 128  # 世界模型隐藏层维度
+WORLD_MODEL_INPUT_DIM = 256  # 世界模型输入维度（应该等于GNN_OUTPUT_DIM）
+WORLD_MODEL_HIDDEN_DIM = 128  # 世界模型隐藏层维度（LSTM输出维度）
 WORLD_MODEL_FUTURE_STEPS = 5  # 预测未来步数
 WORLD_MODEL_NUM_LAYERS = 2  # 世界模型层数
 WORLD_MODEL_DROPOUT = 0.1  # 世界模型 Dropout率

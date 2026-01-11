@@ -20,7 +20,7 @@ from ..constants import (
     DEFAULT_MAX_NEIGHBORS,
     DEFAULT_LANE_CHANGE_DISTANCE,
     GNN_OUTPUT_DIM,
-    WORLD_MODEL_INPUT_DIM,
+    WORLD_MODEL_HIDDEN_DIM,
     FEATURE_EXTRACTOR_OUTPUT_DIM,
     MAX_VEHICLES,
     FEATURES_PER_VEHICLE,
@@ -72,9 +72,12 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
             param.requires_grad = False
 
         # 输出投影层（将GNN输出+世界模型预测映射到固定维度）
-        # 输入: GNN global_embedding (GNN_OUTPUT_DIM) + World Model output (WORLD_MODEL_INPUT_DIM)
+        # 输入: GNN global_embedding (GNN_OUTPUT_DIM) + World Model encoded_features (hidden_dim)
+        # 注意：世界模型的 hidden_dim 可能与 GNN_OUTPUT_DIM 不同
+        world_model_hidden_dim = config.get('world_model', {}).get('hidden_dim', WORLD_MODEL_HIDDEN_DIM)
+
         self.output_projection = nn.Sequential(
-            nn.Linear(GNN_OUTPUT_DIM + WORLD_MODEL_INPUT_DIM, FEATURE_EXTRACTOR_OUTPUT_DIM),
+            nn.Linear(GNN_OUTPUT_DIM + world_model_hidden_dim, FEATURE_EXTRACTOR_OUTPUT_DIM),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(FEATURE_EXTRACTOR_OUTPUT_DIM, FEATURE_EXTRACTOR_OUTPUT_DIM)
@@ -134,19 +137,36 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
                     # 获取全局嵌入（使用GNN的全局池化）
                     graph_embedding = gnn_output['global_embedding'].squeeze(0)
 
-                    # 获取世界模型预测的全局特征（取预测的均值）
-                    world_features = world_output.mean(dim=1) if len(world_output.shape) > 1 else world_output
+                    # 从世界模型输出中提取编码特征
+                    # world_output 是字典，包含 'encoded_features', 'next_state' 等
+                    if isinstance(world_output, dict):
+                        # 使用编码特征作为世界模型表示
+                        world_features = world_output.get('encoded_features',
+                                                            world_output.get('next_state',
+                                                                             torch.zeros(GNN_OUTPUT_DIM, device=device)))
+                        # 如果是节点级特征，计算全局池化
+                        if len(world_features.shape) > 1 and world_features.size(0) > 1:
+                            world_features = world_features.mean(dim=0)
+                        else:
+                            world_features = world_features.squeeze(0)
+                    else:
+                        # 如果直接返回张量，直接使用
+                        world_features = world_output
+
+                    # 确保world_features是正确的维度
+                    if world_features.dim() == 0:
+                        world_features = world_features.unsqueeze(0)
 
                     # 组合GNN嵌入和世界模型预测
                     combined = torch.cat([
                         graph_embedding,
-                        world_features.squeeze(0) if len(world_features.shape) > 0 else world_features
+                        world_features
                     ])
                 else:
                     # 无车辆时使用零向量
                     combined = torch.cat([
                         torch.zeros(GNN_OUTPUT_DIM, device=device),
-                        torch.zeros(WORLD_MODEL_INPUT_DIM, device=device)
+                        torch.zeros(WORLD_MODEL_HIDDEN_DIM, device=device)
                     ])
 
                 # 投影到固定维度
