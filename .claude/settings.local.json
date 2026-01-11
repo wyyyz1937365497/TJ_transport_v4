@@ -20,7 +20,11 @@
       "Bash(lsof:*)",
       "Bash(pkill:*)",
       "mcp__web-search-prime__webSearchPrime",
-      "mcp__web-reader__webReader"
+      "mcp__web-reader__webReader",
+      "Bash(tree:*)",
+      "Bash(findstr:*)",
+      "Bash(findstr /B \"D[:] [-.]\")",
+      "Bash(git add:*)"
     ]
   }
 }

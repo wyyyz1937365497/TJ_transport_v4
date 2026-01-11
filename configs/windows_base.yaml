@@ -71,8 +71,23 @@ model:
     max_neighbors: 8
     lane_change_distance: 50.0
 
-# 训练配置
+# 训练配置 - 完整4阶段训练
 training:
+  # 阶段1: World Model预训练
+  phase1:
+    enabled: true
+    num_episodes: 20  # 训练episodes数量
+    epochs: 20  # 训练轮数
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-5
+    data_collection_timeout: 180  # 数据收集超时（秒）
+    num_parallel_workers: 4  # 并行工作进程数
+    use_mixed_precision: false  # 是否使用混合精度训练
+    gradient_clip: 1.0
+    warmup_epochs: 5  # 学习率warmup轮数
+    phase1_model_path: "checkpoints/world_model_phase1.pth"
+
   # 阶段2: PPO训练（主要训练阶段）
   phase2:
     enabled: true
@@ -87,6 +102,23 @@ training:
     update_epochs: 10
     batch_size: 128  # PPO批次大小
     n_steps: 2048  # 每次rollout的步数
+    phase2_model_path: "checkpoints/ppo_phase2.pth"
+
+  # 阶段3: 端到端微调
+  phase3:
+    enabled: true
+    total_timesteps: 50000
+    learning_rate: 1.0e-5
+    freeze_bn: true  # 是否冻结BatchNorm层
+    phase3_model_path: "checkpoints/e2e_phase3.pth"
+
+  # 阶段4: 约束优化训练（拉格朗日乘子法）
+  phase4:
+    enabled: true
+    total_timesteps: 50000
+    cost_limit: 0.1  # 成本上限
+    learning_rate: 1.0e-4
+    final_model_path: "checkpoints/final_model.pth"
 
 # 评估配置
 evaluation:

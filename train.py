@@ -20,23 +20,64 @@ from src.evaluation import XLSXResultGenerator, generate_evaluation_report
 
 
 def load_config(config_path: str) -> dict:
-    """加载配置文件"""
+    """加载配置文件（支持JSON和YAML格式）"""
+    import os
+
     with open(config_path, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+        # 根据文件扩展名选择加载方式
+        if config_path.endswith('.yaml') or config_path.endswith('.yml'):
+            import yaml
+            config = yaml.safe_load(f)
+        else:
+            config = json.load(f)
 
     # 自动检测设备
-    if config['device'] == 'cuda' and not torch.cuda.is_available():
+    if config.get('device', 'cuda') == 'cuda' and not torch.cuda.is_available():
         print("⚠️  CUDA不可用，使用CPU")
         config['device'] = 'cpu'
+
+    # 从YAML配置中提取路径配置
+    if 'paths' in config:
+        paths = config['paths']
+        if 'checkpoint_dir' in paths and 'checkpoint_dir' not in config:
+            config['checkpoint_dir'] = paths['checkpoint_dir']
+        if 'log_dir' in paths and 'log_dir' not in config:
+            config['log_dir'] = paths['log_dir']
 
     return config
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='智能交通控制系统训练')
+    parser = argparse.ArgumentParser(
+        description='智能交通控制系统训练（完整4阶段）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+训练阶段说明:
+  Phase 1 - 世界模型预训练：学习基础交通动力学
+  Phase 2 - PPO训练：带安全屏障的强化学习训练
+  Phase 3 - 端到端微调：联合优化所有组件
+  Phase 4 - 约束优化：使用拉格朗日乘子法平衡性能与成本
+
+配置文件选项:
+  --config configs/training_config.json (JSON格式)
+  --config configs/windows_base.yaml (YAML格式，基础配置)
+  --config configs/windows_high_performance.yaml (YAML格式，高性能配置)
+  --config configs/windows_extreme_performance.yaml (YAML格式，极限性能配置)
+
+示例:
+  # 完整4阶段训练
+  python train.py --config configs/windows_base.yaml --phase all
+
+  # 只运行阶段1（世界模型预训练）
+  python train.py --config configs/windows_base.yaml --phase 1
+
+  # 跳过数据收集，使用已有数据
+  python train.py --config configs/windows_base.yaml --phase 1 --skip-data-collection
+        """
+    )
     parser.add_argument('--config', type=str, default='configs/training_config.json',
-                       help='配置文件路径')
+                       help='配置文件路径（支持JSON和YAML格式）')
     parser.add_argument('--phase', type=str, default='all', choices=['1', '2', '3', '4', 'all'],
                        help='训练阶段: 1, 2, 3, 4, 或 all')
     parser.add_argument('--eval-only', action='store_true',
@@ -50,13 +91,13 @@ def main():
 
     # 加载配置
     print("="*70)
-    print("🎯 智能交通协同控制系统")
+    print("🎯 智能交通协同控制系统 - 完整4阶段训练")
     print("="*70)
 
     config = load_config(args.config)
     print(f"\n📋 配置文件: {args.config}")
-    print(f"🔧 设备: {config['device']}")
-    print(f"🌱 种子: {config['seed']}")
+    print(f"🔧 设备: {config.get('device', 'cuda')}")
+    print(f"🌱 种子: {config.get('seed', 42)}")
 
     # 设置随机种子
     torch.manual_seed(config['seed'])

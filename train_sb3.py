@@ -369,12 +369,17 @@ def main():
     print()
 
     # 根据阶段训练
+    # 注意：此脚本专注于Phase 2 PPO训练
+    # 如需完整的4阶段训练（Phase 1-4），请使用 train.py
+
     if args.phase in ["phase1", "all"]:
         print("\n" + "="*70)
-        print("🎯 阶段1: 世界模型预训练（通过PPO隐式学习）")
+        print("🎯 阶段1: 世界模型预训练")
         print("="*70)
-        # 注意：在这个简化版本中，我们通过端到端训练隐式地学习世界模型
-        # 如果需要显式的世界模型预训练，可以使用原来的代码
+        print("⚠️  注意：train_sb3.py 专注于Phase 2 PPO训练")
+        print("   如需Phase 1世界模型预训练，请使用：")
+        print("   python train.py --config {} --phase 1".format(args.config))
+        print()
 
     if args.phase in ["phase2", "all"]:
         print("\n" + "="*70)
@@ -395,7 +400,23 @@ def main():
             checkpoint_dir=args.checkpoint_dir
         )
 
-    print("\n🎉 所有训练完成！")
+    if args.phase in ["phase3", "all"]:
+        print("\n" + "="*70)
+        print("🎯 阶段3: 端到端微调")
+        print("="*70)
+        print("⚠️  注意：此阶段需要使用完整训练脚本")
+        print("   请使用：python train.py --config {} --phase 3".format(args.config))
+        print()
+
+    if args.phase in ["phase4", "all"]:
+        print("\n" + "="*70)
+        print("🎯 阶段4: 约束优化训练（拉格朗日乘子法）")
+        print("="*70)
+        print("⚠️  注意：此阶段需要使用完整训练脚本")
+        print("   请使用：python train.py --config {} --phase 4".format(args.config))
+        print()
+
+    print("\n🎉 PPO训练完成！")
     print(f"📊 TensorBoard日志: ./logs_sb3/tensorboard/")
     print(f"💾 模型检查点: {args.checkpoint_dir}")
     print("\n使用以下命令查看训练曲线:")

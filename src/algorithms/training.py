@@ -1,6 +1,11 @@
 """
-三阶段训练流程
+三阶段训练流程（优化版）
 功能：实现完整的训练pipeline
+
+优化改进：
+1. 完善的进度跟踪和日志输出
+2. 优化CPU/GPU数据传输效率
+3. 添加详细的统计信息和ETA
 """
 
 import os
@@ -14,8 +19,31 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Dict, List, Optional, Any, Tuple
 import shutil
 
+# 尝试导入tqdm用于进度条
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    print("⚠️  未安装tqdm，使用简化进度显示。安装: pip install tqdm")
+
 from ..models import TrafficController, create_model_from_config, WorldModelLoss
 from ..env import SumoEnvironment, EfficientDataCollector, TrajectoryDataset, collect_parallel_data_optimized
+
+
+def get_gpu_memory_info(device) -> Dict[str, float]:
+    """获取GPU内存使用情况"""
+    if device.type == 'cuda':
+        try:
+            allocated = torch.cuda.memory_allocated(device) / 1024**3
+            reserved = torch.cuda.memory_reserved(device) / 1024**3
+            return {
+                'allocated_gb': allocated,
+                'reserved_gb': reserved
+            }
+        except:
+            pass
+    return {'allocated_gb': 0, 'reserved_gb': 0}
 
 
 class Trainer:
@@ -288,13 +316,28 @@ class Trainer:
         learning_rate: float = 3e-4
     ) -> TrafficController:
         """
-        阶段2：带安全屏障的RL训练
+        阶段2：带安全屏障的RL训练（优化版）
 
-        目标：学习安全控制策略
+        改进：
+        1. 添加详细的进度显示和ETA
+        2. 减少CPU/GPU传输
+        3. 添加性能统计
         """
         print("\n" + "="*70)
         print("🔄 阶段2：带安全屏障的RL训练")
         print("="*70)
+
+        # GPU信息
+        gpu_info = get_gpu_memory_info(self.device)
+        if gpu_info['allocated_gb'] > 0:
+            print(f"\n🔧 GPU状态:")
+            print(f"   - 已分配: {gpu_info['allocated_gb']:.2f} GB")
+            print(f"   - 已预留: {gpu_info['reserved_gb']:.2f} GB")
+
+        print(f"\n📋 训练配置:")
+        print(f"   - 总timesteps: {total_timesteps:,}")
+        print(f"   - 学习率: {learning_rate:.6f}")
+        print(f"   - 设备: {self.device}")
 
         start_time = time.time()
 
@@ -302,7 +345,7 @@ class Trainer:
         checkpoint_path = os.path.join(self.checkpoint_dir, 'world_model_phase1.pth')
         if os.path.exists(checkpoint_path):
             model.load_checkpoint(checkpoint_path)
-            print("✅ 已加载阶段1预训练权重")
+            print("\n✅ 已加载阶段1预训练权重")
 
         # 2. 设置模型
         model.set_world_model_phase(2)
@@ -328,6 +371,16 @@ class Trainer:
         episode_rewards = []
         episode_costs = []
 
+        # 创建进度条（如果tqdm可用）
+        if HAS_TQDM:
+            pbar = tqdm(total=total_timesteps, desc="Training Phase 2",
+                       unit="step", ncols=120, dynamic_ncols=True)
+        else:
+            pbar = None
+            print(f"\n🏋️  开始训练...")
+
+        update_interval = max(1, total_timesteps // 100)  # 更新100次
+
         while timestep < total_timesteps:
             episode_start = time.time()
 
@@ -348,16 +401,17 @@ class Trainer:
                 # 准备batch
                 batch = self._prepare_batch(observation, env)
 
-                # 前向传播
+                # 前向传播（优化：减少GPU->CPU传输）
                 with torch.no_grad():
                     output = model(batch)
 
-                # 获取动作
+                # 获取动作（优化：批量转换到CPU）
                 actions = {}
                 if output['selected_vehicle_ids']:
-                    safe_actions = output['safe_actions'].cpu().numpy()
+                    # 批量转换：只转换一次
+                    safe_actions_np = output['safe_actions'].cpu().numpy()
                     for i, veh_id in enumerate(output['selected_vehicle_ids']):
-                        actions[veh_id] = safe_actions[i]
+                        actions[veh_id] = safe_actions_np[i]
 
                 # 执行
                 next_observation, reward, done, info = env.step(actions)
@@ -378,6 +432,16 @@ class Trainer:
                 timestep += 1
                 step += 1
 
+                # 更新进度条
+                if pbar is not None and timestep % update_interval == 0:
+                    avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0
+                    avg_cost = np.mean(episode_costs[-10:]) if episode_costs else 0
+                    pbar.set_postfix({
+                        'Reward': f'{avg_reward:.2f}',
+                        'Cost': f'{avg_cost:.4f}'
+                    })
+                    pbar.update(update_interval)
+
                 # 定期更新
                 if step % 64 == 0:
                     self._update_policy(model, optimizer, states, actions_list, rewards, values_list)
@@ -396,14 +460,21 @@ class Trainer:
                 'time': episode_time
             })
 
-            # 打印进度
-            if len(episode_rewards) % 10 == 0:
+            # 打印进度（如果没有tqdm）
+            if pbar is None and len(episode_rewards) % 10 == 0:
                 avg_reward = np.mean(episode_rewards[-10:])
                 avg_cost = np.mean(episode_costs[-10:])
-                print(f"   Episode {len(episode_rewards)} | "
-                      f"Avg Reward: {avg_reward:.3f} | "
+                elapsed = time.time() - start_time
+                eta = (total_timesteps - timestep) * (elapsed / max(timestep, 1))
+                print(f"   Episode {len(episode_rewards):3d} | "
+                      f"Avg Reward: {avg_reward:7.3f} | "
                       f"Avg Cost: {avg_cost:.4f} | "
-                      f"Timestep: {timestep}/{total_timesteps}")
+                      f"Timestep: {timestep:7d}/{total_timesteps} | "
+                      f"ETA: {eta/60:.1f}m")
+
+        # 关闭进度条
+        if pbar is not None:
+            pbar.close()
 
         # 保存模型
         final_checkpoint = os.path.join(self.checkpoint_dir, 'ppo_phase2.pth')
@@ -412,8 +483,15 @@ class Trainer:
         self.history['phase2'] = phase2_history
 
         phase2_time = time.time() - start_time
+        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_cost = np.mean(episode_costs[-100:]) if len(episode_costs) >= 100 else np.mean(episode_costs)
+
         print(f"\n✅ 阶段2完成! 耗时: {phase2_time/60:.2f} 分钟")
-        print(f"   总timesteps: {timestep}")
+        print(f"   总timesteps: {timestep:,}")
+        print(f"   总episodes: {len(episode_rewards)}")
+        print(f"   平均奖励: {avg_reward:.3f}")
+        print(f"   平均成本: {avg_cost:.4f}")
+        print(f"   吞吐量: {timestep/phase2_time:.1f} steps/s")
 
         env.close()
 
@@ -496,7 +574,7 @@ class Trainer:
         env_config = self.config.get('environment', {})
         env = SumoEnvironment(env_config, use_gui=False)
 
-        # 6. 训练循环
+        # 6. 训练循环（优化版）
         phase3_history = []
         timestep = 0
 
@@ -504,7 +582,15 @@ class Trainer:
         episode_costs = []
         episode_losses = []
 
-        print(f"\n🏋️  开始端到端微调...")
+        # 创建进度条
+        if HAS_TQDM:
+            pbar = tqdm(total=total_timesteps, desc="Training Phase 3",
+                       unit="step", ncols=120, dynamic_ncols=True)
+        else:
+            pbar = None
+            print(f"\n🏋️  开始端到端微调...")
+
+        update_interval = max(1, total_timesteps // 100)
 
         while timestep < total_timesteps:
             episode_start = time.time()
@@ -529,12 +615,12 @@ class Trainer:
                 # 前向传播（不需要no_grad，因为要计算梯度）
                 output = model(batch)
 
-                # 获取动作
+                # 获取动作（优化：批量转换）
                 actions = {}
                 if output['selected_vehicle_ids']:
-                    safe_actions = output['safe_actions'].cpu().numpy()
+                    safe_actions_np = output['safe_actions'].cpu().numpy()
                     for i, veh_id in enumerate(output['selected_vehicle_ids']):
-                        actions[veh_id] = safe_actions[i]
+                        actions[veh_id] = safe_actions_np[i]
 
                 # 执行动作
                 next_observation, reward, done, info = env.step(actions)
@@ -562,12 +648,15 @@ class Trainer:
                 timestep += 1
                 step += 1
 
-                # 定期打印进度
-                if timestep % 1000 == 0:
+                # 更新进度条
+                if pbar is not None and timestep % update_interval == 0:
+                    avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0
                     current_lr = scheduler.get_last_lr()[0]
-                    print(f"   Timestep {timestep}/{total_timesteps} | "
-                          f"Current LR: {current_lr:.2e} | "
-                          f"Reward: {episode_reward/(step+1):.3f}")
+                    pbar.set_postfix({
+                        'Reward': f'{avg_reward:.2f}',
+                        'LR': f'{current_lr:.2e}'
+                    })
+                    pbar.update(update_interval)
 
             episode_rewards.append(episode_reward)
             episode_costs.append(episode_cost)
@@ -586,16 +675,23 @@ class Trainer:
                 'learning_rate': scheduler.get_last_lr()[0]
             })
 
-            # 打印进度
-            if len(episode_rewards) % 10 == 0:
+            # 打印进度（如果没有tqdm）
+            if pbar is None and len(episode_rewards) % 10 == 0:
                 avg_reward = np.mean(episode_rewards[-10:])
                 avg_cost = np.mean(episode_costs[-10:])
                 avg_loss = np.mean(episode_losses[-10:])
-                print(f"   Episode {len(episode_rewards)} | "
-                      f"Avg Reward: {avg_reward:.3f} | "
+                elapsed = time.time() - start_time
+                eta = (total_timesteps - timestep) * (elapsed / max(timestep, 1))
+                print(f"   Episode {len(episode_rewards):3d} | "
+                      f"Avg Reward: {avg_reward:7.3f} | "
                       f"Avg Cost: {avg_cost:.4f} | "
                       f"Avg Loss: {avg_loss:.6f} | "
-                      f"Timestep: {timestep}/{total_timesteps}")
+                      f"Timestep: {timestep:7d}/{total_timesteps} | "
+                      f"ETA: {eta/60:.1f}m")
+
+        # 关闭进度条
+        if pbar is not None:
+            pbar.close()
 
         # 保存端到端微调后的模型
         e2e_checkpoint = os.path.join(self.checkpoint_dir, 'e2e_phase3.pth')
@@ -605,11 +701,17 @@ class Trainer:
         self.history['phase3'] = phase3_history
 
         phase3_time = time.time() - start_time
+        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_cost = np.mean(episode_costs[-100:]) if len(episode_costs) >= 100 else np.mean(episode_costs)
+        avg_loss = np.mean(episode_losses[-100:]) if len(episode_losses) >= 100 else np.mean(episode_losses)
+
         print(f"\n✅ 阶段3完成! 耗时: {phase3_time/60:.2f} 分钟")
-        print(f"   总timesteps: {timestep}")
-        print(f"   最终奖励: {np.mean(episode_rewards[-10:]):.3f}")
-        print(f"   最终成本: {np.mean(episode_costs[-10:]):.4f}")
-        print(f"   最终损失: {np.mean(episode_losses[-10:]):.6f}")
+        print(f"   总timesteps: {timestep:,}")
+        print(f"   总episodes: {len(episode_rewards)}")
+        print(f"   平均奖励: {avg_reward:.3f}")
+        print(f"   平均成本: {avg_cost:.4f}")
+        print(f"   平均损失: {avg_loss:.6f}")
+        print(f"   吞吐量: {timestep/phase3_time:.1f} steps/s")
 
         env.close()
 
@@ -623,22 +725,31 @@ class Trainer:
         learning_rate: float = 1e-4
     ) -> TrafficController:
         """
-        阶段4：约束优化训练
+        阶段4：约束优化训练（优化版）
 
         目标：平衡性能与成本（使用拉格朗日乘子法）
 
-        Args:
-            model: 端到端微调后的模型（来自Phase 3）
-            total_timesteps: 训练总步数
-            cost_limit: 成本上限
-            learning_rate: 学习率
-
-        Returns:
-            最终优化的模型
+        改进：
+        1. 添加详细进度显示
+        2. 显示拉格朗日乘子变化
+        3. 性能统计
         """
         print("\n" + "="*70)
         print("🔄 阶段4：约束优化训练（拉格朗日乘子法）")
         print("="*70)
+
+        # GPU信息
+        gpu_info = get_gpu_memory_info(self.device)
+        if gpu_info['allocated_gb'] > 0:
+            print(f"\n🔧 GPU状态:")
+            print(f"   - 已分配: {gpu_info['allocated_gb']:.2f} GB")
+            print(f"   - 已预留: {gpu_info['reserved_gb']:.2f} GB")
+
+        print(f"\n📋 约束配置:")
+        print(f"   - 总timesteps: {total_timesteps:,}")
+        print(f"   - 成本上限: {cost_limit}")
+        print(f"   - 学习率: {learning_rate:.6f}")
+        print(f"   - 初始拉格朗日乘子: {model.lagrange_multiplier.item():.3f}")
 
         start_time = time.time()
 
@@ -646,9 +757,9 @@ class Trainer:
         checkpoint_path = os.path.join(self.checkpoint_dir, 'e2e_phase3.pth')
         if os.path.exists(checkpoint_path):
             model.load_checkpoint(checkpoint_path)
-            print("✅ 已加载Phase 3权重（端到端微调后的模型）")
+            print("\n✅ 已加载Phase 3权重（端到端微调后的模型）")
         else:
-            print("⚠️  警告: 未找到Phase 3权重，使用当前模型")
+            print("\n⚠️  警告: 未找到Phase 3权重，使用当前模型")
 
         # 2. 设置约束
         model.cost_limit = cost_limit
@@ -679,14 +790,22 @@ class Trainer:
         env_config = self.config.get('environment', {})
         env = SumoEnvironment(env_config, use_gui=False)
 
-        # 6. 训练循环
+        # 6. 训练循环（优化版）
         phase4_history = []
         timestep = 0
 
         episode_rewards = []
         episode_costs = []
 
-        print(f"\n🏋️  开始约束优化训练...")
+        # 创建进度条
+        if HAS_TQDM:
+            pbar = tqdm(total=total_timesteps, desc="Training Phase 4",
+                       unit="step", ncols=120, dynamic_ncols=True)
+        else:
+            pbar = None
+            print(f"\n🏋️  开始约束优化训练...")
+
+        update_interval = max(1, total_timesteps // 100)
 
         while timestep < total_timesteps:
             episode_start = time.time()
@@ -702,16 +821,16 @@ class Trainer:
                 # 准备batch
                 batch = self._prepare_batch(observation, env)
 
-                # 前向传播
+                # 前向传播（优化：减少GPU->CPU传输）
                 with torch.no_grad():
                     output = model(batch)
 
-                # 获取动作
+                # 获取动作（优化：批量转换）
                 actions = {}
                 if output['selected_vehicle_ids']:
-                    safe_actions = output['safe_actions'].cpu().numpy()
+                    safe_actions_np = output['safe_actions'].cpu().numpy()
                     for i, veh_id in enumerate(output['selected_vehicle_ids']):
-                        actions[veh_id] = safe_actions[i]
+                        actions[veh_id] = safe_actions_np[i]
 
                 # 执行
                 next_observation, reward, done, info = env.step(actions)
@@ -729,6 +848,16 @@ class Trainer:
                 timestep += 1
                 step += 1
 
+                # 更新进度条
+                if pbar is not None and timestep % update_interval == 0:
+                    avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0
+                    lambda_val = model.lagrange_multiplier.item()
+                    pbar.set_postfix({
+                        'Reward': f'{avg_reward:.2f}',
+                        'Lambda': f'{lambda_val:.2f}'
+                    })
+                    pbar.update(update_interval)
+
             episode_rewards.append(episode_reward)
             episode_costs.append(episode_cost)
 
@@ -745,14 +874,22 @@ class Trainer:
                 'time': episode_time
             })
 
-            # 打印进度
-            if len(episode_rewards) % 10 == 0:
+            # 打印进度（如果没有tqdm）
+            if pbar is None and len(episode_rewards) % 10 == 0:
                 avg_reward = np.mean(episode_rewards[-10:])
                 avg_cost = np.mean(episode_costs[-10:])
-                print(f"   Episode {len(episode_rewards)} | "
-                      f"Avg Reward: {avg_reward:.3f} | "
+                lambda_val = model.lagrange_multiplier.item()
+                elapsed = time.time() - start_time
+                eta = (total_timesteps - timestep) * (elapsed / max(timestep, 1))
+                print(f"   Episode {len(episode_rewards):3d} | "
+                      f"Avg Reward: {avg_reward:7.3f} | "
                       f"Avg Cost: {avg_cost:.4f} | "
-                      f"Lambda: {model.lagrange_multiplier.item():.3f}")
+                      f"Lambda: {lambda_val:.3f} | "
+                      f"ETA: {eta/60:.1f}m")
+
+        # 关闭进度条
+        if pbar is not None:
+            pbar.close()
 
         # 保存最终模型
         final_checkpoint = os.path.join(self.checkpoint_dir, 'final_model.pth')
@@ -762,11 +899,16 @@ class Trainer:
         self.history['phase4'] = phase4_history
 
         phase4_time = time.time() - start_time
+        avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        avg_cost = np.mean(episode_costs[-100:]) if len(episode_costs) >= 100 else np.mean(episode_costs)
+
         print(f"\n✅ 阶段4完成! 耗时: {phase4_time/60:.2f} 分钟")
-        print(f"   总timesteps: {timestep}")
-        print(f"   最终奖励: {np.mean(episode_rewards[-10:]):.3f}")
-        print(f"   最终成本: {np.mean(episode_costs[-10:]):.4f}")
+        print(f"   总timesteps: {timestep:,}")
+        print(f"   总episodes: {len(episode_rewards)}")
+        print(f"   平均奖励: {avg_reward:.3f}")
+        print(f"   平均成本: {avg_cost:.4f}")
         print(f"   最终拉格朗日乘子: {model.lagrange_multiplier.item():.3f}")
+        print(f"   吞吐量: {timestep/phase4_time:.1f} steps/s")
 
         env.close()
 

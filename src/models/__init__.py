@@ -33,6 +33,18 @@ try:
 except ImportError:
     _traffic_controller_available = False
 
+try:
+    from .sb3_policy import create_custom_policy
+    _sb3_policy_available = True
+except ImportError:
+    _sb3_policy_available = False
+
+try:
+    from .sb3_full_policy import FullTrafficController, FullTrafficActorCriticPolicy, create_full_traffic_policy
+    _sb3_full_policy_available = True
+except ImportError:
+    _sb3_full_policy_available = False
+
 # 导出可用的模块
 __all__ = []
 
@@ -50,3 +62,9 @@ if _safety_available:
 
 if _traffic_controller_available:
     __all__.extend(['TrafficController', 'create_model_from_config'])
+
+if _sb3_policy_available:
+    __all__.extend(['create_custom_policy'])
+
+if _sb3_full_policy_available:
+    __all__.extend(['FullTrafficController', 'FullTrafficActorCriticPolicy', 'create_full_traffic_policy'])
