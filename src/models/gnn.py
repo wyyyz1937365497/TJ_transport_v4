@@ -245,23 +245,26 @@ class RiskSensitiveGNN(nn.Module):
 
 class GraphBuilder:
     """
-    交通图构建器
+    交通图构建器（GPU加速版本）
 
     功能：
     - 从车辆状态构建交通交互图
     - 连接相邻车辆（同车道前后车）
     - 连接潜在冲突车辆（相邻车道）
+    - 所有计算在GPU上进行，避免CPU-GPU传输
     """
 
     def __init__(
         self,
         interaction_radius: float = 100.0,
         max_neighbors: int = 8,
-        lane_change_distance: float = 50.0
+        lane_change_distance: float = 50.0,
+        device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ):
         self.interaction_radius = interaction_radius
         self.max_neighbors = max_neighbors
         self.lane_change_distance = lane_change_distance
+        self.device = device
 
     def build_graph(
         self,
@@ -290,41 +293,99 @@ class GraphBuilder:
         vehicle_ids = list(vehicle_states.keys())
         num_vehicles = len(vehicle_ids)
 
-        node_features = []
+        # ========== 优化1: 向量化节点特征提取（GPU） ==========
+        # 预分配tensor而非使用list
+        node_features_list = []
         for vid in vehicle_ids:
             state = vehicle_states[vid]
             features = self._extract_node_features(state, icv_ids)
-            node_features.append(features)
+            node_features_list.append(features)
 
-        node_features = torch.tensor(np.array(node_features), dtype=torch.float32)
+        # 直接在GPU上创建tensor
+        node_features = torch.tensor(node_features_list, dtype=torch.float32, device=self.device)
 
-        # 2. 构建边
-        edge_indices = []
-        edge_features = []
+        # ========== 优化2: 向量化边构建（GPU加速）==========
+        if num_vehicles > 1:
+            # 提取所有车辆的位置、速度、加速度、车道信息
+            positions = []
+            velocities = []
+            accelerations = []
+            lane_ids = []
 
-        for i, vid_i in enumerate(vehicle_ids):
-            for j, vid_j in enumerate(vehicle_ids):
-                if i == j:
-                    continue
+            for vid in vehicle_ids:
+                state = vehicle_states[vid]
+                positions.append([state.get('x', 0.0), state.get('y', 0.0)])
+                velocities.append([state.get('vx', 0.0), state.get('vy', 0.0)])
+                accelerations.append([state.get('ax', 0.0), state.get('ay', 0.0)])
+                lane_ids.append(state.get('lane_id', ''))
 
-                state_i = vehicle_states[vid_i]
-                state_j = vehicle_states[vid_j]
+            # 直接在GPU上创建tensor（跳过numpy）
+            positions = torch.tensor(positions, dtype=torch.float32, device=self.device)  # [N, 2]
+            velocities = torch.tensor(velocities, dtype=torch.float32, device=self.device)  # [N, 2]
+            accelerations = torch.tensor(accelerations, dtype=torch.float32, device=self.device)  # [N, 2]
 
-                # 检查是否应该连接
-                should_connect, edge_feat = self._should_connect(state_i, state_j)
+            # ========== GPU加速的向量化计算 ==========
+            # 使用torch.cdist计算距离矩阵（GPU优化）
+            distances = torch.cdist(positions, positions, p=2)  # [N, N]
 
-                if should_connect:
-                    edge_indices.append([i, j])
-                    edge_features.append(edge_feat)
+            # 向量化计算相对速度（GPU）
+            vel_expanded_1 = velocities.unsqueeze(1)  # [N, 1, 2]
+            vel_expanded_2 = velocities.unsqueeze(0)  # [1, N, 2]
+            rel_velocities = vel_expanded_2 - vel_expanded_1  # [N, N, 2]
+            rel_vel_norms = torch.norm(rel_velocities, p=2, dim=2)  # [N, N]
 
-        if len(edge_indices) > 0:
-            edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
-            edge_attr = torch.tensor(np.array(edge_features), dtype=torch.float32)
+            # 向量化计算相对加速度（GPU）
+            acc_expanded_1 = accelerations.unsqueeze(1)
+            acc_expanded_2 = accelerations.unsqueeze(0)
+            rel_accelerations = acc_expanded_2 - acc_expanded_1
+            rel_accel_norms = torch.norm(rel_accelerations, p=2, dim=2)  # [N, N]
+
+            # 判断是否在同一车道（GPU向量化）
+            # 创建车道ID的tensor映射
+            lane_id_to_idx = {lane_id: idx for idx, lane_id in enumerate(set(lane_ids))}
+            lane_indices = torch.tensor([lane_id_to_idx[lid] for lid in lane_ids], device=self.device)
+
+            # 使用广播判断同一车道
+            lane_i = lane_indices.unsqueeze(1)  # [N, 1]
+            lane_j = lane_indices.unsqueeze(0)  # [1, N]
+            same_lane_matrix = (lane_i == lane_j).float()  # [N, N]
+
+            # 构建边：基于交互半径和车道条件
+            edge_indices = []
+            edge_features = []
+
+            # 只考虑上三角矩阵（避免重复）
+            for i in range(num_vehicles):
+                for j in range(i + 1, num_vehicles):
+                    dist = distances[i, j].item()  # 标量，可以移到CPU
+
+                    # 连接条件
+                    same_lane = same_lane_matrix[i, j].item()
+                    if same_lane > 0.5 or dist < self.lane_change_distance:
+                        if dist < self.interaction_radius:
+                            # 双向边
+                            edge_indices.extend([[i, j], [j, i]])
+
+                            # 边特征
+                            edge_feat = [
+                                dist,
+                                rel_vel_norms[i, j].item(),
+                                rel_accel_norms[i, j].item(),
+                                same_lane
+                            ]
+                            edge_features.extend([edge_feat, edge_feat])
+
+            if len(edge_indices) > 0:
+                edge_index = torch.tensor(edge_indices, dtype=torch.long, device=self.device).t().contiguous()
+                edge_attr = torch.tensor(edge_features, dtype=torch.float32, device=self.device)
+            else:
+                edge_index = torch.zeros(2, 0, dtype=torch.long, device=self.device)
+                edge_attr = torch.zeros(0, 4, device=self.device)
         else:
-            edge_index = torch.zeros(2, 0, dtype=torch.long)
-            edge_attr = torch.zeros(0, 4)
+            edge_index = torch.zeros(2, 0, dtype=torch.long, device=self.device)
+            edge_attr = torch.zeros(0, 4, device=self.device)
 
-        # 3. 创建PyG Data对象
+        # 3. 创建PyG Data对象（GPU）
         graph = Data(
             x=node_features,
             edge_index=edge_index,

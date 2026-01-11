@@ -156,15 +156,48 @@ class CompetitionSumoEnv(SumoEnvironment):
             )
             icv_ids = {all_vehicle_ids[i] for i in icv_indices}
 
+        # ========== 优化: 使用TraCI订阅批量获取车辆状态 ==========
+        # 批量订阅所有车辆的关键属性（减少IPC调用）
+        if len(all_vehicle_ids) > 0:
+            # 定义要订阅的变量
+            var_list = [
+                traci.vehicle.VAR_SPEED,
+                traci.vehicle.VAR_ACCELERATION,
+                traci.vehicle.VAR_ANGLE,
+                traci.vehicle.VAR_LANEINDEX,
+                traci.vehicle.VAR_POSITION,
+                traci.vehicle.VAR_LANE_ID
+            ]
+
+            # 批量订阅
+            for veh_id in all_vehicle_ids:
+                traci.vehicle.subscribe(veh_id, var_list)
+
+            # 一次性获取所有车辆的订阅数据
+            all_subscription_results = traci.vehicle.getAllSubscriptionResults()
+        else:
+            all_subscription_results = {}
+
         # 收集车辆状态（优化的Frenet坐标系）
         for veh_id in all_vehicle_ids:
             try:
-                # 获取基本状态
-                speed = traci.vehicle.getSpeed(veh_id)
-                acceleration = traci.vehicle.getAcceleration(veh_id)
-                angle = traci.vehicle.getAngle(veh_id)
-                lane_id = traci.vehicle.getLaneID(veh_id)
-                lane_index = traci.vehicle.getLaneIndex(veh_id)
+                # 从订阅结果中获取数据（避免单独的TraCI调用）
+                if veh_id in all_subscription_results:
+                    sub_data = all_subscription_results[veh_id]
+                    speed = sub_data.get(traci.vehicle.VAR_SPEED, 0.0)
+                    acceleration = sub_data.get(traci.vehicle.VAR_ACCELERATION, 0.0)
+                    angle = sub_data.get(traci.vehicle.VAR_ANGLE, 0.0)
+                    lane_index = sub_data.get(traci.vehicle.VAR_LANEINDEX, 0)
+                    x, y = sub_data.get(traci.vehicle.VAR_POSITION, (0.0, 0.0))
+                    lane_id = sub_data.get(traci.vehicle.VAR_LANE_ID, "")
+                else:
+                    # 回退到单独调用（不应该发生）
+                    speed = traci.vehicle.getSpeed(veh_id)
+                    acceleration = traci.vehicle.getAcceleration(veh_id)
+                    angle = traci.vehicle.getAngle(veh_id)
+                    lane_id = traci.vehicle.getLaneID(veh_id)
+                    lane_index = traci.vehicle.getLaneIndex(veh_id)
+                    x, y = traci.vehicle.getPosition(veh_id)
 
                 # 提取edge_id
                 edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
@@ -172,7 +205,6 @@ class CompetitionSumoEnv(SumoEnvironment):
                 # 优化的Frenet坐标系计算
                 if self.use_accurate_frenet and self.frenet_system is not None:
                     # 使用精确的Frenet坐标系统(基于预计算的车道中心线)
-                    x, y = traci.vehicle.getPosition(veh_id)
                     s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
 
                     # 获取车道在该位置的航向角(用于速度分解)
@@ -186,6 +218,7 @@ class CompetitionSumoEnv(SumoEnvironment):
                     in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
                 else:
                     # 使用简化的Frenet坐标(SUMO原生)
+                    # 注意：这里仍然需要单独调用，但已经比之前少很多
                     s = traci.vehicle.getLanePosition(veh_id)
                     d = traci.vehicle.getLateralLanePosition(veh_id)
                     heading_at_s = np.radians(self._get_lane_angle(lane_id))
@@ -212,9 +245,9 @@ class CompetitionSumoEnv(SumoEnvironment):
                     'angle': angle,
                     'edge_id': edge_id,
                     'in_bottleneck': in_bottleneck,  # 新增:是否在瓶颈区域
-                    # 保留部分笛卡尔坐标用于调试
-                    'x': traci.vehicle.getPosition(veh_id)[0],
-                    'y': traci.vehicle.getPosition(veh_id)[1]
+                    # 保留部分笛卡尔坐标用于调试（已经从订阅获取，无需重复调用）
+                    'x': x,
+                    'y': y
                 }
 
                 valid_vehicle_ids.append(veh_id)

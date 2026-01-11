@@ -99,55 +99,60 @@ class DualModeSafetyShield(nn.Module):
         vehicle_ids = vehicle_states.get('ids', [])
         vehicle_data = vehicle_states.get('data', {})
 
-        for i, idx in enumerate(selected_indices):
-            if idx >= len(vehicle_ids):
-                continue
+        # ========== 优化: 向量化Level 1安全检查 ==========
+        if k > 0:
+            # 批量提取车辆数据
+            speeds = []
+            for idx in selected_indices:
+                if idx < len(vehicle_ids):
+                    veh_id = vehicle_ids[idx]
+                    if veh_id in vehicle_data:
+                        speeds.append(vehicle_data[veh_id].get('speed', 0.0))
+                    else:
+                        speeds.append(0.0)
+                else:
+                    speeds.append(0.0)
 
-            veh_id = vehicle_ids[idx]
-            if veh_id not in vehicle_data:
-                continue
+            speeds = torch.tensor(speeds, device=raw_actions.device)
 
-            vehicle = vehicle_data[veh_id]
-            current_speed = vehicle.get('speed', 0.0)
+            # ========== 1. 向量化加速度裁剪 ==========
+            raw_accels = raw_actions[:, 0]  # [k]
 
-            # 1. 加速度裁剪（动态限制）
-            raw_accel = raw_actions[i, 0].item()
+            # 速度依赖的加速度限制（向量化）
+            speed_factors = torch.clamp(speeds / 30.0, 0, 1)  # [k]
+            dynamic_max_accels = self.max_accel * (1 - 0.3 * speed_factors)  # [k]
+            dynamic_max_decels = self.max_decel * (1 + 0.2 * speed_factors)  # [k]
 
-            # 速度依赖的加速度限制
-            speed_factor = min(current_speed / 30.0, 1.0)
-            dynamic_max_accel = self.max_accel * (1 - 0.3 * speed_factor)
-            dynamic_max_decel = self.max_decel * (1 + 0.2 * speed_factor)
-
-            # 映射Tanh输出[-1,1]到物理加速度范围
+            # 映射Tanh输出[-1,1]到物理加速度范围（向量化）
             accel_range = self.max_accel - self.max_decel
-            physical_accel = self.max_decel + (raw_accel + 1) / 2 * accel_range
+            physical_accels = self.max_decel + (raw_accels + 1) / 2 * accel_range  # [k]
 
-            safe_accel = np.clip(physical_accel, dynamic_max_decel, dynamic_max_accel)
+            # 裁剪加速度（向量化）
+            safe_accels = torch.clamp(physical_accels, dynamic_max_decels, dynamic_max_accels)  # [k]
 
-            if abs(safe_accel - physical_accel) > 0.1:
-                intervention_mask[i] = True
+            # 检测干预（向量化）
+            accel_interventions = torch.abs(safe_accels - physical_accels) > 0.1  # [k]
+            intervention_mask = intervention_mask | accel_interventions
 
-            # 映射回[-1,1]
-            safe_accel_normalized = (safe_accel - self.max_decel) / accel_range * 2 - 1
-            safe_actions[i, 0] = safe_accel_normalized
+            # 映射回[-1,1]（向量化）
+            safe_accels_normalized = (safe_accels - self.max_decel) / accel_range * 2 - 1  # [k]
+            safe_actions[:, 0] = safe_accels_normalized
 
-            # 2. 换道限制
-            raw_lane_change = raw_actions[i, 1].item()
-            safe_lane_change = raw_lane_change
+            # ========== 2. 向量化换道限制 ==========
+            raw_lane_changes = raw_actions[:, 1]  # [k]
+            safe_lane_changes = raw_lane_changes.clone()
 
-            # 速度过高时禁止换道
-            if current_speed > self.max_lane_change_speed:
-                safe_lane_change = 0.0
-                if raw_lane_change > 0.5:
-                    intervention_mask[i] = True
+            # 速度过高时禁止换道（向量化）
+            high_speed_mask = speeds > self.max_lane_change_speed
+            safe_lane_changes = torch.where(high_speed_mask, torch.zeros_like(safe_lane_changes), safe_lane_changes)
+            intervention_mask = intervention_mask | (high_speed_mask & (raw_lane_changes > 0.5))
 
-            # 低速时也限制换道
-            if current_speed < 1.0:
-                safe_lane_change = 0.0
-                if raw_lane_change > 0.5:
-                    intervention_mask[i] = True
+            # 低速时禁止换道（向量化）
+            low_speed_mask = speeds < 1.0
+            safe_lane_changes = torch.where(low_speed_mask, torch.zeros_like(safe_lane_changes), safe_lane_changes)
+            intervention_mask = intervention_mask | (low_speed_mask & (raw_lane_changes > 0.5))
 
-            safe_actions[i, 1] = safe_lane_change
+            safe_actions[:, 1] = safe_lane_changes
 
         return safe_actions, intervention_mask
 
