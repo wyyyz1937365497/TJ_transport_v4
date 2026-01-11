@@ -95,7 +95,7 @@ class Trainer:
         if not skip_data_collection:
             logger.info("收集训练数据...")
             collect_data(
-                config=self.config.environment,
+                config=self.config.to_dict(),
                 num_episodes=phase1_cfg.get("num_episodes", 5),
                 max_steps=self.config.environment.get("max_steps", 3600),
                 output_dir=self.config.data_dir,

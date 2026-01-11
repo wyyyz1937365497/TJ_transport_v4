@@ -11,7 +11,8 @@
       "Bash(conda run:*)",
       "Bash(~/miniconda3/envs/sumo/bin/python:*)",
       "Bash(~/miniconda3/envs/sumo/bin/pip list:*)",
-      "Bash(sumo:*)"
+      "Bash(sumo:*)",
+      "Bash(timeout:*)"
     ]
   }
 }

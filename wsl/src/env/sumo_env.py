@@ -78,7 +78,6 @@ class SumoEnvironment:
             "--no-step-log", "true",
             "--no-warnings", "true",
             "--step-length", str(self.step_length),
-            "--remote-port", str(self.port),  # 指定端口
         ]
 
         if "seed" in self.config:
@@ -107,8 +106,26 @@ class SumoEnvironment:
             self._apply_actions(actions)
 
         # 推进仿真
-        traci.simulationStep()
-        self.current_step += 1
+        try:
+            traci.simulationStep()
+            self.current_step += 1
+        except Exception as e:
+            # 仿真结束或连接关闭
+            logger.warning(f"仿真结束: {e}")
+            self.is_connected = False
+            # 返回空观测
+            return StepResult(
+                observation=Observation(
+                    vehicle_states={},
+                    vehicle_ids=[],
+                    icv_ids=[],
+                    global_stats=torch.zeros(16),
+                    step=self.current_step,
+                ),
+                reward=0.0,
+                done=True,
+                info=self._get_info(),
+            )
 
         # 更新统计
         self._update_stats()
@@ -295,28 +312,44 @@ class SumoEnvironment:
         lanes = [v.lane_index for v in vehicle_states.values()]
         stats[8] = float(np.mean(lanes) if lanes else 0.0)
 
-        # 碰撞
-        stats[9] = float(traci.simulation.getCollidingVehiclesNumber())
+        # TraCI相关统计（需要连接检查）
+        try:
+            if not self.is_connected:
+                raise Exception("TraCI not connected")
 
-        # 已到达/已出发
-        stats[10] = float(len(self.stats["arrived"]))
-        stats[11] = float(len(self.stats["departed"]))
+            # 碰撞
+            stats[9] = float(traci.simulation.getCollidingVehiclesNumber())
 
-        # 剩余
-        stats[12] = float(traci.simulation.getMinExpectedNumber())
+            # 已到达/已出发
+            stats[10] = float(len(self.stats["arrived"]))
+            stats[11] = float(len(self.stats["departed"]))
+
+            # 剩余
+            stats[12] = float(traci.simulation.getMinExpectedNumber())
+        except:
+            # 连接已关闭或出现错误，使用默认值
+            stats[9] = 0.0
+            stats[10] = float(len(self.stats.get("arrived", set())))
+            stats[11] = float(len(self.stats.get("departed", set())))
+            stats[12] = 0.0
 
         # 车头时距
         thws = []
-        for veh_id in traci.vehicle.getIDList():
-            try:
-                leader = traci.vehicle.getLeader(veh_id, 100.0)
-                if leader:
-                    distance = leader[1]
-                    ego_speed = traci.vehicle.getSpeed(veh_id)
-                    if ego_speed > 0.1:
-                        thws.append(distance / ego_speed)
-            except Exception:
-                continue
+        try:
+            if self.is_connected:
+                vehicle_ids = traci.vehicle.getIDList()
+                for veh_id in vehicle_ids:
+                    try:
+                        leader = traci.vehicle.getLeader(veh_id, 100.0)
+                        if leader:
+                            distance = leader[1]
+                            ego_speed = traci.vehicle.getSpeed(veh_id)
+                            if ego_speed > 0.1:
+                                thws.append(distance / ego_speed)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         stats[13] = float(np.mean(thws) if thws else 2.0)
 
         # 负载
@@ -360,27 +393,49 @@ class SumoEnvironment:
         """检查是否结束"""
         if self.current_step >= self.max_steps:
             return True
-        if traci.simulation.getMinExpectedNumber() <= 0 and self.current_step > 1000:
+
+        try:
+            if self.is_connected and traci.simulation.getMinExpectedNumber() <= 0 and self.current_step > 1000:
+                return True
+        except:
+            # TraCI连接问题，假设仿真结束
             return True
+
         return False
 
     def _get_info(self) -> Dict[str, Any]:
         """获取额外信息"""
-        return {
-            "step": self.current_step,
-            "vehicles": traci.vehicle.getIDCount(),
-            "collisions": traci.simulation.getCollidingVehiclesNumber(),
-            "arrived": traci.simulation.getArrivedNumber(),
-            "departed": traci.simulation.getDepartedNumber(),
-        }
+        info = {"step": self.current_step}
+
+        try:
+            if self.is_connected:
+                info["vehicles"] = traci.vehicle.getIDCount()
+                info["collisions"] = traci.simulation.getCollidingVehiclesNumber()
+                info["arrived"] = traci.simulation.getArrivedNumber()
+                info["departed"] = traci.simulation.getDepartedNumber()
+            else:
+                info["vehicles"] = 0
+                info["collisions"] = 0
+                info["arrived"] = len(self.stats.get("arrived", set()))
+                info["departed"] = len(self.stats.get("departed", set()))
+        except:
+            info["vehicles"] = 0
+            info["collisions"] = 0
+            info["arrived"] = len(self.stats.get("arrived", set()))
+            info["departed"] = len(self.stats.get("departed", set()))
+
+        return info
 
     def _update_stats(self):
         """更新统计信息"""
-        departed = set(traci.simulation.getDepartedIDList())
-        arrived = set(traci.simulation.getArrivedIDList())
-
-        self.stats["departed"].update(departed)
-        self.stats["arrived"].update(arrived)
+        try:
+            if self.is_connected:
+                departed = set(traci.simulation.getDepartedIDList())
+                arrived = set(traci.simulation.getArrivedIDList())
+                self.stats["departed"].update(departed)
+                self.stats["arrived"].update(arrived)
+        except:
+            pass
 
     def __enter__(self):
         """上下文管理器"""

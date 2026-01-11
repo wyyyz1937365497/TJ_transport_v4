@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -14,6 +15,101 @@ from ..models.graph import FastGraphBuilder
 from ..utils.logging import get_logger
 
 logger = get_logger()
+
+
+# 全局变量：用于在multiprocessing中传递config
+_collector_config = None
+
+
+def _set_collector_config(config: Dict[str, Any]):
+    """设置全局配置（用于multiprocessing）"""
+    global _collector_config
+    _collector_config = config
+
+
+def _collect_episode_worker(args: Tuple[int, int, int, Optional[int]]) -> Tuple[Dict, Dict]:
+    """
+    单个episode收集函数（模块级别，可被pickle）
+
+    Args:
+        args: (episode_id, max_steps, timeout, port)
+
+    Returns:
+        (trajectories, stats)
+    """
+    from .sumo_env import SumoEnvironment
+
+    global _collector_config
+    config = _collector_config
+    env_config = config.get("environment", config)  # 兼容两种格式
+
+    episode_id, max_steps, timeout, port = args
+
+    # 为每个worker分配不同端口
+    if port is None:
+        from ..utils.sumo_port_manager import find_free_port
+        # 使用进程ID来分配端口范围，避免冲突
+        base_port = 8813 + (os.getpid() % 100) + episode_id
+        port = find_free_port(base_port)
+
+    env = SumoEnvironment(env_config, use_gui=False, port=port)
+    trajectories = {}
+    stats = {
+        "episode_id": episode_id,
+        "total_steps": 0,
+        "total_vehicles": 0,
+        "success": False,
+    }
+
+    try:
+        start_time = time.time()
+        observation = env.reset()
+
+        for step in range(max_steps):
+            if time.time() - start_time > timeout:
+                break
+
+            # 记录数据
+            current_time = step * config.get("environment", {}).get("step_length", 0.1)
+
+            for veh_id, state in observation.vehicle_states.items():
+                if veh_id not in trajectories:
+                    trajectories[veh_id] = {
+                        "id": veh_id,
+                        "timestamps": [],
+                        "positions": [],
+                        "speeds": [],
+                        "accelerations": [],
+                        "lane_ids": [],
+                        "lanes": [],
+                    }
+
+                trajectories[veh_id]["timestamps"].append(current_time)
+                trajectories[veh_id]["positions"].append(state.position)
+                trajectories[veh_id]["speeds"].append(state.speed)
+                trajectories[veh_id]["accelerations"].append(state.acceleration)
+                trajectories[veh_id]["lane_ids"].append(state.lane_id)
+                trajectories[veh_id]["lanes"].append(state.lane_index)
+
+            # 推进
+            result = env.step()
+            observation = result.observation
+            done = result.done
+
+            if done or len(observation.vehicle_states) == 0:
+                break
+
+        env.close()
+
+        stats["total_steps"] = step + 1
+        stats["total_vehicles"] = len(trajectories)
+        stats["success"] = True
+
+    except Exception as e:
+        logger.error(f"Episode {episode_id} 失败: {e}")
+        stats["error"] = str(e)
+
+    return trajectories, stats
 
 
 class TrajectoryDataset(Dataset):
@@ -240,7 +336,6 @@ def collect_data(
     Returns:
         (trajectories, stats)
     """
-    from .sumo_env import SumoEnvironment
     from multiprocessing import Pool, cpu_count
 
     output_dir = Path(output_dir)
@@ -252,75 +347,8 @@ def collect_data(
     logger.info(f"  - Episodes: {num_episodes}")
     logger.info(f"  - Max steps: {max_steps}")
 
-    # 单个episode收集函数
-    def collect_episode(args: Tuple[int, int, int, Optional[int]]) -> Tuple[Dict, Dict]:
-        episode_id, max_steps, timeout, port = args
-
-        # 为每个worker分配不同端口
-        if port is None:
-            from ..utils.sumo_port_manager import find_free_port
-            # 使用进程ID来分配端口范围，避免冲突
-            import os
-            base_port = 8813 + (os.getpid() % 100) + episode_id
-            port = find_free_port(base_port)
-
-        env = SumoEnvironment(config, use_gui=False, port=port)
-        trajectories = {}
-        stats = {
-            "episode_id": episode_id,
-            "total_steps": 0,
-            "total_vehicles": 0,
-            "success": False,
-        }
-
-        try:
-            import time
-            start_time = time.time()
-            observation = env.reset()
-
-            for step in range(max_steps):
-                if time.time() - start_time > timeout:
-                    break
-
-                # 记录数据
-                current_time = step * config.get("environment", {}).get("step_length", 0.1)
-
-                for veh_id, state in observation.vehicle_states.items():
-                    if veh_id not in trajectories:
-                        trajectories[veh_id] = {
-                            "id": veh_id,
-                            "timestamps": [],
-                            "positions": [],
-                            "speeds": [],
-                            "accelerations": [],
-                            "lane_ids": [],
-                            "lanes": [],
-                        }
-
-                    trajectories[veh_id]["timestamps"].append(current_time)
-                    trajectories[veh_id]["positions"].append(state.position)
-                    trajectories[veh_id]["speeds"].append(state.speed)
-                    trajectories[veh_id]["accelerations"].append(state.acceleration)
-                    trajectories[veh_id]["lane_ids"].append(state.lane_id)
-                    trajectories[veh_id]["lanes"].append(state.lane_index)
-
-                # 推进
-                observation, _, done, _ = env.step()
-
-                if done or len(observation.vehicle_states) == 0:
-                    break
-
-            env.close()
-
-            stats["total_steps"] = step + 1
-            stats["total_vehicles"] = len(trajectories)
-            stats["success"] = True
-
-        except Exception as e:
-            logger.error(f"Episode {episode_id} 失败: {e}")
-            stats["error"] = str(e)
-
-        return trajectories, stats
+    # 设置全局配置（用于multiprocessing）
+    _set_collector_config(config)
 
     # 并行收集
     timeout = config.get("training", {}).get("phase1", {}).get("data_collection_timeout", 180)
@@ -336,7 +364,7 @@ def collect_data(
     all_stats = []
 
     with Pool(processes=min(num_workers, num_episodes)) as pool:
-        results = pool.map(collect_episode, tasks)
+        results = pool.map(_collect_episode_worker, tasks)
 
         for trajectories, stats in results:
             all_trajectories.update(trajectories)
@@ -348,7 +376,7 @@ def collect_data(
                           f"{stats['total_steps']} 步")
 
     # 保存数据
-    timestamp = int(__import__("time").time())
+    timestamp = int(time.time())
     filepath = output_dir / f"parallel_data_{timestamp}.pkl"
 
     with open(filepath, "wb") as f:
