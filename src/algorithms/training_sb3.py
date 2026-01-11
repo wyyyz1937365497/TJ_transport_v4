@@ -40,13 +40,13 @@ from src.utils.weight_transfer import WeightTransfer
 # Phase 1 传统训练导入（复用）
 from src.algorithms.training import Trainer
 
-try:
-    # sb3_contrib 可能未安装，提供备用方案
-    from sb3_contrib import CPO
-    CPO_AVAILABLE = True
-except ImportError:
-    CPO_AVAILABLE = False
-    print("⚠️  警告: sb3_contrib 未安装，Phase 4 将使用备用实现")
+# 注意：sb3_contrib 中没有 CPO (Constrained Policy Optimization) 算法
+# sb3_contrib 包含：MaskablePPO, RecurrentPPO, TQC, QR-DQN, TRPO 等
+# 因此 Phase 4 使用我们自己实现的完整拉格朗日 PPO
+print("ℹ️  Phase 4 将使用自实现的拉格朗日 PPO（约束优化）")
+print("   基于 SB3 的 PPO，添加拉格朗日乘子进行约束处理")
+
+
 
 
 class TrainingPipelineSB3:
@@ -132,6 +132,13 @@ class TrainingPipelineSB3:
         print("\n" + "="*70)
         print("🔄 Phase 1: 世界模型预训练（监督学习）")
         print("="*70)
+
+        # 如果没有传入模型，则创建一个
+        if model is None:
+            print("🏗️  创建模型...")
+            from src.models import create_model_from_config
+            model = create_model_from_config(self.config)
+            print("✅ 模型创建成功")
 
         # 复用传统 Trainer 的 Phase 1 实现
         trainer = Trainer(self.config)
@@ -511,9 +518,11 @@ class TrainingPipelineSB3:
         learning_rate: float = 1e-4
     ):
         """
-        Phase 4：CPO 约束优化
+        Phase 4：拉格朗日约束优化
 
-        使用 sb3_contrib 的 CPO 算法进行约束优化。
+        使用完整的拉格朗日 PPO 实现（基于 SB3 的 PPO + 自定义拉格朗日乘子）
+
+        注意：sb3_contrib 中没有 CPO 算法，因此我们使用自实现的拉格朗日 PPO。
 
         Args:
             total_timesteps: 总训练步数
@@ -521,109 +530,30 @@ class TrainingPipelineSB3:
             learning_rate: 学习率
 
         Returns:
-            训练好的 CPO 模型
+            训练好的拉格朗日 PPO 模型
         """
         if self.phase3_model is None:
             raise RuntimeError("Phase 3 模型不存在，请先运行 train_phase3_sb3()")
 
         print("\n" + "="*70)
-        print("⚖️  Phase 4: CPO 约束优化")
+        print("⚖️  Phase 4: 拉格朗日约束优化训练")
         print("="*70)
         print(f"   总步数: {total_timesteps:,}")
         print(f"   成本上限: {cost_limit}")
         print(f"   学习率: {learning_rate:.6f}")
+        print(f"   方法: 拉格朗日 PPO（自实现）")
         print("="*70)
 
         start_time = time.time()
 
-        # 检查 CPO 是否可用
-        if not CPO_AVAILABLE:
-            print("\n⚠️  sb3_contrib 未安装，使用备用实现...")
-            return self._train_phase4_fallback(
-                total_timesteps=total_timesteps,
-                cost_limit=cost_limit,
-                learning_rate=learning_rate
-            )
-
-        # 1. 复用环境和策略
-        vec_env = self.phase3_model.get_env()
-        policy_class = self.phase3_model.policy_class
-
-        # 2. 创建 CPO 模型
-        print("\n🧠 创建 CPO 模型...")
-
-        phase4_config = self.config.get('training', {}).get('phase4', {})
-
-        model = CPO(
-            policy_class,
-            vec_env,
-            verbose=1,
-            tensorboard_log=os.path.join(self.log_dir, 'sb3_phase4'),
-            learning_rate=learning_rate,
-            cost_limit=cost_limit,
-            cpo_lambda_init=0.1,
-            cpo_lr_lambda=1e-3,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
-            seed=self.config.get('seed', 42),
-            device=str(self.device)
-        )
-
-        print("✅ CPO 模型创建成功")
-
-        # 3. 加载 Phase 3 权重
-        print("\n🔄 加载 Phase 3 权重...")
-        try:
-            # 设置参数（CPO 继承自 PPO，有相同接口）
-            model.set_parameters(self.phase3_model.get_parameters())
-            print("✅ 权重加载成功")
-        except Exception as e:
-            print(f"⚠️  权重加载失败: {e}")
-
-        # 4. 冻结 GNN 和 WorldModel
-        model.policy.freeze_gnn_and_world_model()
-        print("✅ 已冻结 GNN 和 WorldModel")
-
-        # 5. 设置回调
-        callbacks = self._create_phase4_callbacks()
-
-        # 6. 开始训练
-        print("\n🏋️  开始训练...")
-        print("="*70)
-
-        model.learn(
+        # 直接调用完整的拉格朗日 PPO 实现
+        model = self._train_phase4_lagrangian_ppo(
             total_timesteps=total_timesteps,
-            callback=callbacks,
-            progress_bar=True
+            cost_limit=cost_limit,
+            learning_rate=learning_rate
         )
 
         elapsed = time.time() - start_time
-
-        # 7. 保存模型
-        print("\n💾 保存模型...")
-
-        final_path = os.path.join(self.checkpoint_dir, 'final_model_cpo.zip')
-        model.save(final_path)
-        print(f"   ✅ CPO 格式: {final_path}")
-
-        compat_path = os.path.join(self.checkpoint_dir, 'final_model.pth')
-        self._save_sb3_as_compatible(model, compat_path, phase=4)
-        print(f"   ✅ 兼容格式: {compat_path}")
-
-        self.phase4_model = model
-
-        # 记录历史
-        self.history['phase4'] = {
-            'cpo_path': final_path,
-            'compat_path': compat_path,
-            'total_timesteps': total_timesteps,
-            'elapsed_time': elapsed,
-            'cost_limit': cost_limit
-        }
 
         print("\n" + "="*70)
         print(f"✅ Phase 4 训练完成！")
@@ -646,20 +576,30 @@ class TrainingPipelineSB3:
 
         return callbacks
 
-    def _train_phase4_fallback(
+    def _train_phase4_lagrangian_ppo(
         self,
         total_timesteps: int,
         cost_limit: float,
         learning_rate: float
     ):
         """
-        Phase 4 备用实现（当 sb3_contrib 不可用时）
+        Phase 4 拉格朗日 PPO 实现（主要实现）
 
-        使用完整的拉格朗日 PPO 实现
-        基于标准 PPO，添加成本约束处理
+        完整的拉格朗日松弛约束优化实现
+        基于标准 SB3 PPO，添加：
+        1. 拉格朗日乘子动态更新
+        2. 成本约束处理
+        3. 双层优化（策略 + 乘子）
+
+        Args:
+            total_timesteps: 总训练步数
+            cost_limit: 成本上限
+            learning_rate: 学习率
+
+        Returns:
+            训练好的拉格朗日 PPO 模型
         """
-        print("\n⚠️  使用完整拉格朗日 PPO 备用实现")
-        print(f"   成本上限: {cost_limit}")
+        print("\n🔧 初始化拉格朗日 PPO...")
 
         from stable_baselines3 import PPO
         from stable_baselines3.common.callbacks import BaseCallback
