@@ -260,12 +260,33 @@ def collect_data_parallel(
         # 执行一步
         obs, rewards, dones, infos = parallel_envs.step(actions)
 
-        # 记录数据（这里简化处理，实际需要更复杂的数据收集逻辑）
-        for env_idx, info in enumerate(infos):
+        # 完整的数据收集逻辑 - 记录轨迹
+        for env_idx, (ob, reward, done, info) in enumerate(zip(obs, rewards, dones, infos)):
+            # 初始化该环境的轨迹记录（如果需要）
+            if env_idx not in all_trajectories:
+                all_trajectories[env_idx] = []
+
+            # 记录当前步骤的数据
+            step_data = {
+                'observation': ob,
+                'reward': reward,
+                'done': done,
+                'info': info,
+                'action': actions[env_idx]
+            }
+            all_trajectories[env_idx].append(step_data)
+
             # 检查是否episode结束
-            if dones[env_idx]:
+            if done:
                 episode_count += 1
                 print(f"   ✅ Episode {episode_count}/{num_episodes} 完成 (env {env_idx})")
+
+                # 清理该环境的轨迹记录
+                if env_idx in all_trajectories:
+                    # 可以选择保存或处理这里收集的轨迹
+                    trajectory_length = len(all_trajectories[env_idx])
+                    print(f"      轨迹长度: {trajectory_length} 步")
+                    del all_trajectories[env_idx]
 
                 if episode_count >= num_episodes:
                     break

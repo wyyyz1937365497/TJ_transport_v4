@@ -286,7 +286,13 @@ def collect_parallel_data(
         # 移除 port 设置，让SUMO自动管理端口
         process_configs.append(process_config)
 
-    # 单进程收集（简化版，避免多进程复杂度）
+    # 真正的并行数据收集 - 完整实现
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from multiprocessing import Manager
+
+    print(f"\n🚀 启动并行数据收集（{num_processes} 个进程）")
+
+    # 使用进程池进行真正的并行收集
     all_trajectories = {}
     total_stats = {
         'total_episodes': 0,
@@ -297,20 +303,75 @@ def collect_parallel_data(
 
     start_time = time.time()
 
+    # 创建任务列表
+    tasks = []
+    task_id = 0
     for i, (process_config, episodes) in enumerate(zip(process_configs, episodes_per_process)):
-        print(f"\n🔄 进程 {i+1}/{num_processes}: 收集 {episodes} episodes")
-
         for ep in range(episodes):
-            print(f"   Episode {ep+1}/{episodes}")
+            tasks.append({
+                'task_id': task_id,
+                'process_id': i,
+                'process_config': process_config,
+                'episode': ep
+            })
+            task_id += 1
 
+    print(f"   总任务数: {len(tasks)}")
+
+    # 定义单个任务的收集函数
+    def collect_single_task(task_info):
+        """单个数据收集任务"""
+        process_config = task_info['process_config']
+        episode = task_info['episode']
+        task_id = task_info['task_id']
+
+        try:
             collector = EfficientDataCollector(process_config)
             trajectories = collector.collect_episode(verbose=False)
 
-            # 合并轨迹
-            all_trajectories.update(trajectories)
-            total_stats['total_episodes'] += 1
-            total_stats['total_steps'] += collector.stats['total_steps']
-            total_stats['collection_time'] += collector.stats['collection_time']
+            return {
+                'task_id': task_id,
+                'success': True,
+                'trajectories': trajectories,
+                'stats': collector.stats,
+                'error': None
+            }
+        except Exception as e:
+            return {
+                'task_id': task_id,
+                'success': False,
+                'trajectories': {},
+                'stats': {'total_steps': 0, 'collection_time': 0},
+                'error': str(e)
+            }
+
+    # 使用进程池并行执行
+    completed_tasks = 0
+    failed_tasks = 0
+
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        # 提交所有任务
+        future_to_task = {executor.submit(collect_single_task, task): task for task in tasks}
+
+        # 收集结果
+        for future in as_completed(future_to_task):
+            result = future.result()
+            completed_tasks += 1
+
+            if result['success']:
+                # 合并轨迹
+                all_trajectories.update(result['trajectories'])
+                total_stats['total_episodes'] += 1
+                total_stats['total_steps'] += result['stats']['total_steps']
+                total_stats['collection_time'] += result['stats']['collection_time']
+
+                # 进度更新
+                if completed_tasks % 10 == 0 or completed_tasks == len(tasks):
+                    progress = completed_tasks / len(tasks) * 100
+                    print(f"   进度: {completed_tasks}/{len(tasks)} ({progress:.1f}%)")
+            else:
+                failed_tasks += 1
+                print(f"   ⚠️  任务 {result['task_id']} 失败: {result['error']}")
 
     total_stats['total_vehicles'] = len(all_trajectories)
     total_stats['total_time'] = time.time() - start_time

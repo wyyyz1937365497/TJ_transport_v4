@@ -426,11 +426,28 @@ class TrajectoryPredictor:
             # 当前加速度（考虑车辆动力学限制）
             accel_clipped = np.clip(accel, -max_decel, max_accel)
 
-            # 速度更新（考虑空气阻力和滚动阻力）
-            # v(t+dt) = v(t) + a*dt - (阻力项)
-            rolling_resistance = 0.01 * 9.81  # 滚动阻力
-            air_drag = 0.3 * v * v / 1500.0  # 空气阻力（简化）
-            decel_resistance = rolling_resistance + air_drag
+            # 速度更新（考虑完整的空气阻力和滚动阻力模型）
+            # 完整物理模型：
+            # F_rolling = C_rr * m * g  (滚动阻力)
+            # F_air = 0.5 * ρ * Cd * A * v²  (空气阻力)
+            # a_resistance = (F_rolling + F_air) / m
+
+            # 车辆参数
+            vehicle_mass = 1500.0  # kg
+            rolling_resistance_coeff = 0.015  # 无量纲
+            gravity = 9.81  # m/s²
+            air_density = 1.225  # kg/m³ (海平面标准大气)
+            drag_coefficient = 0.30  # 无量纲 (典型轿车)
+            frontal_area = 2.5  # m² (迎风面积)
+
+            # 滚动阻力 (N)
+            f_rolling = rolling_resistance_coeff * vehicle_mass * gravity
+
+            # 空气阻力 (N) - 完整公式
+            f_air = 0.5 * air_density * drag_coefficient * frontal_area * (v ** 2)
+
+            # 总阻力加速度 (m/s²)
+            decel_resistance = (f_rolling + f_air) / vehicle_mass
 
             v_new = v + accel_clipped * self.dt - decel_resistance * self.dt
             v_new = max(0, v_new)  # 速度不能为负

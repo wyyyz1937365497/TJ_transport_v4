@@ -24,7 +24,8 @@
       "Bash(tree:*)",
       "Bash(findstr:*)",
       "Bash(findstr /B \"D[:] [-.]\")",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(del:*)"
     ]
   }
 }

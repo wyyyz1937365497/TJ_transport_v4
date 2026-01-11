@@ -175,8 +175,18 @@ class FullTrafficController(nn.Module):
         return action_features, value_features
 
     def _build_batch_graph(self, vehicle_states, batch_size, num_vehicles):
-        """构建批量图数据"""
+        """
+        构建批量图数据 - 完整实现
+
+        使用基于距离和相对状态的完整图构建逻辑，
+        而非简化的全连接图。
+        """
         from torch_geometric.data import Batch, Data
+
+        # 获取图构建配置
+        interaction_radius = self.config.get('interaction_radius', 100.0)
+        max_neighbors = self.config.get('max_neighbors', 8)
+        lane_change_distance = self.config.get('lane_change_distance', 50.0)
 
         graphs = []
         for b in range(batch_size):
@@ -185,20 +195,86 @@ class FullTrafficController(nn.Module):
             end_idx = start_idx + num_vehicles
             batch_vehicle_states = vehicle_states[start_idx:end_idx]  # [N, 5]
 
-            # 创建节点特征
-            x = batch_vehicle_states  # [N, 5]
+            # 车辆状态格式: [x, y, vx, vy, lane_id]
+            # 提取位置信息
+            positions = batch_vehicle_states[:, :2]  # [N, 2]
+            velocities = batch_vehicle_states[:, 2:4]  # [N, 2]
+            lane_ids = batch_vehicle_states[:, 4]  # [N]
 
-            # 创建简单边（全连接，用于简化）
-            num_nodes = x.size(0)
+            num_nodes = batch_vehicle_states.size(0)
+            x = batch_vehicle_states  # [N, 5] 节点特征
+
             if num_nodes > 1:
+                # 计算车辆之间的距离矩阵
+                # positions: [N, 2] -> [N, 1, 2] and [1, N, 2]
+                pos_expanded_1 = positions.unsqueeze(1)  # [N, 1, 2]
+                pos_expanded_2 = positions.unsqueeze(0)  # [1, N, 2]
+                distances = torch.norm(pos_expanded_1 - pos_expanded_2, dim=2)  # [N, N]
+
+                # 计算相对速度
+                vel_expanded_1 = velocities.unsqueeze(1)  # [N, 1, 2]
+                vel_expanded_2 = velocities.unsqueeze(0)  # [1, N, 2]
+                relative_velocities = vel_expanded_2 - vel_expanded_1  # [N, N, 2]
+
+                # 判断是否在同一车道
+                lane_expanded_1 = lane_ids.unsqueeze(1)  # [N, 1]
+                lane_expanded_2 = lane_ids.unsqueeze(0)  # [1, N]
+                same_lane = (lane_expanded_1 == lane_expanded_2).float()  # [N, N]
+
+                # 构建边：基于交互半径和最大邻居数
                 edge_index = []
+                edge_features = []
+
                 for i in range(num_nodes):
-                    for j in range(num_nodes):
-                        if i != j:
-                            edge_index.append([i, j])
-                edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-                edge_attr = torch.ones(edge_index.size(1), 4)  # 简化边特征
+                    # 找到车辆 i 的邻居
+                    # 排除自身
+                    mask = torch.ones(num_nodes, dtype=torch.bool)
+                    mask[i] = False
+
+                    # 计算交互分数（距离越近分数越高）
+                    interaction_scores = torch.zeros(num_nodes)
+                    interaction_scores[mask] = 1.0 / (distances[i, mask] + 1e-6)
+
+                    # 同车道加分
+                    interaction_scores += same_lane[i] * 0.5
+
+                    # 设置自身的分数为 -inf
+                    interaction_scores[i] = -float('inf')
+
+                    # 选择 top-k 邻居
+                    k = min(max_neighbors, num_nodes - 1)
+                    topk_scores, topk_indices = torch.topk(interaction_scores, k)
+
+                    # 过滤超出交互半径的邻居
+                    valid_mask = distances[i, topk_indices] <= interaction_radius
+                    valid_indices = topk_indices[valid_mask]
+
+                    # 添加边
+                    for j in valid_indices:
+                        edge_index.append([i, j])
+
+                        # 构建边特征 [4]
+                        # 1. 距离
+                        dist = distances[i, j].item()
+                        # 2. 相对速度 x
+                        rel_vel_x = relative_velocities[i, j, 0].item()
+                        # 3. 相对速度 y
+                        rel_vel_y = relative_velocities[i, j, 1].item()
+                        # 4. 是否同车道
+                        is_same_lane = same_lane[i, j].item()
+
+                        edge_features.append([dist, rel_vel_x, rel_vel_y, is_same_lane])
+
+                # 转换为张量
+                if len(edge_index) > 0:
+                    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+                    edge_attr = torch.tensor(edge_features, dtype=torch.float32)
+                else:
+                    # 如果没有边，创建空张量
+                    edge_index = torch.zeros(2, 0, dtype=torch.long)
+                    edge_attr = torch.zeros(0, 4)
             else:
+                # 单个节点
                 edge_index = torch.zeros(2, 0, dtype=torch.long)
                 edge_attr = torch.zeros(0, 4)
 
@@ -451,6 +527,145 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
                 module.eval()
 
         print("✅ 已冻结BatchNorm层")
+
+    def load_phase2_weights_from_sb3(
+        self,
+        phase2_sb3_model,
+        verbose: bool = True
+    ) -> int:
+        """
+        从 Phase 2 SB3 模型加载权重
+
+        这个方法专门用于从 SB3 SimpleActorCriticPolicy 加载权重
+        到完整的 FullTrafficActorCriticPolicy。
+
+        权重映射策略：
+        1. 如果 Phase 2 模型包含 GNN 和 WorldModel，直接传递
+        2. Controller 权重需要重新映射（简化版 → 完整版）
+        3. Actor 和 Critic 网络权重传递
+
+        Args:
+            phase2_sb3_model: Phase 2 的 SB3 PPO 模型
+            verbose: 是否打印详细日志
+
+        Returns:
+            成功加载的权重数量
+        """
+        import torch.nn.functional as F
+
+        if verbose:
+            print("\n" + "="*70)
+            print("🔄 从 Phase 2 SB3 模型加载权重")
+            print("="*70)
+
+        # 获取 Phase 2 策略的状态字典
+        phase2_policy = phase2_sb3_model.policy
+        phase2_state = phase2_policy.state_dict()
+
+        if verbose:
+            print(f"   Phase 2 权重数量: {len(phase2_state)}")
+
+        # 获取当前完整策略的状态字典
+        full_state = self.state_dict()
+
+        # 权重映射统计
+        loaded_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        # 定义权重映射规则
+        # 这里需要根据实际的架构来定义映射
+        weight_mappings = []
+
+        # 策略 1: 尝试映射特征提取器权重
+        # 如果 Phase 2 使用的简化策略包含完整模型组件
+        for key in phase2_state.keys():
+            if 'features_extractor.' in key:
+                # 尝试映射到 traffic_controller
+                new_key = key.replace('features_extractor.', 'traffic_controller.')
+                weight_mappings.append((key, new_key))
+
+        # 策略 2: 映射 Actor 和 Critic 网络
+        for key in phase2_state.keys():
+            if key.startswith('action_net.'):
+                # 映射到 actor_mean
+                new_key = key.replace('action_net.', 'actor_mean.')
+                weight_mappings.append((key, new_key))
+            elif key.startswith('value_net.'):
+                # 映射到 critic
+                new_key = key.replace('value_net.', 'critic.')
+                weight_mappings.append((key, new_key))
+
+        # 策略 3: 直接匹配的键名
+        for key in phase2_state.keys():
+            if key in full_state:
+                weight_mappings.append((key, key))
+
+        # 执行权重传递
+        for phase2_key, full_key in weight_mappings:
+            # 检查目标键是否存在
+            if full_key not in full_state:
+                if verbose:
+                    print(f"   ⚠️  跳过: {phase2_key} → {full_key} (目标不存在)")
+                skipped_count += 1
+                continue
+
+            # 检查形状是否匹配
+            phase2_shape = phase2_state[phase2_key].shape
+            full_shape = full_state[full_key].shape
+
+            if phase2_shape != full_shape:
+                if verbose:
+                    print(f"   ❌ 失败: {phase2_key} → {full_key}")
+                    print(f"      源形状: {phase2_shape}")
+                    print(f"      目标形状: {full_shape}")
+                failed_count += 1
+                continue
+
+            # 传递权重
+            full_state[full_key] = phase2_state[phase2_key].to(self.device)
+            loaded_count += 1
+
+            if verbose:
+                print(f"   ✅ {phase2_key} → {full_key}")
+
+        # 加载权重到当前模型
+        self.load_state_dict(full_state)
+
+        # 打印总结
+        if verbose:
+            print("\n" + "="*70)
+            print("📊 权重加载总结")
+            print("="*70)
+            print(f"   ✅ 成功: {loaded_count}")
+            print(f"   ⚠️  跳过: {skipped_count}")
+            print(f"   ❌ 失败: {failed_count}")
+            print("="*70 + "\n")
+
+        return loaded_count
+
+    def copy_weights_from_simple_policy(
+        self,
+        simple_policy: 'SimpleActorCriticPolicy',
+        verbose: bool = True
+    ) -> int:
+        """
+        从简化策略复制权重
+
+        这是 load_phase2_weights_from_sb3 的别名，
+        用于更直观的 API 调用。
+
+        Args:
+            simple_policy: SimpleActorCriticPolicy 实例
+            verbose: 是否打印详细日志
+
+        Returns:
+            成功复制的权重数量
+        """
+        return self.load_phase2_weights_from_sb3(
+            simple_policy,
+            verbose=verbose
+        )
 
 
 def create_full_traffic_policy(config: Dict[str, Any]) -> type:
