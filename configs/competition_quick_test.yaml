@@ -1,0 +1,211 @@
+# 快速测试配置 - 用于验证代码正确性和快速原型
+# 目标：5-10分钟完成完整训练流程验证
+# 适用：代码调试、功能验证、快速迭代
+
+# =============================================================================
+# 基础设置
+# =============================================================================
+device: cuda  # cuda, cpu, auto
+seed: 42
+precision: fp32  # 使用fp32确保数值稳定性（快速测试不需要混合精度）
+
+# =============================================================================
+# 项目路径配置
+# =============================================================================
+paths:
+  root_dir: .
+  data_dir: data
+  log_dir: logs/quick_test
+  checkpoint_dir: checkpoints/quick_test
+  result_dir: results/quick_test
+
+# =============================================================================
+# SUMO环境配置 - 最小化配置
+# =============================================================================
+environment:
+  # 比赛官方环境配置
+  sumo_cfg: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.xml
+
+  # 仿真参数
+  step_length: 0.1
+  max_steps: 600    # 缩短到10分钟（600步）用于快速测试
+  control_ratio: 0.25  # 严格遵守25% ICV约束
+  use_gui: false
+  num_parallel_workers: 2  # 最小并行配置
+
+# =============================================================================
+# 模型架构 - 保持与初赛配置一致（仅调整规模）
+# =============================================================================
+model:
+  # 图神经网络
+  gnn:
+    node_dim: 9
+    edge_dim: 4
+    hidden_dim: 64   # 保持不变
+    output_dim: 256
+    num_layers: 2    # 减少到2层加速
+    heads: 4
+    dropout: 0.1
+    use_batch_norm: true
+
+  # 世界模型
+  world_model:
+    input_dim: 256
+    hidden_dim: 128
+    future_steps: 3   # 减少到3步加速
+    num_layers: 2
+    bidirectional: false
+    dropout: 0.1
+
+  # 控制器
+  controller:
+    gnn_dim: 256
+    world_dim: 256
+    global_dim: 16
+    hidden_dim: 128
+    action_dim: 2
+    top_k: 3       # 减少到Top-3加速
+    dropout: 0.2
+
+  # 安全屏障
+  safety:
+    ttc_threshold: 2.0
+    thw_threshold: 1.5
+    max_accel: 2.0
+    max_decel: -3.0
+    emergency_decel: -5.0
+
+  # 图构建
+  graph:
+    interaction_radius: 100.0
+    max_neighbors: 6    # 减少邻居数加速
+    lane_change_distance: 50.0
+
+# =============================================================================
+# 训练配置 - 极速训练流程
+# =============================================================================
+training:
+  # 阶段1: World Model预训练（最小化）
+  phase1:
+    enabled: true
+    num_episodes: 2   # 仅2个episode快速验证
+    epochs: 3         # 仅3轮
+    batch_size: 64    # 小批次
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-5
+    data_collection_timeout: 60  # 1分钟超时
+    num_parallel_workers: 2
+    use_mixed_precision: false   # 关闭混合精度简化调试
+    gradient_clip: 1.0
+    warmup_epochs: 1
+    phase1_model_path: "checkpoints/quick_test/world_model_phase1.pth"
+
+  # 阶段2: PPO训练（最小化）
+  phase2:
+    enabled: true
+    num_envs: 2        # 仅2个环境
+    total_timesteps: 1000  # 仅1000步验证训练循环
+    learning_rate: 3.0e-4
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_epsilon: 0.2
+    entropy_coef: 0.01
+    value_loss_coef: 0.5
+    update_epochs: 5    # 减少到5轮
+    batch_size: 64      # 小批次
+    n_steps: 256       # 减少rollout步数
+    phase2_model_path: "checkpoints/quick_test/ppo_phase2.pth"
+
+  # 阶段3: 端到端微调（可选，快速测试可跳过）
+  phase3:
+    enabled: false     # 快速测试跳过此阶段
+    total_timesteps: 500
+    learning_rate: 1.0e-5
+    freeze_bn: true
+    phase3_model_path: "checkpoints/quick_test/e2e_phase3.pth"
+
+  # 阶段4: 约束优化训练（可选）
+  phase4:
+    enabled: false     # 快速测试跳过此阶段
+    total_timesteps: 500
+    cost_limit: 0.1
+    learning_rate: 1.0e-4
+    final_model_path: "checkpoints/quick_test/final_model.pth"
+
+# =============================================================================
+# 评估配置 - 基础验证
+# =============================================================================
+evaluation:
+  num_episodes: 2  # 仅2个episode验证
+  generate_xlsx: true  # 生成XLSX验证格式正确
+  save_detailed_logs: false  # 不保存详细日志节省空间
+
+# =============================================================================
+# 可视化与监控
+# =============================================================================
+wandb:
+  enabled: false  # 关闭WandB加速测试
+
+# 日志配置 - 简化日志
+logging:
+  log_every_n_steps: 5  # 更频繁的日志
+  val_check_interval: 50
+  save_top_k: 1  # 仅保存最佳checkpoint
+  profiler: null
+
+# =============================================================================
+# 比赛特定优化 - 保持最小化
+# =============================================================================
+competition:
+  # 启用优化的Frenet坐标系统
+  use_accurate_frenet: true
+
+  # 启用预测-决策闭环（快速测试版）
+  enable_prediction_loop: true
+
+  # 预测融合权重（保持一致）
+  prediction_weights:
+    risk_vehicle_boost: 1.3
+    recommended_vehicle_boost: 1.2
+    congestion_threshold: 0.7
+    feature_enhancement_risk: 0.2
+    feature_enhancement_congestion: 0.1
+
+  # 瓶颈区域优化
+  bottleneck_optimization:
+    enabled: true
+    junctions: ["J14", "J15", "J17"]
+    priority_multiplier: 1.5
+
+  # 干预成本控制
+  intervention_cost:
+    alpha: 1.0
+    beta: 5.0
+    cost_penalty_factor: 0.01
+
+# =============================================================================
+# 训练优化技巧 - 全部关闭
+# =============================================================================
+training_tricks:
+  use_lr_scheduler: false  # 关闭加速
+  use_gradient_clip: true  # 保留梯度裁剪保证稳定性
+  max_grad_norm: 1.0
+  use_experience_replay: false
+  curriculum_learning:
+    enabled: false
+
+# =============================================================================
+# 快速测试说明
+# =============================================================================
+# 预期运行时间：5-10分钟
+# 预期GPU内存：2-4GB
+# 适用场景：
+#   1. 代码修改后验证功能
+#   2. 快速原型实验
+#   3. 调试训练流程
+#   4. 验证环境配置
+#
+# 注意：此配置仅用于验证，不能用于比赛提交
+# 比赛请使用：competition_preliminary.yaml

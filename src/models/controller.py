@@ -128,10 +128,11 @@ class InfluenceDrivenController(nn.Module):
         world_predictions: torch.Tensor,
         global_metrics: torch.Tensor,
         vehicle_ids: List[str],
-        is_icv: torch.Tensor
+        is_icv: torch.Tensor,
+        traffic_predictions: Optional[Dict[str, any]] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        前向传播
+        前向传播（集成交通流预测）
 
         Args:
             gnn_embedding: [N, gnn_dim] GNN嵌入
@@ -139,11 +140,17 @@ class InfluenceDrivenController(nn.Module):
             global_metrics: [B, global_dim] 全局交通指标
             vehicle_ids: [N] 车辆ID列表
             is_icv: [N] 是否为智能网联车
+            traffic_predictions: 交通流预测结果（可选）
+                - future_speeds: [B, N, F] 未来速度预测
+                - congestion_prob: [B, N, 3] 拥堵概率
+                - risk_vehicles: List[int] 高风险车辆索引
+                - recommendations: Dict 控制建议
 
         Returns:
             output: 包含选中车辆、动作、价值等
         """
         batch_size = gnn_embedding.size(0)
+        device = gnn_embedding.device
 
         # 1. 处理全局特征
         global_features = self.global_encoder(global_metrics)  # [B, 64]
@@ -172,6 +179,16 @@ class InfluenceDrivenController(nn.Module):
 
         fused_features = self.fusion_layer(fused_input)  # [N, hidden_dim]
 
+        # 3. 融合交通流预测信息
+        if traffic_predictions is not None:
+            fused_features = self._integrate_traffic_predictions(
+                fused_features,
+                traffic_predictions,
+                vehicle_ids,
+                batch_size,
+                device
+            )
+
         # 3. 计算ICV车辆影响力
         icv_mask = is_icv.bool()
         icv_indices = torch.where(icv_mask)[0]
@@ -180,12 +197,13 @@ class InfluenceDrivenController(nn.Module):
             return {
                 'selected_vehicle_ids': [],
                 'selected_indices': [],
-                'raw_actions': torch.zeros(0, self.action_dim, device=gnn_embedding.device),
-                'influence_scores': torch.zeros(0, device=gnn_embedding.device),
-                'value_estimates': torch.zeros(0, device=gnn_embedding.device),
-                'cost_estimates': torch.zeros(0, device=gnn_embedding.device),
-                'advantage_estimates': torch.zeros(0, device=gnn_embedding.device),
-                'action_probs': torch.zeros(0, self.action_dim, device=gnn_embedding.device)
+                'raw_actions': torch.zeros(0, self.action_dim, device=device),
+                'influence_scores': torch.zeros(0, device=device),
+                'value_estimates': torch.zeros(0, device=device),
+                'cost_estimates': torch.zeros(0, device=device),
+                'advantage_estimates': torch.zeros(0, device=device),
+                'action_probs': torch.zeros(0, self.action_dim, device=device),
+                'prediction_info': {} if traffic_predictions is None else traffic_predictions
             }
 
         # 提取ICV特征
@@ -194,7 +212,16 @@ class InfluenceDrivenController(nn.Module):
         # 计算影响力得分
         influence_scores = self.influence_scorer(icv_features).squeeze(-1)  # [N_icv]
 
-        # 4. 选择Top-K
+        # 4. 如果有预测信息，调整风险车辆的影响力权重
+        if traffic_predictions is not None:
+            influence_scores = self._adjust_influence_with_predictions(
+                influence_scores,
+                icv_indices,
+                traffic_predictions,
+                device
+            )
+
+        # 5. 选择Top-K
         k = min(self.top_k, len(icv_indices))
         top_k_scores, top_k_local_indices = torch.topk(
             influence_scores, k, largest=True, sorted=True
@@ -230,7 +257,8 @@ class InfluenceDrivenController(nn.Module):
             'cost_estimates': cost_estimates,
             'advantage_estimates': advantage_estimates,
             'action_probs': action_probs,
-            'fused_features': fused_features
+            'fused_features': fused_features,
+            'prediction_info': {} if traffic_predictions is None else traffic_predictions
         }
 
     def select_actions(
@@ -240,20 +268,22 @@ class InfluenceDrivenController(nn.Module):
         global_metrics: torch.Tensor,
         vehicle_ids: List[str],
         is_icv: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        traffic_predictions: Optional[Dict[str, any]] = None
     ) -> Dict[str, any]:
         """
         选择动作（训练/推理）
 
         Args:
             deterministic: 是否使用确定性策略
+            traffic_predictions: 交通流预测结果（可选）
 
         Returns:
             包含动作的字典
         """
         output = self.forward(
             gnn_embedding, world_predictions, global_metrics,
-            vehicle_ids, is_icv
+            vehicle_ids, is_icv, traffic_predictions
         )
 
         if deterministic:
@@ -298,6 +328,113 @@ class InfluenceDrivenController(nn.Module):
         total_cost = accel_cost + lane_change_cost
 
         return total_cost
+
+    def _integrate_traffic_predictions(
+        self,
+        fused_features: torch.Tensor,
+        traffic_predictions: Dict[str, any],
+        vehicle_ids: List[str],
+        batch_size: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        融合交通流预测信息到特征中
+
+        Args:
+            fused_features: [N, hidden_dim] 融合特征
+            traffic_predictions: 交通流预测结果
+            vehicle_ids: 车辆ID列表
+            batch_size: 批次大小
+            device: 设备
+
+        Returns:
+            enhanced_features: [N, hidden_dim] 增强后的特征
+        """
+        # 1. 提取风险车辆索引
+        risk_vehicles = traffic_predictions.get('risk_vehicles', [])
+
+        if not risk_vehicles:
+            return fused_features
+
+        # 2. 为风险车辆创建增强向量
+        risk_mask = torch.zeros(batch_size, device=device)
+        for idx in risk_vehicles:
+            if 0 <= idx < batch_size:
+                risk_mask[idx] = 1.0
+
+        # 3. 提取拥堵概率
+        congestion_prob = traffic_predictions.get('congestion_prob', None)
+        if congestion_prob is not None and congestion_prob.size(0) > 0:
+            # congestion_prob: [B, N, 3] -> 取最大拥堵概率
+            if congestion_prob.dim() == 3:
+                max_congestion = congestion_prob[0, :, 2]  # 严重拥堵概率
+            else:
+                max_congestion = torch.zeros(batch_size, device=device)
+
+            # 4. 融合风险信息到特征
+            # 为风险车辆增加特征权重
+            risk_enhancement = risk_mask.unsqueeze(1) * 0.2  # 增加20%权重
+            congestion_enhancement = max_congestion.unsqueeze(1) * 0.1  # 拥堵增加10%权重
+
+            # 应用增强
+            enhanced_features = fused_features * (1.0 + risk_enhancement + congestion_enhancement)
+
+            return enhanced_features
+
+        return fused_features
+
+    def _adjust_influence_with_predictions(
+        self,
+        influence_scores: torch.Tensor,
+        icv_indices: torch.Tensor,
+        traffic_predictions: Dict[str, any],
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        根据交通流预测调整影响力得分
+
+        策略:
+        1. 如果ICV车辆是风险车辆，增加其影响力权重
+        2. 如果车辆接近瓶颈区域，适当增加权重
+        3. 如果预测未来拥堵严重，增加预防性控制的权重
+
+        Args:
+            influence_scores: [N_icv] ICV影响力得分
+            icv_indices: [N_icv] ICV全局索引
+            traffic_predictions: 交通流预测结果
+            device: 设备
+
+        Returns:
+            adjusted_scores: [N_icv] 调整后的影响力得分
+        """
+        adjusted_scores = influence_scores.clone()
+
+        # 1. 提取风险车辆
+        risk_vehicles = traffic_predictions.get('risk_vehicles', [])
+
+        # 2. 获取推荐的控制车辆
+        recommendations = traffic_predictions.get('recommendations', {})
+        priority_vehicles = recommendations.get('priority_vehicles', [])
+
+        # 3. 为风险车辆增加影响力权重
+        if risk_vehicles:
+            for local_idx, global_idx in enumerate(icv_indices):
+                if global_idx in risk_vehicles:
+                    # 风险车辆影响力增加30%
+                    adjusted_scores[local_idx] *= 1.3
+
+        # 4. 为优先车辆（预测器推荐的）增加额外权重
+        if priority_vehicles:
+            for local_idx, global_idx in enumerate(icv_indices):
+                if global_idx in priority_vehicles:
+                    # 推荐车辆影响力再增加20%
+                    adjusted_scores[local_idx] *= 1.2
+
+        # 5. 归一化到[0,1]
+        if adjusted_scores.max() > 1.0:
+            adjusted_scores = adjusted_scores / adjusted_scores.max()
+
+        return adjusted_scores
 
 
 class ValueNetwork(nn.Module):
