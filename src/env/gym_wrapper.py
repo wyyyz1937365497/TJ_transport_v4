@@ -76,29 +76,20 @@ class GymSumoEnv(gym.Env):
 
     def _define_spaces(self):
         """定义观测空间和动作空间"""
-        # 使用常量配置
-        self.observation_space = gym.spaces.Dict({
-            # 车辆状态（MAX_VEHICLES辆车 × FEATURES_PER_VEHICLE个特征）
-            'vehicle_states': gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(MAX_VEHICLES * FEATURES_PER_VEHICLE,),
-                dtype=np.float32
-            ),
-            # 全局统计特征（32维：比赛专用统计）
-            'global_stats': gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(32,),
-                dtype=np.float32
-            ),
-            'num_vehicles': gym.spaces.Box(
-                low=0,
-                high=1000,
-                shape=(1,),
-                dtype=np.int32
-            )
-        })
+        # 计算总特征维度
+        total_features = (
+            MAX_VEHICLES * FEATURES_PER_VEHICLE +  # 车辆状态特征
+            32 +                                     # 全局统计特征（比赛专用）
+            1                                        # 车辆数量
+        )
+
+        # 使用扁平化的Box观测空间以兼容Stable-Baselines3
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(total_features,),
+            dtype=np.float32
+        )
 
         # 动作空间：控制多个车辆的加速度和换道
         # 扁平化为 MAX_VEHICLES * 2 维向量以兼容 SB3
@@ -110,7 +101,7 @@ class GymSumoEnv(gym.Env):
 
         self.max_vehicles = MAX_VEHICLES
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """
         重置环境
 
@@ -129,7 +120,7 @@ class GymSumoEnv(gym.Env):
 
         return obs, info
 
-    def step(self, action: np.ndarray) -> Tuple[Dict, float, bool, bool, Dict]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         执行一步
 
@@ -184,7 +175,7 @@ class GymSumoEnv(gym.Env):
 
         return actions
 
-    def _format_observation(self, observation: Dict) -> Dict:
+    def _format_observation(self, observation: Dict) -> np.ndarray:
         """
         将SUMO观测格式化为标准Gymnasium格式（使用Frenet坐标系）
 
@@ -192,10 +183,10 @@ class GymSumoEnv(gym.Env):
             observation: SUMO原始观测（来自CompetitionSumoEnv，包含Frenet坐标）
 
         Returns:
-            标准化观测字典
+            扁平化的观测数组，用于Stable-Baselines3
         """
         vehicle_states = observation.get('vehicle_states', {})
-        global_stats = observation.get('global_stats', np.zeros(16))
+        global_stats = observation.get('global_stats', np.zeros(32))
         icv_ids = observation.get('icv_ids', set())
 
         # 车辆状态向量化（Frenet坐标系9维特征）
@@ -222,11 +213,15 @@ class GymSumoEnv(gym.Env):
         else:
             vehicle_features = vehicle_features[:max_features]
 
-        return {
-            'vehicle_states': np.array(vehicle_features, dtype=np.float32),
-            'global_stats': np.array(global_stats, dtype=np.float32),
-            'num_vehicles': np.array([len(vehicle_states)], dtype=np.int32)
-        }
+        # 拼接所有特征为一个扁平数组
+        flat_obs = np.array(vehicle_features, dtype=np.float32)
+        flat_obs = np.concatenate([
+            flat_obs,                              # 车辆状态特征 (MAX_VEHICLES * FEATURES_PER_VEHICLE)
+            global_stats.flatten(),                # 全局统计特征 (32)
+            [len(vehicle_states)]                  # 车辆数量 (1)
+        ]).astype(np.float32)
+
+        return flat_obs
 
     def _get_info(self, observation: Dict) -> Dict:
         """获取额外信息"""

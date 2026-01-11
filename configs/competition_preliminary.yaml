@@ -69,7 +69,7 @@ model:
   controller:
     gnn_dim: 256       # GNN嵌入维度
     world_dim: 256     # World Model输出维度
-    global_dim: 16     # 全局交通特征维度
+    global_dim: 32     # 全局交通特征维度（32维比赛专用统计）
     hidden_dim: 128    # 控制器隐藏层维度
     action_dim: 2      # 动作维度（加速度、换道概率）
     top_k: 5           # 每步选择Top-5最具影响力的ICV车辆

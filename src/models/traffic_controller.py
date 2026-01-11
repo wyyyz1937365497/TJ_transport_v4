@@ -62,7 +62,7 @@ class TrafficController(nn.Module):
         self.controller = InfluenceDrivenController(
             gnn_dim=config.get('gnn_output_dim', 256),
             world_dim=config.get('gnn_output_dim', 256),
-            global_dim=config.get('global_dim', 16),
+            global_dim=config.get('global_dim', 32),  # 32维全局统计特征
             hidden_dim=config.get('controller_hidden_dim', 128),
             action_dim=config.get('action_dim', 2),
             top_k=config.get('top_k', 5),

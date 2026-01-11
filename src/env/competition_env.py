@@ -48,13 +48,20 @@ class CompetitionSumoEnv(SumoEnvironment):
             try:
                 self.frenet_system = get_frenet_system(net_xml_path)
                 self.use_accurate_frenet = True
+                print(f"✅ Frenet坐标系初始化成功: {net_xml_path}")
             except Exception as e:
-                print(f"⚠️  无法初始化Frenet系统: {e}, 使用简化Frenet坐标")
-                self.frenet_system = None
-                self.use_accurate_frenet = False
+                # Frenet系统是比赛性能的关键，不应该静默失败
+                raise RuntimeError(
+                    f"❌ Frenet坐标系初始化失败（这会严重降低模型性能）: {e}\n"
+                    f"   请确保net.xml文件路径正确且格式有效: {net_xml_path}\n"
+                    f"   Frenet坐标系对于准确的位置表示至关重要，不能使用简化版本。"
+                )
         else:
-            self.frenet_system = None
-            self.use_accurate_frenet = False
+            raise FileNotFoundError(
+                f"❌ Frenet系统所需的net.xml文件不存在: {net_xml_path}\n"
+                f"   精确的Frenet坐标系对于比赛性能至关重要。\n"
+                f"   请检查路径配置或在config中指定正确的net_file路径。"
+            )
 
         # 干预统计
         self.intervention_stats = {
@@ -109,22 +116,19 @@ class CompetitionSumoEnv(SumoEnvironment):
         # 记录干预统计
         self._track_interventions(actions)
 
-        # 执行动作
-        observation = super().step(actions)
+        # 执行动作（父类返回tuple: observation, reward, done, info）
+        obs, _, done, base_info = super().step(actions)
 
         # 更新性能指标
-        self._update_performance_metrics(observation)
+        self._update_performance_metrics(obs)
 
         # 计算奖励（使用比赛标准）
-        reward = self._compute_competition_reward(observation)
-
-        # 检查结束
-        done = self._is_done()
+        reward = self._compute_competition_reward(obs)
 
         # 获取额外信息
         info = self._get_competition_info()
 
-        return observation, reward, done, info
+        return obs, reward, done, info
 
     def _get_observation(self) -> Dict[str, Any]:
         """
@@ -159,14 +163,14 @@ class CompetitionSumoEnv(SumoEnvironment):
         # ========== 优化: 使用TraCI订阅批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
         if len(all_vehicle_ids) > 0:
-            # 定义要订阅的变量
+            # 定义要订阅的变量（使用traci.constants中的常量ID）
             var_list = [
-                traci.vehicle.VAR_SPEED,
-                traci.vehicle.VAR_ACCELERATION,
-                traci.vehicle.VAR_ANGLE,
-                traci.vehicle.VAR_LANEINDEX,
-                traci.vehicle.VAR_POSITION,
-                traci.vehicle.VAR_LANE_ID
+                traci.constants.VAR_SPEED,        # 0x40 - 速度
+                traci.constants.VAR_ACCELERATION,  # 0x72 - 加速度
+                traci.constants.VAR_ANGLE,        # 0x43 - 角度
+                traci.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
+                traci.constants.VAR_POSITION,     # 0x42 - 位置
+                traci.constants.VAR_LANE_ID       # 0x51 - 车道ID
             ]
 
             # 批量订阅
@@ -184,20 +188,22 @@ class CompetitionSumoEnv(SumoEnvironment):
                 # 从订阅结果中获取数据（避免单独的TraCI调用）
                 if veh_id in all_subscription_results:
                     sub_data = all_subscription_results[veh_id]
-                    speed = sub_data.get(traci.vehicle.VAR_SPEED, 0.0)
-                    acceleration = sub_data.get(traci.vehicle.VAR_ACCELERATION, 0.0)
-                    angle = sub_data.get(traci.vehicle.VAR_ANGLE, 0.0)
-                    lane_index = sub_data.get(traci.vehicle.VAR_LANEINDEX, 0)
-                    x, y = sub_data.get(traci.vehicle.VAR_POSITION, (0.0, 0.0))
-                    lane_id = sub_data.get(traci.vehicle.VAR_LANE_ID, "")
+                    speed = sub_data.get(traci.constants.VAR_SPEED, 0.0)                     # VAR_SPEED (0x40)
+                    acceleration = sub_data.get(traci.constants.VAR_ACCELERATION, 0.0)       # VAR_ACCELERATION (0x72)
+                    angle = sub_data.get(traci.constants.VAR_ANGLE, 0.0)                     # VAR_ANGLE (0x43)
+                    lane_index = sub_data.get(traci.constants.VAR_LANE_INDEX, 0)             # VAR_LANE_INDEX (0x52)
+                    x, y = sub_data.get(traci.constants.VAR_POSITION, (0.0, 0.0))           # VAR_POSITION (0x42)
+                    lane_id = sub_data.get(traci.constants.VAR_LANE_ID, "")                  # VAR_LANE_ID (0x51)
                 else:
-                    # 回退到单独调用（不应该发生）
-                    speed = traci.vehicle.getSpeed(veh_id)
-                    acceleration = traci.vehicle.getAcceleration(veh_id)
-                    angle = traci.vehicle.getAngle(veh_id)
-                    lane_id = traci.vehicle.getLaneID(veh_id)
-                    lane_index = traci.vehicle.getLaneIndex(veh_id)
-                    x, y = traci.vehicle.getPosition(veh_id)
+                    # 订阅失败不应该发生，如果发生说明批量订阅有问题
+                    # 这是一个严重问题，会显著降低性能（慢5倍）
+                    raise RuntimeError(
+                        f"❌ TraCI批量订阅失败，车辆 {veh_id} 不在订阅结果中。\n"
+                        f"   这会导致回退到逐个TraCI调用，性能降低约5倍。\n"
+                        f"   当前订阅车辆数: {len(all_vehicle_ids)}\n"
+                        f"   订阅结果车辆数: {len(all_subscription_results)}\n"
+                        f"   请检查TraCI订阅配置和SUMO版本兼容性。"
+                    )
 
                 # 提取edge_id
                 edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id

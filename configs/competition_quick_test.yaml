@@ -63,7 +63,7 @@ model:
   controller:
     gnn_dim: 256
     world_dim: 256
-    global_dim: 16
+    global_dim: 32    # 32维全局统计特征（比赛专用）
     hidden_dim: 128
     action_dim: 2
     top_k: 3       # 减少到Top-3加速

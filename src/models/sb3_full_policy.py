@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, MlpExtractor
+from stable_baselines3.common.torch_layers import MlpExtractor
 from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 # 导入完整模型组件
@@ -72,7 +72,7 @@ class FullTrafficController(nn.Module):
         self.controller = InfluenceDrivenController(
             gnn_dim=config.get('gnn_output_dim', 256),
             world_dim=config.get('gnn_output_dim', 256),
-            global_dim=config.get('global_dim', 16),
+            global_dim=config.get('global_dim', 32),  # 32维全局统计特征
             hidden_dim=config.get('controller_hidden_dim', 128),
             action_dim=config.get('action_dim', 2),
             top_k=config.get('top_k', 5),
@@ -98,15 +98,16 @@ class FullTrafficController(nn.Module):
 
         # 用于SB3的输出投影层
         # 将模型输出转换为SB3期望的格式
+        # 输入维度: 256(gnn) + 256(world_model) + 32(global_stats) = 544
         self.action_projection = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(544, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(128, 64)  # 假设动作空间是64维
         )
 
         self.value_projection = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(544, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
@@ -213,7 +214,8 @@ class FullTrafficController(nn.Module):
         action_features = self.action_projection(aggregated)  # [B, 64]
         value_features = self.value_projection(aggregated)  # [B, 1]
 
-        return action_features, value_features
+        # 返回 action_features, value_features, 以及聚合特征（供特征提取器使用）
+        return action_features, value_features, aggregated
 
     def _apply_safety_constraints(
         self,
@@ -432,78 +434,6 @@ class FullTrafficController(nn.Module):
         return batch_graph
 
 
-class FullTrafficFeatureExtractor(BaseFeaturesExtractor):
-    """
-    完整交通特征提取器 - 用于SB3的ActorCriticPolicy
-
-    使用完整的GNN + World Model提取特征
-    """
-
-    def __init__(
-        self,
-        observation_space: gym.Space,
-        config: Dict[str, Any]
-    ):
-        super(FullTrafficFeatureExtractor, self).__init__(
-            observation_space,
-            features_dim=512  # 输出特征维度
-        )
-
-        self.config = config
-        self.device = torch.device(config.get('device', 'cuda'))
-
-        # 完整的交通控制器
-        self.traffic_controller = FullTrafficController(config)
-
-        # 将vehicle_states投影到固定维度
-        self.input_projection = nn.Sequential(
-            nn.Linear(observation_space['vehicle_states'].shape[0], 256),
-            nn.ReLU(),
-            nn.LayerNorm(256)
-        )
-
-        # 全局特征编码器
-        self.global_encoder = nn.Sequential(
-            nn.Linear(observation_space['global_stats'].shape[0], 128),
-            nn.ReLU(),
-            nn.LayerNorm(128)
-        )
-
-        # 特征组合器
-        self.combiner = nn.Sequential(
-            nn.Linear(384, 512),
-            nn.ReLU(),
-            nn.LayerNorm(512)
-        )
-
-    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        提取特征
-
-        Args:
-            observations: Dict with 'vehicle_states', 'global_stats', 'num_vehicles'
-
-        Returns:
-            features: [batch_size, 512]
-        """
-        vehicle_states = observations['vehicle_states']
-        global_stats = observations['global_stats']
-
-        # 投影车辆状态
-        vehicle_features = self.input_projection(vehicle_states)  # [B, 256]
-
-        # 组合全局统计
-        global_features = F.relu(self.global_encoder(global_stats))  # [B, 128]
-
-        # 组合特征
-        combined = torch.cat([vehicle_features, global_features], dim=-1)  # [B, 384]
-
-        # 最终投影
-        features = self.combiner(combined)  # [B, 512]
-
-        return features
-
-
 class FullTrafficActorCriticPolicy(ActorCriticPolicy):
     """
     完整交通Actor-Critic策略 - 用于SB3 PPO
@@ -535,8 +465,9 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
 
         # 重置actor和critic以使用交通控制器
         # actor_mean: 策略网络输出动作均值
+        # 输入维度: 256(gnn) + 256(world_model) + 32(global_stats) = 544
         self.actor_mean = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(544, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(256, action_space.shape[0])
@@ -544,7 +475,7 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
 
         # critic: 价值网络
         self.critic = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(544, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(256, 1)
@@ -596,6 +527,40 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
 
         return actions, values, log_prob
 
+    def evaluate_actions(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        评估动作 - 重写以使用自定义特征提取
+
+        Args:
+            observations: [batch_size, obs_dim]
+            actions: [batch_size, action_dim]
+
+        Returns:
+            values: [batch_size, 1]
+            log_prob: [batch_size, 1]
+            entropy: [batch_size, 1] or scalar
+        """
+        # 使用自定义特征提取（返回544维特征）
+        features = self.extract_features(observations)
+
+        # 使用actor_mean和critic直接计算，跳过mlp_extractor
+        latent_policy = self.actor_mean(features)
+        latent_value = self.critic(features)
+
+        # 计算动作分布
+        action_mean = latent_policy
+        action_std = self.log_std.exp()
+        distribution = self.action_dist.proba_distribution(action_mean, action_std)
+
+        log_prob = distribution.log_prob(actions)
+        entropy = distribution.entropy()
+
+        return latent_value, log_prob, entropy
+
     def extract_features(self, observations: torch.Tensor) -> torch.Tensor:
         """
         使用完整交通控制器提取特征
@@ -604,33 +569,117 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
             observations: [batch_size, obs_dim] 或 Dict
 
         Returns:
-            features: [batch_size, 512]
+            features: [batch_size, 544]
         """
-        # 如果是tensor，需要转换回dict格式
+        # 如果是tensor，需要解析扁平化的观测并调用完整架构
         if isinstance(observations, torch.Tensor):
-            # 假设输入是扁平化的观测
-            # 需要解析为原始格式
-            # 这里简化处理，直接使用MLP
-            features = self._mlp_extractor(observations)
+            # 解析扁平化的观测: [B, 321]
+            # 结构: [B, 288(vehicles) + 32(global) + 1(num)]
+            batch_size = observations.size(0)
+
+            # 分割观测
+            vehicle_features = observations[:, :288]  # [B, 288] = 32*9
+            global_stats = observations[:, 288:320]   # [B, 32]
+            num_vehicles = observations[:, 320:321]   # [B, 1]
+
+            # 重塑vehicle_states为 [B, N, 9]
+            vehicle_states_reshaped = vehicle_features.view(batch_size, 32, 9)  # [B, 32, 9]
+
+            # 调用完整交通控制器（使用tensor接口）
+            features = self._parse_and_call_controller(
+                vehicle_states=vehicle_states_reshaped,
+                global_stats=global_stats,
+                num_vehicles=num_vehicles
+            )
         else:
-            # 使用完整的交通控制器
-            # 注意：这里需要根据实际观测格式调整
-            features = self.traffic_controller(
+            # 使用完整的交通控制器（dict输入）
+            # traffic_controller 返回 (action_features, value_features, aggregated)
+            _, _, aggregated = self.traffic_controller(
                 vehicle_states=observations['vehicle_states'],
                 global_stats=observations['global_stats']
-            )[0]  # 返回action features
+            )
+            features = aggregated  # 使用聚合特征 [B, 544]
 
         return features
 
-    def _mlp_extractor(self, observations: torch.Tensor) -> torch.Tensor:
-        """简单的MLP特征提取器（备用）"""
-        if not hasattr(self, '_mlp'):
-            self._mlp = nn.Sequential(
-                nn.Linear(observations.size(-1), 512),
-                nn.ReLU(),
-                nn.LayerNorm(512)
-            ).to(self.device)
-        return self._mlp(observations)
+    def _parse_and_call_controller(
+        self,
+        vehicle_states: torch.Tensor,
+        global_stats: torch.Tensor,
+        num_vehicles: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        解析观测并调用完整的交通控制器架构
+
+        Args:
+            vehicle_states: [B, 32, 9] 车辆状态
+            global_stats: [B, 32] 全局统计
+            num_vehicles: [B, 1] 车辆数量
+
+        Returns:
+            features: [B, 544]
+        """
+        batch_size = vehicle_states.size(0)
+        device = vehicle_states.device
+
+        # 展平vehicle_states为 [B*N, 9] 用于GNN
+        num_vehicles_flat = vehicle_states.size(1)  # 32
+        vehicle_states_flat = vehicle_states.reshape(-1, 9)  # [B*32, 9]
+
+        # 生成车辆ID和ICV ID（从vehicle_states推断）
+        # is_icv是第9个特征（索引8）
+        is_icv_flat = vehicle_states_flat[:, 8]  # [B*32]
+
+        # 构建图
+        graph_data = self.traffic_controller._build_batch_graph(
+            vehicle_states_flat,
+            batch_size,
+            num_vehicles_flat
+        )
+
+        # 1. GNN特征提取
+        gnn_output = self.traffic_controller.risk_gnn(
+            node_features=graph_data.x,
+            edge_index=graph_data.edge_index,
+            edge_features=graph_data.edge_attr,
+            batch=graph_data.batch
+        )
+        gnn_embedding = gnn_output['node_embedding']  # [B*32, 256]
+
+        # 2. WorldModel预测
+        world_predictions = self.traffic_controller.world_model(gnn_embedding)
+        world_features = world_predictions.get('next_state', gnn_embedding)  # [B*32, 256]
+
+        # 3. 扩展全局特征
+        global_features = global_stats.unsqueeze(1).expand(-1, num_vehicles_flat, -1)  # [B, 32, 32]
+        global_features = global_features.reshape(-1, 32)  # [B*32, 32]
+
+        # 4. Controller决策
+        controller_output = self.traffic_controller.controller(
+            gnn_embedding=gnn_embedding,
+            world_predictions=world_features.unsqueeze(1) if len(world_features.shape) == 2 else world_features,
+            global_metrics=global_features,
+            vehicle_ids=[f"v_{i}" for i in range(batch_size * num_vehicles_flat)],
+            is_icv=is_icv_flat
+        )
+
+        # 5. 聚合特征 [B*32, 256+256+32] -> [B, 544]
+        # 组合 GNN + WorldModel + Global
+        combined = torch.cat([
+            gnn_embedding,    # [B*32, 256]
+            world_features,   # [B*32, 256]
+            global_features   # [B*32, 32]
+        ], dim=-1)  # [B*32, 544]
+
+        # 平均池化到batch级别
+        # 创建batch索引
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, num_vehicles_flat).reshape(-1)  # [B*32]
+
+        # 使用global_mean_pool聚合
+        from torch_geometric.nn import global_mean_pool
+        features = global_mean_pool(combined, batch_indices)  # [B, 544]
+
+        return features
 
     def load_phase2_weights(self, checkpoint_path: str) -> None:
         """
@@ -682,6 +731,61 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
             param.requires_grad = True
 
         print("✅ 已解冻所有组件，进行端到端训练")
+
+    def unfreeze_progressively(self, stage: int = 1) -> None:
+        """
+        渐进式解冻策略 - 从Phase 2到Phase 3的平滑过渡
+
+        Stage 1: 解冻WorldModel的最后1层（保持GNN冻结）
+        Stage 2: 解冻WorldModel的所有层（保持GNN冻结）
+        Stage 3: 解冻GNN的最后1层
+        Stage 4: 完全解冻所有组件
+
+        Args:
+            stage: 解冻阶段 (1-4)
+        """
+        if stage >= 1:
+            # Stage 1: 解冻WorldModel的解码器层
+            if hasattr(self.traffic_controller.world_model, 'risk_decoders'):
+                for decoder in self.traffic_controller.world_model.risk_decoders:
+                    for param in decoder.parameters():
+                        param.requires_grad = True
+            print("✅ Stage 1: 已解冻WorldModel解码器")
+
+        if stage >= 2:
+            # Stage 2: 解冻WorldModel的所有层
+            for param in self.traffic_controller.world_model.parameters():
+                param.requires_grad = True
+            print("✅ Stage 2: 已完全解冻WorldModel")
+
+        if stage >= 3:
+            # Stage 3: 解冻GNN的最后1层
+            if len(self.traffic_controller.risk_gnn.gnn_layers) > 0:
+                last_gnn_layer = self.traffic_controller.risk_gnn.gnn_layers[-1]
+                for param in last_gnn_layer.parameters():
+                    param.requires_grad = True
+            print("✅ Stage 3: 已解冻GNN最后一层")
+
+        if stage >= 4:
+            # Stage 4: 完全解冻
+            self.unfreeze_all()
+
+    def get_trainable_params_count(self) -> Dict[str, int]:
+        """
+        获取可训练参数数量统计
+
+        Returns:
+            各组件的可训练参数数量
+        """
+        stats = {
+            'gnn': sum(p.numel() for p in self.traffic_controller.risk_gnn.parameters() if p.requires_grad),
+            'world_model': sum(p.numel() for p in self.traffic_controller.world_model.parameters() if p.requires_grad),
+            'controller': sum(p.numel() for p in self.traffic_controller.controller.parameters() if p.requires_grad),
+            'actor_mean': sum(p.numel() for p in self.actor_mean.parameters() if p.requires_grad),
+            'critic': sum(p.numel() for p in self.critic.parameters() if p.requires_grad),
+        }
+        stats['total'] = sum(stats.values())
+        return stats
 
     def freeze_batch_norm(self) -> None:
         """冻结BatchNorm层"""

@@ -410,8 +410,22 @@ class TrainingPipelineSB3:
 
         start_time = time.time()
 
-        # 1. 复用环境
-        vec_env = self.phase2_model.get_env()
+        # 1. 创建新环境（Phase 2环境已关闭，需要重新创建）
+        print("\n🌍 创建 Phase 3 环境...")
+        env_config = self.config.get('environment', {})
+        num_envs = phase3_config.get('num_envs', 2)  # 默认2个环境
+
+        from src.env.gym_wrapper import make_gym_env
+
+        vec_env_wrapper = create_parallel_envs(
+            config=env_config,
+            num_envs=num_envs,
+            base_port=8813,  # 使用新端口避免冲突
+            seed=self.config.get('seed', 42)
+        )
+        vec_env = vec_env_wrapper.vec_env
+
+        print(f"✅ 环境创建成功")
 
         # 2. 创建完整策略
         print("\n🧠 创建完整策略...")
@@ -501,6 +515,9 @@ class TrainingPipelineSB3:
         print(f"✅ Phase 3 训练完成！")
         print(f"   总耗时: {elapsed/60:.2f} 分钟")
         print("="*70 + "\n")
+
+        # 9. 清理环境
+        vec_env.close()
 
         return model
 
