@@ -15,9 +15,9 @@ paths:
 
 # SUMO环境配置
 environment:
-  sumo_cfg: ../仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
-  net_file: ../仿真环境_初赛_1.0/仿真环境-初赛/net.xml
-  route_file: ../仿真环境_初赛_1.0/仿真环境-初赛/routes.xml
+  sumo_cfg: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.xml
   step_length: 0.1
   max_steps: 3600
   control_ratio: 0.25

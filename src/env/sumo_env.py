@@ -164,9 +164,35 @@ class SumoEnvironment:
         """关闭SUMO仿真"""
         if self.is_connected and TRACI_AVAILABLE:
             try:
-                traci.close()
-            except:
+                # 使用 close(wait=False) 避免阻塞
+                # 如果不支持 wait 参数，则使用强制关闭
+                try:
+                    traci.close(wait=False)
+                except TypeError:
+                    # 旧版本 TraCI 不支持 wait 参数，强制关闭连接
+                    traci.close()
+            except Exception as e:
+                # 忽略关闭错误，确保进程退出
                 pass
+
+            # 强制终止 SUMO 进程（防止僵尸进程）
+            try:
+                import signal
+                import psutil
+                # 查找并终止 SUMO 进程
+                current_process = psutil.Process()
+                for child in current_process.children(recursive=True):
+                    try:
+                        if 'sumo' in child.name().lower():
+                            child.terminate()
+                    except:
+                        pass
+            except ImportError:
+                # psutil 不可用时，使用 os.system 强制终止
+                os.system("pkill -9 sumo 2>/dev/null || true")
+            except Exception:
+                pass
+
             self.is_connected = False
             print("✅ SUMO已关闭")
 
