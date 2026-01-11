@@ -25,7 +25,8 @@
       "Bash(findstr:*)",
       "Bash(findstr /B \"D[:] [-.]\")",
       "Bash(git add:*)",
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "Bash(if not exist:*)"
     ]
   }
 }

@@ -10,10 +10,16 @@
 
 import numpy as np
 import traci
-from typing import Dict, List, Set, Any, Tuple
+from typing import Dict, List, Set, Any, Tuple, Optional
 from collections import defaultdict
+from pathlib import Path
 
 from .sumo_env import SumoEnvironment
+
+# 导入优化的Frenet工具
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+from utils.frenet_utils import get_frenet_system
 
 
 class CompetitionSumoEnv(SumoEnvironment):
@@ -29,6 +35,20 @@ class CompetitionSumoEnv(SumoEnvironment):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+
+        # 初始化优化的Frenet坐标系(基于固定路网)
+        net_xml_path = config.get('net_file', '仿真环境_初赛_1.0/仿真环境-初赛/net.xml')
+        if Path(net_xml_path).exists():
+            try:
+                self.frenet_system = get_frenet_system(net_xml_path)
+                self.use_accurate_frenet = True
+            except Exception as e:
+                print(f"⚠️  无法初始化Frenet系统: {e}, 使用简化Frenet坐标")
+                self.frenet_system = None
+                self.use_accurate_frenet = False
+        else:
+            self.frenet_system = None
+            self.use_accurate_frenet = False
 
         # 干预统计
         self.intervention_stats = {
@@ -102,14 +122,16 @@ class CompetitionSumoEnv(SumoEnvironment):
 
     def _get_observation(self) -> Dict[str, Any]:
         """
-        获取观测（使用Frenet坐标系）
+        获取观测（使用优化的Frenet坐标系）
 
         返回的车辆状态包含：
         - s: 沿车道中心线的距离
         - d: 横向偏移（相对于车道中心）
         - vs: 纵向速度
-        - vd: 横向速度（近似为0，因为车辆主要沿车道行驶）
+        - vd: 横向速度
         - lane_index: 车道索引
+        - in_bottleneck: 是否在瓶颈区域
+        - edge_id: 边ID
         """
         all_vehicle_ids = traci.vehicle.getIDList()
         vehicle_states = {}
@@ -128,7 +150,7 @@ class CompetitionSumoEnv(SumoEnvironment):
             )
             icv_ids = {all_vehicle_ids[i] for i in icv_indices}
 
-        # 收集车辆状态（Frenet坐标系）
+        # 收集车辆状态（优化的Frenet坐标系）
         for veh_id in all_vehicle_ids:
             try:
                 # 获取基本状态
@@ -138,15 +160,34 @@ class CompetitionSumoEnv(SumoEnvironment):
                 lane_id = traci.vehicle.getLaneID(veh_id)
                 lane_index = traci.vehicle.getLaneIndex(veh_id)
 
-                # Frenet坐标系
-                s = traci.vehicle.getLanePosition(veh_id)  # 沿车道位置
-                d = traci.vehicle.getLateralLanePosition(veh_id)  # 横向偏移
+                # 提取edge_id
+                edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+
+                # 优化的Frenet坐标系计算
+                if self.use_accurate_frenet and self.frenet_system is not None:
+                    # 使用精确的Frenet坐标系统(基于预计算的车道中心线)
+                    x, y = traci.vehicle.getPosition(veh_id)
+                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+
+                    # 获取车道在该位置的航向角(用于速度分解)
+                    lane_heading = self.frenet_system.lanes.get(lane_id)
+                    if lane_heading is not None:
+                        heading_at_s = lane_heading.get_heading_at_s(s)
+                    else:
+                        heading_at_s = np.radians(angle)
+
+                    # 检查是否在瓶颈区域
+                    in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
+                else:
+                    # 使用简化的Frenet坐标(SUMO原生)
+                    s = traci.vehicle.getLanePosition(veh_id)
+                    d = traci.vehicle.getLateralLanePosition(veh_id)
+                    heading_at_s = np.radians(self._get_lane_angle(lane_id))
+                    in_bottleneck = False
 
                 # 速度分解到Frenet坐标系
-                # 纵向速度 vs ≈ speed (主要沿车道方向)
-                # 横向速度 vd ≈ 0 (直道情况)
-                vs = speed * np.cos(np.radians(angle - self._get_lane_angle(lane_id)))
-                vd = speed * np.sin(np.radians(angle - self._get_lane_angle(lane_id)))
+                vs = speed * np.cos(angle * np.pi / 180.0 - heading_at_s)
+                vd = speed * np.sin(angle * np.pi / 180.0 - heading_at_s)
 
                 # 记录出发时间
                 if veh_id not in self.vehicle_departure_times:
@@ -163,7 +204,9 @@ class CompetitionSumoEnv(SumoEnvironment):
                     'lane_id': lane_id,
                     'lane_index': lane_index,
                     'angle': angle,
-                    # 保留部分笛卡尔坐标用于全局理解
+                    'edge_id': edge_id,
+                    'in_bottleneck': in_bottleneck,  # 新增:是否在瓶颈区域
+                    # 保留部分笛卡尔坐标用于调试
                     'x': traci.vehicle.getPosition(veh_id)[0],
                     'y': traci.vehicle.getPosition(veh_id)[1]
                 }

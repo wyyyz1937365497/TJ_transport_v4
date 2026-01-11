@@ -24,6 +24,13 @@ from .multi_gpu import (
     monitor_gpu_usage
 )
 
+from .frenet_utils import (
+    FrenetCoordinateSystem,
+    LaneCenterline,
+    get_frenet_system,
+    normalize_frenet_features
+)
+
 __all__ = [
     'setup_logging',
     'save_config',
@@ -40,5 +47,9 @@ __all__ = [
     'setup_multi_gpu_training',
     'adjust_hyperparameters_for_multi_gpu',
     'print_gpu_info',
-    'monitor_gpu_usage'
+    'monitor_gpu_usage',
+    'FrenetCoordinateSystem',
+    'LaneCenterline',
+    'get_frenet_system',
+    'normalize_frenet_features'
 ]
