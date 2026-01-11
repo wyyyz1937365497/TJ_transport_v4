@@ -378,7 +378,8 @@ class TrainingPipelineSB3:
         self,
         total_timesteps: int = 50000,
         learning_rate: float = 1e-5,
-        freeze_bn: bool = True
+        freeze_bn: bool = True,
+        phase2_checkpoint: Optional[str] = None
     ) -> PPO:
         """
         Phase 3：SB3 端到端微调
@@ -393,12 +394,41 @@ class TrainingPipelineSB3:
             total_timesteps: 总训练步数
             learning_rate: 学习率（较小）
             freeze_bn: 是否冻结 BatchNorm 层
+            phase2_checkpoint: Phase 2 checkpoint路径（如果不在内存中）
 
         Returns:
             训练好的 SB3 PPO 模型
         """
-        if self.phase2_model is None:
-            raise RuntimeError("Phase 2 模型不存在，请先运行 train_phase2_sb3()")
+        # 尝试从内存或checkpoint获取Phase 2模型
+        phase2_model = self.phase2_model
+
+        if phase2_model is None:
+            # 尝试从checkpoint加载
+            if phase2_checkpoint is None:
+                phase2_checkpoint = self.config.get('training', {}).get('phase2', {}).get('phase2_model_path')
+
+            if phase2_checkpoint and os.path.exists(phase2_checkpoint):
+                print(f"\n🔄 从checkpoint加载Phase 2模型: {phase2_checkpoint}")
+                try:
+                    # 加载SB3格式的模型
+                    from stable_baselines3 import PPO as SB3PPO
+                    phase2_model = SB3PPO.load(phase2_checkpoint)
+                    print("✅ Phase 2模型加载成功")
+                except Exception as e:
+                    print(f"⚠️  无法加载Phase 2模型: {e}")
+                    raise RuntimeError(
+                        f"无法加载Phase 2模型。请确保:\n"
+                        f"   1. checkpoint文件存在: {phase2_checkpoint}\n"
+                        f"   2. 或者先运行 train_phase2_sb3()"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Phase 2 模型不存在且未提供checkpoint。\n"
+                    f"   请先运行 train_phase2_sb3() 或提供 phase2_checkpoint 参数。\n"
+                    f"   checkpoint路径: {phase2_checkpoint}"
+                )
+        else:
+            print("✅ 使用内存中的Phase 2模型")
 
         print("\n" + "="*70)
         print("🔥 Phase 3: SB3 端到端微调")
@@ -410,6 +440,9 @@ class TrainingPipelineSB3:
 
         start_time = time.time()
 
+        # 获取 Phase 3 配置
+        phase3_config = self.config.get('training', {}).get('phase3', {})
+
         # 1. 创建新环境（Phase 2环境已关闭，需要重新创建）
         print("\n🌍 创建 Phase 3 环境...")
         env_config = self.config.get('environment', {})
@@ -417,10 +450,14 @@ class TrainingPipelineSB3:
 
         from src.env.gym_wrapper import make_gym_env
 
+        # 使用不同的端口范围避免与Phase 2冲突
+        # Phase 2 使用 8813-8820，Phase 3 使用 8913-8920
+        base_port = 8913
+
         vec_env_wrapper = create_parallel_envs(
             config=env_config,
             num_envs=num_envs,
-            base_port=8813,  # 使用新端口避免冲突
+            base_port=base_port,
             seed=self.config.get('seed', 42)
         )
         vec_env = vec_env_wrapper.vec_env
@@ -458,7 +495,7 @@ class TrainingPipelineSB3:
         print("\n🔄 加载 Phase 2 权重...")
         try:
             loaded = model.policy.load_phase2_weights_from_sb3(
-                self.phase2_model,
+                phase2_model,  # 使用局部变量而不是self.phase2_model
                 verbose=True
             )
             print(f"✅ 成功加载 {loaded} 个权重")
@@ -543,7 +580,8 @@ class TrainingPipelineSB3:
         self,
         total_timesteps: int = 50000,
         cost_limit: float = 0.1,
-        learning_rate: float = 1e-4
+        learning_rate: float = 1e-4,
+        phase3_checkpoint: Optional[str] = None
     ):
         """
         Phase 4：拉格朗日约束优化
@@ -556,12 +594,41 @@ class TrainingPipelineSB3:
             total_timesteps: 总训练步数
             cost_limit: 成本上限
             learning_rate: 学习率
+            phase3_checkpoint: Phase 3 checkpoint路径（如果不在内存中）
 
         Returns:
             训练好的拉格朗日 PPO 模型
         """
-        if self.phase3_model is None:
-            raise RuntimeError("Phase 3 模型不存在，请先运行 train_phase3_sb3()")
+        # 尝试从内存或checkpoint获取Phase 3模型
+        phase3_model = self.phase3_model
+
+        if phase3_model is None:
+            # 尝试从checkpoint加载
+            if phase3_checkpoint is None:
+                phase3_checkpoint = self.config.get('training', {}).get('phase3', {}).get('phase3_model_path')
+
+            if phase3_checkpoint and os.path.exists(phase3_checkpoint):
+                print(f"\n🔄 从checkpoint加载Phase 3模型: {phase3_checkpoint}")
+                try:
+                    # 加载SB3格式的模型
+                    from stable_baselines3 import PPO as SB3PPO
+                    phase3_model = SB3PPO.load(phase3_checkpoint)
+                    print("✅ Phase 3模型加载成功")
+                except Exception as e:
+                    print(f"⚠️  无法加载Phase 3模型: {e}")
+                    raise RuntimeError(
+                        f"无法加载Phase 3模型。请确保:\n"
+                        f"   1. checkpoint文件存在: {phase3_checkpoint}\n"
+                        f"   2. 或者先运行 train_phase3_sb3()"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Phase 3 模型不存在且未提供checkpoint。\n"
+                    f"   请先运行 train_phase3_sb3() 或提供 phase3_checkpoint 参数。\n"
+                    f"   checkpoint路径: {phase3_checkpoint}"
+                )
+        else:
+            print("✅ 使用内存中的Phase 3模型")
 
         print("\n" + "="*70)
         print("⚖️  Phase 4: 拉格朗日约束优化训练")
@@ -578,7 +645,8 @@ class TrainingPipelineSB3:
         model = self._train_phase4_lagrangian_ppo(
             total_timesteps=total_timesteps,
             cost_limit=cost_limit,
-            learning_rate=learning_rate
+            learning_rate=learning_rate,
+            phase3_model=phase3_model  # 传递Phase 3模型
         )
 
         elapsed = time.time() - start_time

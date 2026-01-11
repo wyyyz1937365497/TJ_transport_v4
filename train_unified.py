@@ -315,12 +315,17 @@ def main():
 
         phase3_config = config.get('training', {}).get('phase3', {})
 
-        # SB3 端到端微调
-        model = trainer.train_phase3_sb3(
-            total_timesteps=phase3_config.get('total_timesteps', 50000),
-            learning_rate=phase3_config.get('learning_rate', 1e-5),
-            freeze_bn=phase3_config.get('freeze_bn', True)
-        )
+        # 检查是否启用
+        if not phase3_config.get('enabled', True):
+            print("⏭️  Phase 3 已禁用 (phase3.enabled: false)")
+            print("   跳过端到端微调")
+        else:
+            # SB3 端到端微调
+            model = trainer.train_phase3_sb3(
+                total_timesteps=phase3_config.get('total_timesteps', 50000),
+                learning_rate=phase3_config.get('learning_rate', 1e-5),
+                freeze_bn=phase3_config.get('freeze_bn', True)
+            )
 
     # Phase 4: 约束优化训练
     if args.phase in ['4', 'all']:
@@ -330,12 +335,17 @@ def main():
 
         phase4_config = config.get('training', {}).get('phase4', {})
 
-        # CPO 约束优化（拉格朗日 PPO）
-        model = trainer.train_phase4_sb3(
-            total_timesteps=phase4_config.get('total_timesteps', 50000),
-            cost_limit=phase4_config.get('cost_limit', 0.1),
-            learning_rate=phase4_config.get('learning_rate', 1e-4)
-        )
+        # 检查是否启用
+        if not phase4_config.get('enabled', True):
+            print("⏭️  Phase 4 已禁用 (phase4.enabled: false)")
+            print("   跳过约束优化训练")
+        else:
+            # CPO 约束优化（拉格朗日 PPO）
+            model = trainer.train_phase4_sb3(
+                total_timesteps=phase4_config.get('total_timesteps', 50000),
+                cost_limit=phase4_config.get('cost_limit', 0.1),
+                learning_rate=phase4_config.get('learning_rate', 1e-4)
+            )
     total_time = time.time() - start_time
 
     # ========== 训练完成 ==========

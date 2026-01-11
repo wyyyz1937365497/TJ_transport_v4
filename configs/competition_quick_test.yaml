@@ -118,17 +118,18 @@ training:
     n_steps: 256       # 减少rollout步数
     phase2_model_path: "checkpoints/quick_test/ppo_phase2.pth"
 
-  # 阶段3: 端到端微调（可选，快速测试可跳过）
+  # 阶段3: 端到端微调（快速测试版）
   phase3:
-    enabled: false     # 快速测试跳过此阶段
+    enabled: true    # 启用用于测试
+    num_envs: 2      # 2个环境
     total_timesteps: 500
     learning_rate: 1.0e-5
     freeze_bn: true
     phase3_model_path: "checkpoints/quick_test/e2e_phase3.pth"
 
-  # 阶段4: 约束优化训练（可选）
+  # 阶段4: 约束优化训练（快速测试版）
   phase4:
-    enabled: false     # 快速测试跳过此阶段
+    enabled: true    # 启用用于测试
     total_timesteps: 500
     cost_limit: 0.1
     learning_rate: 1.0e-4
