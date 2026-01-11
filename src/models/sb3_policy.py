@@ -11,10 +11,23 @@ import numpy as np
 
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.preprocessing import get_flattened_obs_dim
+from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 from .traffic_controller import TrafficController
 from .gnn import GraphBuilder
+from ..constants import (
+    DEFAULT_INTERACTION_RADIUS,
+    DEFAULT_MAX_NEIGHBORS,
+    DEFAULT_LANE_CHANGE_DISTANCE,
+    GNN_OUTPUT_DIM,
+    WORLD_MODEL_INPUT_DIM,
+    FEATURE_EXTRACTOR_OUTPUT_DIM,
+    MAX_VEHICLES,
+    FEATURES_PER_VEHICLE,
+    ANGLE_SCALE,
+    LANE_INDEX_SCALE,
+    POSITION_SCALE
+)
 
 
 class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
@@ -38,7 +51,7 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
             config: 配置字典
             device: 计算设备
         """
-        super().__init__(observation_space, features_dim=512)  # 固定输出维度
+        super().__init__(observation_space, features_dim=FEATURE_EXTRACTOR_OUTPUT_DIM)
 
         self.config = config
         self._device_internal = device
@@ -49,21 +62,22 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
 
         # 创建图构建器
         self.graph_builder = GraphBuilder(
-            interaction_radius=config.get('interaction_radius', 100.0),
-            max_neighbors=config.get('max_neighbors', 8),
-            lane_change_distance=config.get('lane_change_distance', 50.0)
+            interaction_radius=config.get('interaction_radius', DEFAULT_INTERACTION_RADIUS),
+            max_neighbors=config.get('max_neighbors', DEFAULT_MAX_NEIGHBORS),
+            lane_change_distance=config.get('lane_change_distance', DEFAULT_LANE_CHANGE_DISTANCE)
         )
 
         # 冻结安全层（特征提取阶段不需要）
         for param in self.traffic_controller.safety_shield.parameters():
             param.requires_grad = False
 
-        # 输出投影层（将GNN+世界模型输出映射到固定维度）
+        # 输出投影层（将GNN输出+世界模型预测映射到固定维度）
+        # 输入: GNN global_embedding (GNN_OUTPUT_DIM) + World Model output (WORLD_MODEL_INPUT_DIM)
         self.output_projection = nn.Sequential(
-            nn.Linear(256 + 256, 512),  # GNN输出 + 世界模型输出
+            nn.Linear(GNN_OUTPUT_DIM + WORLD_MODEL_INPUT_DIM, FEATURE_EXTRACTOR_OUTPUT_DIM),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(512, 512)
+            nn.Linear(FEATURE_EXTRACTOR_OUTPUT_DIM, FEATURE_EXTRACTOR_OUTPUT_DIM)
         ).to(self._device_internal)
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -111,20 +125,28 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
                         batch=None  # 单图模式
                     )
 
-                    # 获取全局嵌入
+                    # 获取节点嵌入用于世界模型
+                    node_embedding = gnn_output['node_embedding']
+
+                    # 使用世界模型进行未来状态预测
+                    world_output = self.traffic_controller.world_model(node_embedding)
+
+                    # 获取全局嵌入（使用GNN的全局池化）
                     graph_embedding = gnn_output['global_embedding'].squeeze(0)
 
-                    # 世界模型（简化版：不使用预测，直接使用GNN输出）
-                    # 由于世界模型需要特定输入格式，这里我们简化处理
+                    # 获取世界模型预测的全局特征（取预测的均值）
+                    world_features = world_output.mean(dim=1) if len(world_output.shape) > 1 else world_output
+
+                    # 组合GNN嵌入和世界模型预测
                     combined = torch.cat([
                         graph_embedding,
-                        global_stats  # 使用全局统计信息补充
+                        world_features.squeeze(0) if len(world_features.shape) > 0 else world_features
                     ])
                 else:
                     # 无车辆时使用零向量
                     combined = torch.cat([
-                        torch.zeros(256, device=device),
-                        global_stats
+                        torch.zeros(GNN_OUTPUT_DIM, device=device),
+                        torch.zeros(WORLD_MODEL_INPUT_DIM, device=device)
                     ])
 
                 # 投影到固定维度
@@ -145,8 +167,11 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
         """
         从扁平化的特征重建车辆状态字典
 
+        根据gym_wrapper.py中的特征提取逻辑重建车辆状态。
+        特征格式：[speed, acceleration, angle/ANGLE_SCALE, lane_index/LANE_INDEX_SCALE, position/POSITION_SCALE]
+
         Args:
-            flat_features: [256] 扁平化特征
+            flat_features: [160] 扁平化特征 (MAX_VEHICLES辆车 × FEATURES_PER_VEHICLE个特征)
             num_vehicles: 车辆数量
             device: 设备
 
@@ -155,29 +180,26 @@ class TrafficControllerFeatureExtractor(BaseFeaturesExtractor):
         """
         vehicle_states = {}
 
-        # 根据 gym_wrapper.py 中的特征提取逻辑重建
-        # 每辆车有5个特征: speed, acceleration, angle/360, lane_index/10, position/1000
-        features_per_vehicle = 5
-
-        for i in range(min(num_vehicles, 32)):  # 最多32辆车
-            start_idx = i * features_per_vehicle
-            end_idx = start_idx + features_per_vehicle
+        for i in range(min(num_vehicles, MAX_VEHICLES)):
+            start_idx = i * FEATURES_PER_VEHICLE
+            end_idx = start_idx + FEATURES_PER_VEHICLE
 
             if end_idx > len(flat_features):
                 break
 
-            # 提取特征
+            # 提取并还原特征
             speed = float(flat_features[start_idx])
             acceleration = float(flat_features[start_idx + 1])
-            angle = float(flat_features[start_idx + 2]) * 360.0
-            lane_index = float(flat_features[start_idx + 3]) * 10.0
-            position = float(flat_features[start_idx + 4]) * 1000.0
+            angle = float(flat_features[start_idx + 2]) * ANGLE_SCALE
+            lane_index = float(flat_features[start_idx + 3]) * LANE_INDEX_SCALE
+            position = float(flat_features[start_idx + 4]) * POSITION_SCALE
 
-            # 构建车辆状态（简化版，只包含GNN需要的字段）
+            # 构建车辆状态（包含GNN需要的所有字段）
+            # 注意：SUMO道路主要是一维的，y坐标设为0是合理的
             vehicle_states[f"veh_{i}"] = {
                 'id': f"veh_{i}",
                 'x': position,
-                'y': 0.0,  # 简化：只有一维位置
+                'y': 0.0,  # SUMO道路主要是一维，横向位置由车道决定
                 'z': 0.0,
                 'vx': speed,
                 'vy': 0.0,
@@ -246,7 +268,15 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
         )
 
         # 更新features_dim
-        self.features_dim = 512
+        self.features_dim = FEATURE_EXTRACTOR_OUTPUT_DIM
+
+        # 重新初始化log_std以匹配实际动作空间维度
+        # 动作空间是 [MAX_VEHICLES, 2]，扁平化后是 MAX_VEHICLES * 2 维
+        action_dim = self.action_space.shape[0]  # MAX_VEHICLES * 2
+        self.log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32).to(self.device))
+
+        # 设置动作分布类（对于连续动作空间使用DiagGaussianDistribution）
+        self.action_dist_cls = DiagGaussianDistribution
 
         # 重新构建action_net和value_net（使用正确的输入维度）
         # Actor网络：输出动作均值
@@ -270,16 +300,27 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
         ).to(self.device)
 
     def _build_mlp_extractor(self) -> None:
-        """设置mlp_extractor属性（避免AttributeError）"""
-        # 创建一个假的mlp_extractor占位符
-        # 实际特征提取由TrafficController完成
-        class DummyExtractor(nn.Module):
-            def __init__(self, features_dim):
+        """
+        设置mlp_extractor属性以兼容SB3接口。
+
+        注意：本策略使用TrafficController作为特征提取器，
+        因此不需要额外的MLP提取器。此方法仅提供必要的接口属性。
+        """
+        # 创建简单的接口对象以满足SB3的要求
+        # 特征提取完全由TrafficControllerFeatureExtractor完成
+        class FeatureExtractorInterface(nn.Module):
+            """特征提取器接口类 - 直接传递特征维度"""
+
+            def __init__(self, features_dim: int):
                 super().__init__()
                 self.latent_dim_pi = features_dim
                 self.latent_dim_vf = features_dim
 
-        self.mlp_extractor = DummyExtractor(self.features_dim)
+            def forward(self, features: torch.Tensor) -> torch.Tensor:
+                """直接返回特征，不做额外处理"""
+                return features
+
+        self.mlp_extractor = FeatureExtractorInterface(self.features_dim)
 
     def forward(
         self,
@@ -302,12 +343,11 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
         # 计算动作均值
         action_mean = self.action_net(features)
 
-        # 计算动作标准差（可学习参数）
-        log_std = self.log_std
-        action_std = torch.ones_like(action_mean) * torch.exp(log_std)
-
-        # 创建分布
-        distribution = self.action_dist_cls(action_mean, action_std)
+        # 创建分布对象并设置均值和标准差
+        # DiagGaussianDistribution 需要 action_dim 初始化，然后使用 proba_distribution 设置参数
+        action_dim = self.action_space.shape[0]
+        distribution = self.action_dist_cls(action_dim)
+        distribution = distribution.proba_distribution(action_mean, self.log_std)
 
         # 采样动作
         if deterministic:
@@ -344,11 +384,10 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
         # 计算动作均值
         action_mean = self.action_net(features)
 
-        # 计算动作标准差
-        action_std = torch.ones_like(action_mean) * torch.exp(self.log_std)
-
-        # 创建分布
-        distribution = self.action_dist_cls(action_mean, action_std)
+        # 创建分布对象并设置均值和标准差
+        action_dim = self.action_space.shape[0]
+        distribution = self.action_dist_cls(action_dim)
+        distribution = distribution.proba_distribution(action_mean, self.log_std)
 
         # 计算log概率和熵
         log_prob = distribution.log_prob(actions)
@@ -357,14 +396,15 @@ class CustomActorCriticPolicy(ActorCriticPolicy):
         # 计算状态价值
         values = self.value_net(features)
 
-        return values.flatten(), log_prob, distribution.entropy()
+        return values.flatten(), log_prob, entropy
 
     def get_distribution(self, obs: torch.Tensor):
         """获取动作分布"""
         features = self.extract_features(obs)
         action_mean = self.action_net(features)
-        action_std = torch.ones_like(action_mean) * torch.exp(self.log_std)
-        return self.action_dist_cls(action_mean, action_std)
+        action_dim = self.action_space.shape[0]
+        distribution = self.action_dist_cls(action_dim)
+        return distribution.proba_distribution(action_mean, self.log_std)
 
 
 def create_custom_policy(

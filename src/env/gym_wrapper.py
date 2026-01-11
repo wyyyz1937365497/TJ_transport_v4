@@ -7,6 +7,17 @@ import gymnasium as gym
 import numpy as np
 from typing import Dict, Any, Tuple, Optional
 from .sumo_env import SumoEnvironment
+from ..constants import (
+    MAX_VEHICLES,
+    FEATURES_PER_VEHICLE,
+    ANGLE_SCALE,
+    LANE_INDEX_SCALE,
+    POSITION_SCALE,
+    DEFAULT_STEP_LENGTH,
+    DEFAULT_MAX_STEPS,
+    DEFAULT_MAX_ACCEL,
+    DEFAULT_MAX_DECEL
+)
 
 
 class GymSumoEnv(gym.Env):
@@ -52,8 +63,8 @@ class GymSumoEnv(gym.Env):
         # 配置
         self.config = config
         self.port = port
-        self.max_steps = config.get('max_steps', 3600)
-        self.step_length = config.get('step_length', 0.1)
+        self.max_steps = config.get('max_steps', DEFAULT_MAX_STEPS)
+        self.step_length = config.get('step_length', DEFAULT_STEP_LENGTH)
 
         # 设置种子
         if seed is not None:
@@ -64,16 +75,13 @@ class GymSumoEnv(gym.Env):
 
     def _define_spaces(self):
         """定义观测空间和动作空间"""
-        # 观测空间：包含车辆状态和全局统计
-        # 这是一个简化的实现，实际可以根据需求调整
+        # 使用常量配置
         self.observation_space = gym.spaces.Dict({
-            # 车辆状态（如果有车辆的话）
-            # 这里使用Box表示可以处理变长车辆列表
-            # 实际观测会在reset/step中动态生成
+            # 车辆状态（MAX_VEHICLES辆车 × FEATURES_PER_VEHICLE个特征）
             'vehicle_states': gym.spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(256,),  # 固定大小，用padding处理
+                shape=(MAX_VEHICLES * FEATURES_PER_VEHICLE,),
                 dtype=np.float32
             ),
             # 全局统计特征（16维）
@@ -92,15 +100,14 @@ class GymSumoEnv(gym.Env):
         })
 
         # 动作空间：控制多个车辆的加速度和换道
-        # 简化版：固定最多控制32辆车，每辆2个动作（加速度、换道）
-        max_vehicles = 32
+        # 扁平化为 MAX_VEHICLES * 2 维向量以兼容 SB3
         self.action_space = gym.spaces.Box(
-            low=np.array([[-3.0, 0.0]] * max_vehicles),  # 最小加速度, 不换道
-            high=np.array([[2.0, 1.0]] * max_vehicles),   # 最大加速度, 换道
+            low=np.array([DEFAULT_MAX_DECEL, 0.0] * MAX_VEHICLES, dtype=np.float32),
+            high=np.array([DEFAULT_MAX_ACCEL, 1.0] * MAX_VEHICLES, dtype=np.float32),
             dtype=np.float32
         )
 
-        self.max_vehicles = max_vehicles
+        self.max_vehicles = MAX_VEHICLES
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
         """
@@ -155,7 +162,7 @@ class GymSumoEnv(gym.Env):
         解析动作向量为车辆控制字典
 
         Args:
-            action: [max_vehicles, 2] 数组
+            action: 扁平化的 [max_vehicles * 2] 数组
 
         Returns:
             {vehicle_id: [acceleration, lane_change]}
@@ -166,10 +173,13 @@ class GymSumoEnv(gym.Env):
         # 获取当前ICV列表
         icv_ids = list(obs.get('icv_ids', set()))
 
+        # 将扁平化的动作向量重新整形为 [max_vehicles, 2]
+        action_reshaped = action.reshape(self.max_vehicles, 2)
+
         # 为每个ICV分配动作
         for i, veh_id in enumerate(icv_ids[:self.max_vehicles]):
-            if i < len(action):
-                actions[veh_id] = action[i]
+            if i < len(action_reshaped):
+                actions[veh_id] = action_reshaped[i]
 
         return actions
 
@@ -189,18 +199,18 @@ class GymSumoEnv(gym.Env):
         # 车辆状态向量化
         vehicle_features = []
         for veh_id, state in vehicle_states.items():
-            # 提取关键特征
+            # 提取关键特征并归一化
             features = [
                 state.get('speed', 0.0),
                 state.get('acceleration', 0.0),
-                state.get('angle', 0.0) / 360.0,  # 归一化角度
-                state.get('lane_index', 0.0) / 10.0,  # 归一化车道
-                state.get('position', 0.0) / 1000.0,  # 归一化位置
+                state.get('angle', 0.0) / ANGLE_SCALE,
+                state.get('lane_index', 0.0) / LANE_INDEX_SCALE,
+                state.get('position', 0.0) / POSITION_SCALE,
             ]
             vehicle_features.extend(features)
 
         # Padding到固定大小
-        max_features = self.max_vehicles * 5
+        max_features = self.max_vehicles * FEATURES_PER_VEHICLE
         if len(vehicle_features) < max_features:
             vehicle_features.extend([0.0] * (max_features - len(vehicle_features)))
         else:
@@ -225,8 +235,15 @@ class GymSumoEnv(gym.Env):
         self.np_random = np.random.default_rng(seed)
 
     def render(self):
-        """渲染（SUMO不支持，保留接口）"""
-        pass
+        """
+        渲染环境
+
+        注意：并行环境中不支持SUMO GUI渲染。
+        如需可视化，请使用单线程环境并设置use_gui=True。
+        """
+        raise NotImplementedError(
+            "SUMO并行环境不支持渲染。如需可视化，请使用单线程环境。"
+        )
 
     def close(self):
         """关闭环境"""

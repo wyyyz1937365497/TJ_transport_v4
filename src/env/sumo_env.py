@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Tuple, Any
 import time
 import pickle
 import json
+import logging
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 try:
     import traci
@@ -282,19 +286,22 @@ class SumoEnvironment:
                         if possible_directions:
                             # 随机选择一个有效的换道方向
                             lane_change_direction = np.random.choice(possible_directions)
+                            target_lane = current_lane + lane_change_direction
 
-                            traci.vehicle.changeLane(
-                                veh_id,
-                                current_lane + lane_change_direction,
-                                2.0  # 持续时间
-                            )
+                            # 二次验证：确保目标车道在有效范围内
+                            if 0 <= target_lane < lane_count:
+                                traci.vehicle.changeLane(
+                                    veh_id,
+                                    target_lane,
+                                    2.0  # 持续时间
+                                )
                     except Exception as lane_error:
-                        # 换道失败，忽略
-                        pass
+                        # 换道失败，记录但不中断训练（可能是车辆离开路网等）
+                        logger.debug(f"车辆 {veh_id} 换道失败: {lane_error}")
 
             except Exception as e:
-                # 忽略单个车辆的控制失败
-                pass
+                # 车辆控制失败，记录但不影响其他车辆
+                logger.debug(f"车辆 {veh_id} 控制失败: {e}")
 
     def _get_observation(self) -> Dict[str, Any]:
         """获取当前观测"""

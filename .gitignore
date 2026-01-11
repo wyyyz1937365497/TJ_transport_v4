@@ -3,3 +3,5 @@
 */*pycache*/
 *.pth
 data/
+logs/
+logs_sb3/
