@@ -15,7 +15,8 @@ DEFAULT_MAX_STEPS = 3600
 
 # 车辆配置
 MAX_VEHICLES = 32  # 最大支持的车辆数量
-FEATURES_PER_VEHICLE = 5  # 每辆车的特征数: speed, acceleration, angle, lane_index, position
+# Frenet坐标系特征: s(纵向), d(横向), vs(纵向速度), vd(横向速度), speed, acceleration, lane_index, angle, is_icv
+FEATURES_PER_VEHICLE = 9  # 每辆车的特征数（Frenet坐标系9维）
 
 # 特征归一化参数（用于还原归一化的特征）
 ANGLE_SCALE = 360.0  # 角度归一化因子

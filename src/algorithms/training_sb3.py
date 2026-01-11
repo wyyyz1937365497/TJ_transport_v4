@@ -33,20 +33,11 @@ from stable_baselines3.common.vec_env import VecEnv
 
 # 项目导入
 from src.env.vec_env import create_parallel_envs
-from src.models.sb3_policy import create_custom_policy
 from src.models.sb3_full_policy import create_full_traffic_policy
 from src.utils.weight_transfer import WeightTransfer
 
 # Phase 1 传统训练导入（复用）
 from src.algorithms.training import Trainer
-
-# 注意：sb3_contrib 中没有 CPO (Constrained Policy Optimization) 算法
-# sb3_contrib 包含：MaskablePPO, RecurrentPPO, TQC, QR-DQN, TRPO 等
-# 因此 Phase 4 使用我们自己实现的完整拉格朗日 PPO
-print("ℹ️  Phase 4 将使用自实现的拉格朗日 PPO（约束优化）")
-print("   基于 SB3 的 PPO，添加拉格朗日乘子进行约束处理")
-
-
 
 
 class TrainingPipelineSB3:
@@ -156,7 +147,7 @@ class TrainingPipelineSB3:
             self.checkpoint_dir,
             'world_model_phase1.pth'
         )
-        model.save_checkpoint(self.phase1_checkpoint)
+        model.save_checkpoint(self.phase1_checkpoint, epoch=epochs)
 
         self.phase1_model = model
 
@@ -183,9 +174,9 @@ class TrainingPipelineSB3:
         Phase 2：使用 SB3 PPO 训练控制器
 
         关键特性：
-        1. 使用 SimpleActorCriticPolicy（简化策略）
+        1. 使用 FullTrafficActorCriticPolicy（包含完整 GNN + WorldModel）
         2. 加载 Phase 1 的 GNN 和 WorldModel 权重
-        3. 冻结感知和预测层，只训练 Controller
+        3. 冻结 GNN 和 WorldModel，只训练 Controller
         4. 使用 SB3 的高效 PPO 实现
 
         Args:
@@ -202,6 +193,7 @@ class TrainingPipelineSB3:
         print(f"   总步数: {total_timesteps:,}")
         print(f"   并行环境: {num_envs}")
         print(f"   学习率: {learning_rate:.6f}")
+        print(f"   架构: 完整 GNN + WorldModel + Controller")
         print("="*70)
 
         start_time = time.time()
@@ -223,14 +215,17 @@ class TrainingPipelineSB3:
         print(f"   观测空间: {vec_env.observation_space}")
         print(f"   动作空间: {vec_env.action_space}")
 
-        # 2. 创建 SB3 PPO 模型
-        print("\n🧠 创建 SB3 PPO 模型...")
-        policy_class = create_custom_policy(self.config)
+        # 2. 创建完整的 SB3 PPO 模型（使用 FullTrafficActorCriticPolicy）
+        print("\n🧠 创建 SB3 PPO 模型（完整架构）...")
+
+        # 使用完整的策略（包含 GNN + WorldModel）
+        from src.models.sb3_full_policy import create_full_traffic_policy
+        full_policy_class = create_full_traffic_policy(self.config)
 
         phase2_config = self.config.get('training', {}).get('phase2', {})
 
         model = PPO(
-            policy_class,
+            full_policy_class,
             vec_env,
             verbose=1,
             tensorboard_log=os.path.join(self.log_dir, 'sb3_phase2'),
@@ -253,29 +248,49 @@ class TrainingPipelineSB3:
         )
 
         print("✅ 模型创建成功")
-        print(f"   策略: {policy_class.__name__}")
+        print(f"   策略: FullTrafficActorCriticPolicy")
         print(f"   Batch size: {phase2_config.get('batch_size', 128)}")
         print(f"   PPO n_steps: {phase2_config.get('n_steps', 2048)}")
         print(f"   PPO epochs: {phase2_config.get('update_epochs', 10)}")
 
-        # 3. 加载 Phase 1 权重
+        # 3. 加载 Phase 1 权重到完整的策略中
         if self.phase1_checkpoint and os.path.exists(self.phase1_checkpoint):
-            print(f"\n🔄 加载 Phase 1 权重...")
+            print(f"\n🔄 加载 Phase 1 权重到完整策略...")
             try:
-                loaded = self.weight_transfer.phase1_to_sb3(
-                    model.policy,
-                    self.phase1_checkpoint,
-                    self.device
-                )
+                # 直接加载到 traffic_controller
+                checkpoint = torch.load(self.phase1_checkpoint, map_location=self.device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+
+                # 获取策略的 traffic_controller
+                policy_traffic_controller = model.policy.traffic_controller
+                policy_state_dict = policy_traffic_controller.state_dict()
+
+                # 加载 GNN 和 WorldModel 权重
+                loaded = 0
+                for key, param in state_dict.items():
+                    if key in policy_state_dict:
+                        if param.shape == policy_state_dict[key].shape:
+                            policy_state_dict[key] = param
+                            loaded += 1
+
+                policy_traffic_controller.load_state_dict(policy_state_dict)
                 print(f"✅ 成功加载 {loaded} 个权重")
+                print(f"   - GNN: 已加载")
+                print(f"   - WorldModel: 已加载")
+                print(f"   - Controller: 将从随机初始化开始训练")
             except Exception as e:
                 print(f"⚠️  权重加载失败: {e}")
                 print(f"   将使用随机初始化的权重")
         else:
             print(f"\n⚠️  未找到 Phase 1 检查点，使用随机初始化")
 
-        # 4. 冻结 GNN 和 WorldModel（如果存在）
-        self._freeze_phase2_components(model.policy)
+        # 4. 冻结 GNN 和 WorldModel
+        print(f"\n❄️  冻结组件...")
+        model.policy.freeze_gnn_and_world_model()
+        print("✅ 已冻结 GNN 和 WorldModel，只训练 Controller")
 
         # 5. 设置回调
         callbacks = self._create_phase2_callbacks()

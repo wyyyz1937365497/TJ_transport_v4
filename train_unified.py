@@ -40,42 +40,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 # 导入模型创建函数（可能失败）
-try:
-    from src.models import create_model_from_config
-    _model_creation_available = True
-except ImportError:
-    print("⚠️  警告: 无法导入 create_model_from_config，某些功能可能不可用")
-    _model_creation_available = False
-    create_model_from_config = None
-
-# 导入训练器
-try:
-    from src.algorithms import Trainer
-    _trainer_available = True
-except ImportError:
-    print("⚠️  警告: 无法导入 Trainer")
-    _trainer_available = False
-    Trainer = None
-
+from src.models import create_model_from_config
 # 导入 SB3 训练管道
-try:
-    from src.algorithms.training_sb3 import TrainingPipelineSB3
-    _sb3_trainer_available = True
-except ImportError:
-    print("⚠️  警告: 无法导入 TrainingPipelineSB3")
-    _sb3_trainer_available = False
-    TrainingPipelineSB3 = None
+from src.algorithms.training_sb3 import TrainingPipelineSB3
 
 # 导入评估模块
-try:
-    from src.evaluation import XLSXResultGenerator, generate_evaluation_report
-    _evaluation_available = True
-except ImportError:
-    print("⚠️  警告: 无法导入评估模块")
-    _evaluation_available = False
-    XLSXResultGenerator = None
-    generate_evaluation_report = None
-
+from src.evaluation import XLSXResultGenerator, generate_evaluation_report
 
 def load_config(config_path: str) -> dict:
     """
@@ -94,11 +64,6 @@ def load_config(config_path: str) -> dict:
             config = yaml.safe_load(f)
         else:
             config = json.load(f)
-
-    # 自动检测设备
-    if config.get('device', 'cuda') == 'cuda' and not torch.cuda.is_available():
-        print("⚠️  CUDA 不可用，使用 CPU")
-        config['device'] = 'cpu'
 
     # 从 YAML 配置中提取路径配置
     if 'paths' in config:
@@ -268,50 +233,16 @@ def main():
     # 应用命令行参数覆盖
     apply_command_line_overrides(config, args)
 
-    # 确定训练模式
-    use_sb3 = args.use_sb3
-    if args.legacy:
-        use_sb3 = False
-
     print(f"\n🔧 设备: {config.get('device', 'cuda')}")
     print(f"🌱 种子: {config.get('seed', 42)}")
-    print(f"🚀 训练模式: {'SB3 优化' if use_sb3 else '传统实现'}")
 
     # 设置随机种子
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
 
     # ========== 选择训练管道 ==========
-    if use_sb3:
-        print("\n✨ 使用 SB3 优化训练管道")
-        if not _sb3_trainer_available:
-            print("❌ 错误: TrainingPipelineSB3 不可用，请检查依赖")
-            print("   回退到传统训练模式...")
-            use_sb3 = False
-
-        if use_sb3:
-            trainer = TrainingPipelineSB3(config)
-        else:
-            if not _model_creation_available:
-                print("❌ 错误: 无法创建模型")
-                return
-            model = create_model_from_config(config)
-            if not _trainer_available:
-                print("❌ 错误: Trainer 不可用")
-                return
-            trainer = Trainer(config)
-
-    if not use_sb3:
-        print("\n📜 使用传统训练管道")
-        if not _model_creation_available:
-            print("❌ 错误: 无法创建模型")
-            return
-        model = create_model_from_config(config)
-        if not _trainer_available:
-            print("❌ 错误: Trainer 不可用")
-            return
-        trainer = Trainer(config)
-
+    print("\n✨ 使用 SB3 优化训练管道")
+    trainer = TrainingPipelineSB3(config)
     # ========== 仅评估模式 ==========
     if args.eval_only:
         print("\n📊 仅评估模式")
@@ -319,12 +250,9 @@ def main():
         # 加载模型
         checkpoint_path = os.path.join(config['checkpoint_dir'], 'final_model.pth')
         if os.path.exists(checkpoint_path):
-            if use_sb3:
-                # 加载 SB3 模型
-                from stable_baselines3 import PPO
-                model = PPO.load(checkpoint_path.replace('.pth', '_sb3.zip'))
-            else:
-                model.load_checkpoint(checkpoint_path)
+            # 加载 SB3 模型
+            from stable_baselines3 import PPO
+            model = PPO.load(checkpoint_path.replace('.pth', '_sb3.zip'))
         else:
             print(f"⚠️  检查点不存在: {checkpoint_path}")
             print("   将使用随机初始化的模型")
@@ -355,26 +283,15 @@ def main():
 
         phase1_config = config.get('training', {}).get('phase1', {})
 
-        if use_sb3:
-            # 使用 SB3 管道（复用传统 Phase 1）
-            model = trainer.train_phase1(
-                model=None,
-                num_episodes=phase1_config.get('num_episodes', 20),
-                epochs=phase1_config.get('epochs', 20),
-                batch_size=phase1_config.get('batch_size', 128),
-                learning_rate=phase1_config.get('learning_rate', 1e-4),
-                skip_data_collection=args.skip_data_collection
-            )
-        else:
-            # 传统实现
-            model = trainer.train_phase1(
-                model=model,
-                num_episodes=phase1_config.get('num_episodes', 20),
-                epochs=phase1_config.get('epochs', 20),
-                batch_size=phase1_config.get('batch_size', 128),
-                learning_rate=phase1_config.get('learning_rate', 1e-4),
-                skip_data_collection=args.skip_data_collection
-            )
+        # 使用 SB3 管道（复用传统 Phase 1）
+        model = trainer.train_phase1(
+            model=None,
+            num_episodes=phase1_config.get('num_episodes', 20),
+            epochs=phase1_config.get('epochs', 20),
+            batch_size=phase1_config.get('batch_size', 128),
+            learning_rate=phase1_config.get('learning_rate', 1e-4),
+            skip_data_collection=args.skip_data_collection
+        )
 
     # Phase 2: PPO 训练
     if args.phase in ['2', 'all']:
@@ -384,21 +301,11 @@ def main():
 
         phase2_config = config.get('training', {}).get('phase2', {})
 
-        if use_sb3:
-            # SB3 PPO
-            model = trainer.train_phase2_sb3(
-                total_timesteps=phase2_config.get('total_timesteps', 100000),
-                num_envs=phase2_config.get('num_envs', 4),
-                learning_rate=phase2_config.get('learning_rate', 3e-4)
-            )
-        else:
-            # 传统 PPO
-            model = trainer.train_phase2(
-                model=model,
-                num_envs=phase2_config.get('num_envs', 2),
-                total_timesteps=phase2_config.get('total_timesteps', 10000),
-                learning_rate=phase2_config.get('learning_rate', 3e-4)
-            )
+        model = trainer.train_phase2_sb3(
+            total_timesteps=phase2_config.get('total_timesteps', 100000),
+            num_envs=phase2_config.get('num_envs', 4),
+            learning_rate=phase2_config.get('learning_rate', 3e-4)
+        )
 
     # Phase 3: 端到端微调
     if args.phase in ['3', 'all']:
@@ -408,21 +315,12 @@ def main():
 
         phase3_config = config.get('training', {}).get('phase3', {})
 
-        if use_sb3:
-            # SB3 端到端微调
-            model = trainer.train_phase3_sb3(
-                total_timesteps=phase3_config.get('total_timesteps', 50000),
-                learning_rate=phase3_config.get('learning_rate', 1e-5),
-                freeze_bn=phase3_config.get('freeze_bn', True)
-            )
-        else:
-            # 传统端到端微调
-            model = trainer.train_phase3(
-                model=model,
-                total_timesteps=phase3_config.get('total_timesteps', 5000),
-                learning_rate=phase3_config.get('learning_rate', 1e-5),
-                freeze_bn=phase3_config.get('freeze_bn', True)
-            )
+        # SB3 端到端微调
+        model = trainer.train_phase3_sb3(
+            total_timesteps=phase3_config.get('total_timesteps', 50000),
+            learning_rate=phase3_config.get('learning_rate', 1e-5),
+            freeze_bn=phase3_config.get('freeze_bn', True)
+        )
 
     # Phase 4: 约束优化训练
     if args.phase in ['4', 'all']:
@@ -432,22 +330,12 @@ def main():
 
         phase4_config = config.get('training', {}).get('phase4', {})
 
-        if use_sb3:
-            # CPO 约束优化
-            model = trainer.train_phase4_sb3(
-                total_timesteps=phase4_config.get('total_timesteps', 50000),
-                cost_limit=phase4_config.get('cost_limit', 0.1),
-                learning_rate=phase4_config.get('learning_rate', 1e-4)
-            )
-        else:
-            # 传统拉格朗日约束优化
-            model = trainer.train_phase4(
-                model=model,
-                total_timesteps=phase4_config.get('total_timesteps', 5000),
-                cost_limit=phase4_config.get('cost_limit', 0.1),
-                learning_rate=phase4_config.get('learning_rate', 1e-4)
-            )
-
+        # CPO 约束优化（拉格朗日 PPO）
+        model = trainer.train_phase4_sb3(
+            total_timesteps=phase4_config.get('total_timesteps', 50000),
+            cost_limit=phase4_config.get('cost_limit', 0.1),
+            learning_rate=phase4_config.get('learning_rate', 1e-4)
+        )
     total_time = time.time() - start_time
 
     # ========== 训练完成 ==========
@@ -455,12 +343,10 @@ def main():
     print("🎉 训练完成！（4 阶段训练）")
     print("="*70)
     print(f"   总耗时: {total_time/3600:.2f} 小时")
-    print(f"   训练模式: {'SB3 优化' if use_sb3 else '传统实现'}")
 
     # 保存训练历史
     history_path = os.path.join(config['log_dir'], 'training_history.json')
-    if use_sb3:
-        trainer.save_history(history_path)
+    trainer.save_history(history_path)
 
     # 最终评估
     print("\n📊 最终评估...")

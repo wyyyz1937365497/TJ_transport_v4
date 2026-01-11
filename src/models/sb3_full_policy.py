@@ -12,12 +12,13 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import gymnasium as gym
 from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, MlpExtractor
 from stable_baselines3.common.distributions import DiagGaussianDistribution
 
 # 导入完整模型组件
@@ -104,6 +105,9 @@ class FullTrafficController(nn.Module):
             nn.Linear(128, 1)
         )
 
+        # 将所有模块移动到正确的设备（在所有子模块创建之后）
+        self.to(self.device)
+
     def forward(
         self,
         vehicle_states: torch.Tensor,
@@ -176,12 +180,15 @@ class FullTrafficController(nn.Module):
 
     def _build_batch_graph(self, vehicle_states, batch_size, num_vehicles):
         """
-        构建批量图数据 - 完整实现
+        构建批量图数据
 
-        使用基于距离和相对状态的完整图构建逻辑，
-        而非简化的全连接图。
+        环境已提供9维Frenet特征：[s, d, vs, vd, speed, acceleration, lane_index, angle, is_icv]
+        直接使用这些特征构建图，无需转换。
         """
         from torch_geometric.data import Batch, Data
+
+        # 获取设备
+        device = vehicle_states.device
 
         # 获取图构建配置
         interaction_radius = self.config.get('interaction_radius', 100.0)
@@ -193,27 +200,40 @@ class FullTrafficController(nn.Module):
             # 提取当前batch的车辆状态
             start_idx = b * num_vehicles
             end_idx = start_idx + num_vehicles
-            batch_vehicle_states = vehicle_states[start_idx:end_idx]  # [N, 5]
-
-            # 车辆状态格式: [x, y, vx, vy, lane_id]
-            # 提取位置信息
-            positions = batch_vehicle_states[:, :2]  # [N, 2]
-            velocities = batch_vehicle_states[:, 2:4]  # [N, 2]
-            lane_ids = batch_vehicle_states[:, 4]  # [N]
+            batch_vehicle_states = vehicle_states[start_idx:end_idx]  # [N, 9]
 
             num_nodes = batch_vehicle_states.size(0)
-            x = batch_vehicle_states  # [N, 5] 节点特征
+
+            # 直接使用9维Frenet特征作为节点特征
+            # [0]: s (纵向位置), [1]: d (横向偏移), [2]: vs (纵向速度), [3]: vd (横向速度)
+            # [4]: speed, [5]: acceleration, [6]: lane_index, [7]: angle, [8]: is_icv
+            x = batch_vehicle_states  # [N, 9]
+
+            # 为边构建准备位置和速度信息（使用Frenet坐标）
+            # positions_2d: [N, 2] (s, d) - Frenet坐标系中的位置
+            positions_2d = torch.stack([
+                batch_vehicle_states[:, 0],  # s (纵向位置)
+                batch_vehicle_states[:, 1]   # d (横向偏移)
+            ], dim=1)  # [N, 2]
+
+            # velocities_2d: [N, 2] (vs, vd) - Frenet坐标系中的速度
+            velocities_2d = torch.stack([
+                batch_vehicle_states[:, 2],  # vs (纵向速度)
+                batch_vehicle_states[:, 3]   # vd (横向速度)
+            ], dim=1)  # [N, 2]
+
+            lane_ids = batch_vehicle_states[:, 6].long()  # lane_index
 
             if num_nodes > 1:
                 # 计算车辆之间的距离矩阵
-                # positions: [N, 2] -> [N, 1, 2] and [1, N, 2]
-                pos_expanded_1 = positions.unsqueeze(1)  # [N, 1, 2]
-                pos_expanded_2 = positions.unsqueeze(0)  # [1, N, 2]
+                # positions_2d: [N, 2] -> [N, 1, 2] and [1, N, 2]
+                pos_expanded_1 = positions_2d.unsqueeze(1)  # [N, 1, 2]
+                pos_expanded_2 = positions_2d.unsqueeze(0)  # [1, N, 2]
                 distances = torch.norm(pos_expanded_1 - pos_expanded_2, dim=2)  # [N, N]
 
                 # 计算相对速度
-                vel_expanded_1 = velocities.unsqueeze(1)  # [N, 1, 2]
-                vel_expanded_2 = velocities.unsqueeze(0)  # [1, N, 2]
+                vel_expanded_1 = velocities_2d.unsqueeze(1)  # [N, 1, 2]
+                vel_expanded_2 = velocities_2d.unsqueeze(0)  # [1, N, 2]
                 relative_velocities = vel_expanded_2 - vel_expanded_1  # [N, N, 2]
 
                 # 判断是否在同一车道
@@ -228,11 +248,11 @@ class FullTrafficController(nn.Module):
                 for i in range(num_nodes):
                     # 找到车辆 i 的邻居
                     # 排除自身
-                    mask = torch.ones(num_nodes, dtype=torch.bool)
+                    mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
                     mask[i] = False
 
                     # 计算交互分数（距离越近分数越高）
-                    interaction_scores = torch.zeros(num_nodes)
+                    interaction_scores = torch.zeros(num_nodes, device=device)
                     interaction_scores[mask] = 1.0 / (distances[i, mask] + 1e-6)
 
                     # 同车道加分
@@ -267,16 +287,16 @@ class FullTrafficController(nn.Module):
 
                 # 转换为张量
                 if len(edge_index) > 0:
-                    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-                    edge_attr = torch.tensor(edge_features, dtype=torch.float32)
+                    edge_index = torch.tensor(edge_index, dtype=torch.long, device=device).t().contiguous()
+                    edge_attr = torch.tensor(edge_features, dtype=torch.float32, device=device)
                 else:
                     # 如果没有边，创建空张量
-                    edge_index = torch.zeros(2, 0, dtype=torch.long)
-                    edge_attr = torch.zeros(0, 4)
+                    edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
+                    edge_attr = torch.zeros(0, 4, device=device)
             else:
                 # 单个节点
-                edge_index = torch.zeros(2, 0, dtype=torch.long)
-                edge_attr = torch.zeros(0, 4)
+                edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
+                edge_attr = torch.zeros(0, 4, device=device)
 
             # 创建图
             graph = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
@@ -315,6 +335,20 @@ class FullTrafficFeatureExtractor(BaseFeaturesExtractor):
             nn.Linear(observation_space['vehicle_states'].shape[0], 256),
             nn.ReLU(),
             nn.LayerNorm(256)
+        )
+
+        # 全局特征编码器
+        self.global_encoder = nn.Sequential(
+            nn.Linear(observation_space['global_stats'].shape[0], 128),
+            nn.ReLU(),
+            nn.LayerNorm(128)
+        )
+
+        # 特征组合器
+        self.combiner = nn.Sequential(
+            nn.Linear(384, 512),
+            nn.ReLU(),
+            nn.LayerNorm(512)
         )
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -397,8 +431,12 @@ class FullTrafficActorCriticPolicy(ActorCriticPolicy):
         )
 
     def _build_mlp_extractor(self) -> None:
-        """跳过父类的MLP构建，使用我们的完整模型"""
-        pass
+        """
+        构建MLP提取器 - 为SB3提供兼容的特征提取器
+        """
+        # 让父类创建标准的 mlp_extractor
+        # 这样 SB3 的 _build 方法可以正常访问它
+        super(FullTrafficActorCriticPolicy, self)._build_mlp_extractor()
 
     def forward(self, observations: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

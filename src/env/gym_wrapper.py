@@ -6,7 +6,8 @@ Gymnasium环境包装器 - 将SUMO环境包装成标准的Gymnasium Env
 import gymnasium as gym
 import numpy as np
 from typing import Dict, Any, Tuple, Optional
-from .sumo_env import SumoEnvironment
+# 使用比赛标准环境（Frenet坐标系 + 正确的奖励函数）
+from .competition_env import CompetitionSumoEnv as SumoEnvironment
 from ..constants import (
     MAX_VEHICLES,
     FEATURES_PER_VEHICLE,
@@ -185,27 +186,32 @@ class GymSumoEnv(gym.Env):
 
     def _format_observation(self, observation: Dict) -> Dict:
         """
-        将SUMO观测格式化为标准Gymnasium格式
+        将SUMO观测格式化为标准Gymnasium格式（使用Frenet坐标系）
 
         Args:
-            observation: SUMO原始观测
+            observation: SUMO原始观测（来自CompetitionSumoEnv，包含Frenet坐标）
 
         Returns:
             标准化观测字典
         """
         vehicle_states = observation.get('vehicle_states', {})
         global_stats = observation.get('global_stats', np.zeros(16))
+        icv_ids = observation.get('icv_ids', set())
 
-        # 车辆状态向量化
+        # 车辆状态向量化（Frenet坐标系9维特征）
         vehicle_features = []
         for veh_id, state in vehicle_states.items():
-            # 提取关键特征并归一化
+            # 提取Frenet坐标系特征并归一化
             features = [
-                state.get('speed', 0.0),
-                state.get('acceleration', 0.0),
-                state.get('angle', 0.0) / ANGLE_SCALE,
-                state.get('lane_index', 0.0) / LANE_INDEX_SCALE,
-                state.get('position', 0.0) / POSITION_SCALE,
+                state.get('s', 0.0) / 1000.0,              # 纵向位置（归一化到0-1）
+                state.get('d', 0.0) / 10.0,               # 横向偏移（归一化，假设车道宽度~3-4m）
+                state.get('vs', 0.0) / 30.0,              # 纵向速度（归一化到0-30m/s）
+                state.get('vd', 0.0) / 10.0,              # 横向速度（归一化）
+                state.get('speed', 0.0) / 30.0,           # 总速度（归一化到0-30m/s）
+                state.get('acceleration', 0.0) / 3.0,     # 加速度（归一化到-3~3m/s²）
+                state.get('lane_index', 0.0) / 10.0,      # 车道索引（归一化）
+                state.get('angle', 0.0) / 360.0,          # 航向角（归一化到0-360度）
+                1.0 if veh_id in icv_ids else 0.0         # is_icv标志
             ]
             vehicle_features.extend(features)
 
