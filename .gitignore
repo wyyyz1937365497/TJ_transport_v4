@@ -8,3 +8,6 @@ logs_sb3/
 nul
 logs_sb3/
 checkpoints_sb3_test/
+checkpoints_sb3/
+checkpoints/
+results/

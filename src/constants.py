@@ -51,7 +51,7 @@ WORLD_MODEL_DROPOUT = 0.1  # 世界模型 Dropout率
 # 控制器配置
 CONTROLLER_GNN_DIM = 256  # 控制器GNN维度
 CONTROLLER_WORLD_DIM = 256  # 控制器世界模型维度
-CONTROLLER_GLOBAL_DIM = 16  # 全局统计特征维度
+CONTROLLER_GLOBAL_DIM = 32  # 全局统计特征维度（比赛专用32维统计）
 CONTROLLER_HIDDEN_DIM = 128  # 控制器隐藏层维度
 CONTROLLER_ACTION_DIM = 2  # 动作维度（加速度、换道）
 CONTROLLER_TOP_K = 5  # Top-K风险车辆数

@@ -85,11 +85,11 @@ class GymSumoEnv(gym.Env):
                 shape=(MAX_VEHICLES * FEATURES_PER_VEHICLE,),
                 dtype=np.float32
             ),
-            # 全局统计特征（16维）
+            # 全局统计特征（32维：比赛专用统计）
             'global_stats': gym.spaces.Box(
                 low=-np.inf,
                 high=np.inf,
-                shape=(16,),
+                shape=(32,),
                 dtype=np.float32
             ),
             'num_vehicles': gym.spaces.Box(
