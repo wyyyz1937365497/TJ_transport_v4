@@ -12,6 +12,15 @@ import time
 import pickle
 import json
 from multiprocessing import Pool, Process, Queue, Manager, cpu_count
+import multiprocessing
+
+# 尝试设置spawn启动方法（避免fork导致的TraCI状态共享问题）
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    # 已经设置过，忽略
+    pass
+
 from .sumo_env import SumoEnvironment
 
 
@@ -27,9 +36,16 @@ def collect_single_episode(args: Tuple[Dict[str, Any], int, int, float, int]) ->
     """
     config, episode_id, max_steps, timeout, port = args
 
-    # 独立进程环境
+    # 独立进程环境 - 确保TraCI状态干净
     import sys
     import traci
+
+    # 清理任何现有的TraCI连接
+    try:
+        traci.close()
+    except:
+        pass
+
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
     trajectories = {}
@@ -43,8 +59,8 @@ def collect_single_episode(args: Tuple[Dict[str, Any], int, int, float, int]) ->
     }
 
     try:
-        # 创建环境（每个进程独立实例，使用指定端口）
-        env = SumoEnvironment(config, use_gui=False, port=port)
+        # 创建环境（每个进程独立实例，使用指定端口，禁用端口重试）
+        env = SumoEnvironment(config, use_gui=False, port=port, disable_port_retry=True)
 
         start_time = time.time()
         observation = env.reset()
@@ -185,7 +201,9 @@ class ParallelDataCollector:
         all_trajectories = {}
         all_stats = []
 
-        with Pool(processes=self.num_workers) as pool:
+        # 使用spawn启动方式避免TraCI状态共享问题
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=self.num_workers) as pool:
             # 异步应用函数
             results = pool.map_async(collect_single_episode, tasks)
 

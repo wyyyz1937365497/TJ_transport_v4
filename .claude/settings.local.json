@@ -12,7 +12,15 @@
       "Bash(~/miniconda3/envs/sumo/bin/python:*)",
       "Bash(~/miniconda3/envs/sumo/bin/pip list:*)",
       "Bash(sumo:*)",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "Bash(pip show:*)",
+      "Bash(find:*)",
+      "Bash(netstat:*)",
+      "Bash(ss:*)",
+      "Bash(lsof:*)",
+      "Bash(pkill:*)",
+      "mcp__web-search-prime__webSearchPrime",
+      "mcp__web-reader__webReader"
     ]
   }
 }

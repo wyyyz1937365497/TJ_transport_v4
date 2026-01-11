@@ -35,11 +35,13 @@ class SumoEnvironment:
         self,
         config: Dict[str, Any],
         use_gui: bool = False,
-        port: Optional[int] = None
+        port: Optional[int] = None,
+        disable_port_retry: bool = False  # 禁用端口重试（用于并行环境）
     ):
         self.config = config
         self.use_gui = use_gui
         self.port = port if port is not None else 8813  # 默认端口
+        self.disable_port_retry = disable_port_retry  # 是否禁用端口重试
 
         # SUMO配置
         self.sumo_cfg = config.get('sumo_cfg', '')
@@ -78,15 +80,28 @@ class SumoEnvironment:
 
     def _build_sumo_command(self) -> List[str]:
         """构建SUMO命令"""
-        sumo_binary = "sumo-gui.exe" if self.use_gui else "sumo.exe"
+        import platform
+        is_windows = platform.system() == "Windows"
+
+        sumo_binary = "sumo-gui" if self.use_gui else "sumo"
+        if is_windows:
+            sumo_binary += ".exe"
 
         # 如果不在PATH中，尝试使用绝对路径
         if not os.path.exists(sumo_binary):
-            # 尝试常见的SUMO安装路径
-            possible_paths = [
-                r"C:\Program Files (x86)\Eclipse\Sumo\bin\sumo.exe",
-                r"C:\Program Files\Eclipse\Sumo\bin\sumo.exe",
-            ]
+            if is_windows:
+                # Windows路径
+                possible_paths = [
+                    r"C:\Program Files (x86)\Eclipse\Sumo\bin\sumo.exe",
+                    r"C:\Program Files\Eclipse\Sumo\bin\sumo-gui.exe",
+                ]
+            else:
+                # Linux/WSL路径
+                possible_paths = [
+                    "/usr/bin/sumo",
+                    "/usr/local/bin/sumo",
+                    os.path.expanduser("~/sumo/bin/sumo"),
+                ]
 
             for path in possible_paths:
                 if os.path.exists(path):
@@ -99,7 +114,7 @@ class SumoEnvironment:
             "--no-step-log", "true",
             "--no-warnings", "true",
             "--step-length", str(self.step_length),
-            "--remote-port", str(self.port)  # 添加端口参数
+            # 注意：不要添加--remote-port参数，traci.start()会自动处理
         ]
 
         # 只有在配置中明确指定了seed才添加
@@ -116,23 +131,34 @@ class SumoEnvironment:
         if self.is_connected:
             return
 
-        # 尝试连接，最多重试3次
-        max_attempts = 3
-        for attempt in range(max_attempts):
+        # 尝试连接
+        if self.disable_port_retry:
+            # 并行模式：不重试，直接使用分配的端口
             try:
                 traci.start(self.sumo_cmd, port=self.port)
                 self.is_connected = True
                 self.current_step = 0
                 print(f"✅ SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
-                return
             except Exception as e:
-                if attempt < max_attempts - 1:
-                    print(f"⚠️  端口 {self.port} 占用，尝试新端口...")
-                    # 尝试新端口
-                    self.port += 10
-                    self.sumo_cmd = self._build_sumo_command()
-                else:
-                    raise RuntimeError(f"SUMO启动失败（已尝试 {max_attempts} 次）: {e}")
+                raise RuntimeError(f"SUMO启动失败 (Port: {self.port}): {e}")
+        else:
+            # 单机模式：尝试连接，最多重试3次
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    traci.start(self.sumo_cmd, port=self.port)
+                    self.is_connected = True
+                    self.current_step = 0
+                    print(f"✅ SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
+                    return
+                except Exception as e:
+                    if attempt < max_attempts - 1:
+                        print(f"⚠️  端口 {self.port} 占用，尝试新端口...")
+                        # 尝试新端口
+                        self.port += 10
+                        self.sumo_cmd = self._build_sumo_command()
+                    else:
+                        raise RuntimeError(f"SUMO启动失败（已尝试 {max_attempts} 次）: {e}")
 
     def close(self):
         """关闭SUMO仿真"""

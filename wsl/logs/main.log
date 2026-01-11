@@ -4,3 +4,15 @@
 2026-01-11 02:41:28 - tj_transport - INFO - 模型已创建
 2026-01-11 02:41:28 - tj_transport - INFO -   总参数: 660,932
 2026-01-11 02:41:28 - tj_transport - INFO -   可训练参数: 660,932
+2026-01-11 11:05:59 - tj_transport - INFO - 配置文件: config/base.yaml
+2026-01-11 11:05:59 - tj_transport - INFO - 设备: cuda
+2026-01-11 11:05:59 - tj_transport - INFO - 种子: 42
+2026-01-11 11:05:59 - tj_transport - INFO - 模型已创建
+2026-01-11 11:05:59 - tj_transport - INFO -   总参数: 660,932
+2026-01-11 11:05:59 - tj_transport - INFO -   可训练参数: 660,932
+2026-01-11 13:20:52 - tj_transport - INFO - 配置文件: config/base.yaml
+2026-01-11 13:20:52 - tj_transport - INFO - 设备: cuda
+2026-01-11 13:20:52 - tj_transport - INFO - 种子: 42
+2026-01-11 13:20:52 - tj_transport - INFO - 模型已创建
+2026-01-11 13:20:52 - tj_transport - INFO -   总参数: 660,932
+2026-01-11 13:20:52 - tj_transport - INFO -   可训练参数: 660,932
