@@ -58,14 +58,14 @@ class IdealArchitectureEvaluator:
                 try:
                     # 加载SB3模型
                     model = PPO.load(path, device=self.device)
-                    print(f"✅ 模型加载成功: {path}")
+                    print(f"[OK] 模型加载成功: {path}")
                     print(f"   Top-K: {self.top_k}")
                     return model
                 except Exception as e:
-                    print(f"⚠️ 加载失败 ({path}): {e}")
+                    print(f"[WARNING] 加载失败 ({path}): {e}")
                     continue
 
-        print(f"⚠️ 未找到有效模型，将使用随机策略")
+        print(f"[WARNING] 未找到有效模型，将使用随机策略")
         return None
 
     def evaluate_episode(self, model: Any, use_gui: bool = False) -> Dict[str, Any]:
@@ -247,7 +247,7 @@ class IdealArchitectureEvaluator:
                 }
 
         except Exception as e:
-            print(f"⚠️ 推理失败: {e}")
+            print(f"[WARNING] 推理失败: {e}")
             import traceback
             traceback.print_exc()
 
@@ -398,16 +398,16 @@ class IdealArchitectureEvaluator:
         """打印单个episode结果"""
         print(f"\n📈 Episode {episode_num} 评估结果:")
         print(f"{'─'*80}")
-        print(f"📊 基础指标:")
+        print(f"[INFO] 基础指标:")
         print(f"   总车辆数:        {metrics['total_vehicles']}")
         print(f"   已到达:          {metrics['arrived_vehicles']}")
         print(f"   在途车辆:        {metrics['in_road_vehicles']}")
         print(f"   OD完成率(OCR):   {metrics['ocr']:.4f}")
-        print(f"\n📊 性能指标:")
+        print(f"\n[INFO] 性能指标:")
         print(f"   平均速度:        {metrics['avg_speed']:.2f} m/s")
         print(f"   速度标准差(σv):  {metrics['std_speed']:.2f} m/s")
         print(f"   平均绝对加速度:  {metrics['avg_abs_acceleration']:.3f} m/s²")
-        print(f"\n📊 干预成本:")
+        print(f"\n[INFO] 干预成本:")
         print(f"   控制指令总数:    {metrics['total_control_count']}")
         print(f"   受控车辆数:      {metrics['num_controlled_vehicles']}")
         print(f"   平均Top-K选择:   {metrics['avg_top_k_selected']:.1f}")
@@ -415,7 +415,7 @@ class IdealArchitectureEvaluator:
         print(f"   换道成本:        {metrics['total_lane_change_cost']:.2f}")
         print(f"   总干预成本:      {metrics['total_intervention_cost']:.2f}")
         print(f"   成本密度:        {metrics['cost_density']:.4f}")
-        print(f"\n📊 影响力分析:")
+        print(f"\n[INFO] 影响力分析:")
         print(f"   平均影响力得分:  {metrics['avg_influence_score']:.4f}")
         print(f"   动态权重 (效率):  {metrics['avg_dynamic_weights_efficiency']:.3f}")
         print(f"   动态权重 (稳定):  {metrics['avg_dynamic_weights_stability']:.3f}")
@@ -448,21 +448,21 @@ class IdealArchitectureEvaluator:
         print(f"\n{'='*80}")
         print(f"🏆 最终评估结果 ({num_episodes} episodes 平均)")
         print(f"{'='*80}")
-        print(f"\n📊 基础指标:")
+        print(f"\n[INFO] 基础指标:")
         print(f"   总车辆数:        {results['total_vehicles_mean']:.1f} ± {results['total_vehicles_std']:.1f}")
         print(f"   已到达:          {results['arrived_vehicles_mean']:.1f} ± {results['arrived_vehicles_std']:.1f}")
         print(f"   OD完成率(OCR):   {results['ocr_mean']:.4f} ± {results['ocr_std']:.4f}")
-        print(f"\n📊 性能指标:")
+        print(f"\n[INFO] 性能指标:")
         print(f"   平均速度:        {results['avg_speed_mean']:.2f} ± {results['avg_speed_std']:.2f} m/s")
         print(f"   速度标准差:      {results['std_speed_mean']:.2f} ± {results['std_speed_std']:.2f} m/s")
         print(f"   平均绝对加速度:  {results['avg_abs_acceleration_mean']:.3f} ± {results['avg_abs_acceleration_std']:.3f} m/s²")
-        print(f"\n📊 干预成本:")
+        print(f"\n[INFO] 干预成本:")
         print(f"   控制指令总数:    {results['total_control_count_mean']:.0f}")
         print(f"   受控车辆数:      {results['num_controlled_vehicles_mean']:.1f}")
         print(f"   平均Top-K选择:   {results['avg_top_k_selected_mean']:.1f}")
         print(f"   总干预成本:      {results['total_intervention_cost_mean']:.2f}")
         print(f"   成本密度:        {results['cost_density_mean']:.4f}")
-        print(f"\n📊 影响力分析:")
+        print(f"\n[INFO] 影响力分析:")
         print(f"   平均影响力得分:  {results['avg_influence_score_mean']:.4f}")
         print(f"   动态权重 (效率):  {results['avg_dynamic_weights_efficiency_mean']:.3f}")
         print(f"   动态权重 (稳定):  {results['avg_dynamic_weights_stability_mean']:.3f}")
@@ -501,7 +501,7 @@ def main():
     model = evaluator.load_model(args.checkpoint)
 
     # 评估
-    print(f"\n📊 开始评估 ({args.episodes} episodes)...")
+    print(f"\n[INFO] 开始评估 ({args.episodes} episodes)...")
 
     all_metrics = []
     for episode in range(args.episodes):

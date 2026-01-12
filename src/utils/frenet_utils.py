@@ -401,8 +401,8 @@ if __name__ == '__main__':
     net_path = "仿真环境_初赛_1.0/仿真环境-初赛/net.xml"
     frenet = FrenetCoordinateSystem(net_path)
 
-    print(f"\n✅ 解析到 {len(frenet.lanes)} 条车道")
-    print(f"✅ 识别到 {len(frenet.bottleneck_areas)} 个瓶颈区域")
+    print(f"\n[OK] 解析到 {len(frenet.lanes)} 条车道")
+    print(f"[OK] 识别到 {len(frenet.bottleneck_areas)} 个瓶颈区域")
 
     # 显示瓶颈信息
     print("\n瓶颈区域:")
@@ -422,5 +422,5 @@ if __name__ == '__main__':
             print(f"  s={s}m -> ({x:.2f}, {y:.2f}) -> s={s_back:.2f}, d={d_back:.2f}")
 
     print("\n" + "=" * 70)
-    print("✅ 测试完成")
+    print("[OK] 测试完成")
     print("=" * 70)

@@ -48,17 +48,17 @@ class CompetitionSumoEnv(SumoEnvironment):
             try:
                 self.frenet_system = get_frenet_system(net_xml_path)
                 self.use_accurate_frenet = True
-                print(f"✅ Frenet坐标系初始化成功: {net_xml_path}")
+                print(f"[OK] Frenet坐标系初始化成功: {net_xml_path}")
             except Exception as e:
                 # Frenet系统是比赛性能的关键，不应该静默失败
                 raise RuntimeError(
-                    f"❌ Frenet坐标系初始化失败（这会严重降低模型性能）: {e}\n"
+                    f"[X] Frenet坐标系初始化失败（这会严重降低模型性能）: {e}\n"
                     f"   请确保net.xml文件路径正确且格式有效: {net_xml_path}\n"
                     f"   Frenet坐标系对于准确的位置表示至关重要，不能使用简化版本。"
                 )
         else:
             raise FileNotFoundError(
-                f"❌ Frenet系统所需的net.xml文件不存在: {net_xml_path}\n"
+                f"[X] Frenet系统所需的net.xml文件不存在: {net_xml_path}\n"
                 f"   精确的Frenet坐标系对于比赛性能至关重要。\n"
                 f"   请检查路径配置或在config中指定正确的net_file路径。"
             )
@@ -198,7 +198,7 @@ class CompetitionSumoEnv(SumoEnvironment):
                     # 订阅失败不应该发生，如果发生说明批量订阅有问题
                     # 这是一个严重问题，会显著降低性能（慢5倍）
                     raise RuntimeError(
-                        f"❌ TraCI批量订阅失败，车辆 {veh_id} 不在订阅结果中。\n"
+                        f"[X] TraCI批量订阅失败，车辆 {veh_id} 不在订阅结果中。\n"
                         f"   这会导致回退到逐个TraCI调用，性能降低约5倍。\n"
                         f"   当前订阅车辆数: {len(all_vehicle_ids)}\n"
                         f"   订阅结果车辆数: {len(all_subscription_results)}\n"

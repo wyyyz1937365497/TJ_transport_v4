@@ -21,7 +21,7 @@ try:
     TRACI_AVAILABLE = True
 except ImportError:
     TRACI_AVAILABLE = False
-    print("⚠️  警告: TraCI未安装，SUMO功能将不可用")
+    print("[WARNING]  警告: TraCI未安装，SUMO功能将不可用")
 
 
 class SumoEnvironment:
@@ -77,10 +77,10 @@ class SumoEnvironment:
             raise FileNotFoundError(f"SUMO配置文件不存在: {self.sumo_cfg}")
 
         if self.net_file and not os.path.exists(self.net_file):
-            print(f"⚠️  警告: 路网文件不存在: {self.net_file}")
+            print(f"[WARNING]  警告: 路网文件不存在: {self.net_file}")
 
         if self.route_file and not os.path.exists(self.route_file):
-            print(f"⚠️  警告: 路径文件不存在: {self.route_file}")
+            print(f"[WARNING]  警告: 路径文件不存在: {self.route_file}")
 
     def _build_sumo_command(self) -> List[str]:
         """构建SUMO命令"""
@@ -142,7 +142,7 @@ class SumoEnvironment:
                 traci.start(self.sumo_cmd, port=self.port)
                 self.is_connected = True
                 self.current_step = 0
-                print(f"✅ SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
+                print(f"[OK] SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
             except Exception as e:
                 raise RuntimeError(f"SUMO启动失败 (Port: {self.port}): {e}")
         else:
@@ -153,11 +153,11 @@ class SumoEnvironment:
                     traci.start(self.sumo_cmd, port=self.port)
                     self.is_connected = True
                     self.current_step = 0
-                    print(f"✅ SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
+                    print(f"[OK] SUMO已启动 (GUI: {self.use_gui}, Port: {self.port})")
                     return
                 except Exception as e:
                     if attempt < max_attempts - 1:
-                        print(f"⚠️  端口 {self.port} 占用，尝试新端口...")
+                        print(f"[WARNING]  端口 {self.port} 占用，尝试新端口...")
                         # 尝试新端口
                         self.port += 10
                         self.sumo_cmd = self._build_sumo_command()
@@ -198,7 +198,7 @@ class SumoEnvironment:
                 pass
 
             self.is_connected = False
-            print("✅ SUMO已关闭")
+            print("[OK] SUMO已关闭")
 
     def reset(self) -> Dict[str, Any]:
         """重置环境"""

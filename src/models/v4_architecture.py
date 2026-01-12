@@ -107,7 +107,8 @@ class RiskSensitiveGNN(nn.Module):
         )
 
         # 层次化池化
-        self.local_pool = nn.Linear(hidden_dim * (num_heads if self.use_pyg else 1), hidden_dim)
+        # GAT with concat=True outputs hidden_dim, not hidden_dim * num_heads
+        self.local_pool = nn.Linear(hidden_dim, hidden_dim)
         self.global_pool = nn.Linear(hidden_dim, output_dim)
 
         # 关键性评分头（用于Top-K选择）
@@ -288,6 +289,27 @@ class MultiScaleRSSM(nn.Module):
             node_embeddings = node_embeddings.unsqueeze(0)  # [1, N, D]
 
         batch_size, num_nodes, _ = node_embeddings.shape
+
+        # 处理空车辆的情况
+        if num_nodes == 0:
+            device = node_embeddings.device
+            return {
+                'z_flow': torch.zeros(batch_size * num_nodes, self.latent_dim, device=device),
+                'z_risk': torch.zeros(batch_size * num_nodes, self.latent_dim, device=device),
+                'speed_pred': torch.zeros(batch_size * num_nodes, 1, device=device),
+                'position_pred': torch.zeros(batch_size * num_nodes, 2, device=device),
+                'conflict_prob': torch.zeros(batch_size * num_nodes, 1, device=device),
+                'hidden_state': hidden_state
+            }
+
+        # 检查hidden_state的batch维度是否匹配
+        if hidden_state is not None:
+            # hidden_state是tuple (h, c)，每个shape是 [num_layers, batch_size, hidden_dim]
+            h_hidden, c_hidden = hidden_state
+            expected_batch_size = num_nodes  # LSTM处理的是序列维度，即num_nodes
+            if h_hidden.size(1) != expected_batch_size:
+                # Batch size不匹配，重置hidden_state
+                hidden_state = None
 
         # 编码
         h = self.encoder(node_embeddings)  # [B, N, hidden_dim]
@@ -1061,10 +1083,17 @@ class EnhancedDynamicWeightGating(nn.Module):
 
         # 时间平滑
         if self.use_temporal_smoothing and self.prev_weights is not None:
-            weights = (
-                self.smoothing_factor * self.prev_weights +
-                (1 - self.smoothing_factor) * weights
-            )
+            # Check if batch sizes match
+            if self.prev_weights.size(0) == weights.size(0):
+                # Batch sizes match, apply smoothing
+                weights = (
+                    self.smoothing_factor * self.prev_weights +
+                    (1 - self.smoothing_factor) * weights
+                )
+            else:
+                # Batch sizes don't match, reset prev_weights to current weights
+                # This handles variable batch sizes during training
+                pass
 
         self.prev_weights = weights.detach().clone()
 

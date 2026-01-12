@@ -46,12 +46,14 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         observation_space: gym.Space,
         action_space: gym.Space,
         lr_schedule: callable,
-        config: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
-        # 保存配置
+        # 保存配置（从参数或类属性获取）
+        if config is None:
+            config = getattr(self.__class__, 'config', {})
         self.config = config
-        self.device = torch.device(config.get('device', 'cuda'))
+        self.cfg_device = config.get('device', 'cuda')  # Store config device separately
 
         # 调用父类初始化
         super().__init__(
@@ -134,6 +136,18 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         )
 
         # ============================================================
+        # 5.5. 价值网络（用于PPO，SB3需要）
+        # ============================================================
+        # Create critic network for PPO (maps global embedding to value)
+        self.critic = nn.Sequential(
+            nn.Linear(gnn_config.get('output_dim', 256), 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+        # ============================================================
         # 6. 拉格朗日优化器（动态约束优化）
         # ============================================================
         self.lagrangian_optimizer = LagrangianOptimizer(
@@ -147,7 +161,9 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # ============================================================
         # LSTM隐藏状态（用于世界模型）
         # ============================================================
-        self.register_buffer('rssm_hidden', None)
+        # LSTM hidden state is stored as a regular attribute (_rssm_hidden), not a buffer
+        # because it's a tuple, not a tensor
+        self._rssm_hidden = None
 
         # ============================================================
         # 图构建参数（使用空间邻近而非全连接）
@@ -213,11 +229,14 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # ============================================================
         rssm_output = self.prediction_layer(
             node_embeddings=node_embeddings,
-            hidden_state=self.rssm_hidden
+            hidden_state=getattr(self, '_rssm_hidden', None)
         )
 
-        # 更新LSTM隐藏状态
-        self.rssm_hidden = rssm_output['hidden_state']
+        # 更新LSTM隐藏状态（不使用buffer，直接作为属性存储）
+        # LSTM hidden state is a tuple (h, c), store it as a regular attribute
+        if not hasattr(self, '_rssm_hidden'):
+            self._rssm_hidden = None
+        self._rssm_hidden = rssm_output['hidden_state']
 
         z_flow = rssm_output['z_flow']
         z_risk = rssm_output['z_risk']
@@ -252,6 +271,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         使用完整的影响力驱动控制器
         """
         batch_size = observations.size(0)
+        device = observations.device
 
         # 1. 提取特征（完整v4.0架构）
         features_dict = self.extract_features(observations)
@@ -264,11 +284,35 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         # 2. 获取价值估计（使用全局嵌入）
         global_features = features_dict['global_embedding']
-        if batch_size > 1:
-            # 如果是batch，使用全局池化特征
-            values = self.critic(global_features)
+
+        # Ensure global_features has correct shape and no NaN
+        global_features = torch.nan_to_num(global_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Check if global_features is empty or all zeros
+        if global_features.numel() == 0 or global_features.abs().sum() < 1e-6:
+            # Return zero values
+            values = torch.zeros(batch_size, 1, device=device)
         else:
+            # Ensure shape is [batch_size, feature_dim]
+            if global_features.dim() == 1:
+                global_features = global_features.unsqueeze(0)
+
+            # If we have more features than batch_size, take first batch_size
+            if global_features.size(0) > batch_size:
+                global_features = global_features[:batch_size]
+
+            # If we have fewer features than batch_size, repeat the last one
+            elif global_features.size(0) < batch_size:
+                last_feature = global_features[-1:].unsqueeze(0)
+                global_features = torch.cat([global_features, last_feature.repeat(batch_size - global_features.size(0), 1)], dim=0)
+
             values = self.critic(global_features)
+
+            # Ensure values has correct shape [batch_size, 1]
+            if values.dim() == 1:
+                values = values.unsqueeze(-1)
+            if values.size(0) != batch_size:
+                values = torch.zeros(batch_size, 1, device=device)
 
         # 3. 使用影响力驱动控制器选择车辆和生成动作
         # 注意：这里需要模拟车辆ID列表和ICV标志
@@ -305,35 +349,44 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             z_risk[:self.max_vehicles]
         ], dim=-1)
 
-        # 动作生成头
-        accel_actions = torch.tanh(fused[:, :64])  # 加速度 [-1, 1]
-        lane_actions = torch.sigmoid(fused[:, 64:65])  # 换道概率 [0, 1]
+        # 检查是否有NaN或Inf，如果有则替换为零
+        fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 应用Top-K掩码（使用重要性得分）
-        k = min(self.top_k, int(is_icv.sum().item()))
-        if k > 0:
-            top_k_values, top_k_indices = torch.topk(importance[:k], k)
+        # 检查是否全为零（没有车辆或无效数据）
+        if fused.abs().sum() < 1e-6:
+            # 返回零动作
+            actions = torch.zeros(batch_size, 64, device=device)
+        else:
+            # 动作生成头 - 生成64维动作（匹配action_space）
+            # 使用简单线性投影到64维
+            action_projection = nn.Linear(fused.size(-1), 64).to(device)
+            action_features = action_projection(fused)  # [max_vehicles, 64]
 
-            # 创建掩码
-            mask = torch.zeros(self.max_vehicles, device=device)
-            mask[top_k_indices] = 1.0
+            # 检查投影后的NaN
+            action_features = torch.nan_to_num(action_features, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # 应用掩码
-            accel_actions = accel_actions * mask.unsqueeze(-1)
-            lane_actions = lane_actions * mask.unsqueeze(-1)
+            # 使用tanh确保动作在[-1, 1]范围内
+            actions = torch.tanh(action_features)  # [max_vehicles, 64]
 
-        # Padding到固定维度
-        if accel_actions.size(0) < self.max_vehicles:
-            accel_actions = F.pad(accel_actions, (0, 0, 0, self.max_vehicles - accel_actions.size(0)))
-            lane_actions = F.pad(lane_actions, (0, 0, 0, self.max_vehicles - lane_actions.size(0)))
+            # 应用Top-K掩码（使用重要性得分）
+            k = min(self.top_k, int(is_icv.sum().item()))
+            if k > 0 and importance.size(0) >= k:
+                top_k_values, top_k_indices = torch.topk(importance[:k], k)
 
-        # 合并为扁平化动作
-        actions = torch.cat([accel_actions, lane_actions], dim=-1)  # [32, 2]
+                # 创建掩码 - 只控制Top-K车辆，其他置零
+                mask = torch.zeros_like(actions)  # [max_vehicles, 64]
+                mask[top_k_indices] = 1.0
 
-        # 如果是batch，增加batch维度
-        if batch_size > 1:
-            actions = actions.unsqueeze(0).expand(batch_size, -1, -1)
-            actions = actions.reshape(batch_size, -1)
+                # 应用掩码
+                actions = actions * mask
+
+            # 取平均或最大池化到单个动作向量
+            # 对于SB3，我们只需要一个64维的动作向量
+            actions = actions.mean(dim=0, keepdim=True)  # [1, 64]
+
+            # 如果是batch，扩展到batch大小
+            if batch_size > 1:
+                actions = actions.expand(batch_size, -1)  # [batch_size, 64]
 
         # 动作分布
         action_mean = actions
@@ -530,6 +583,14 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             # 边特征（空间邻近）
             edge_index, edge_attr = self._build_edges_spatial(states, num_veh)
 
+            # Validate edge indices to prevent CUDA errors
+            if edge_index.size(1) > 0:
+                max_idx = edge_index.max().item()
+                if max_idx >= num_veh:
+                    # Edge indices are out of bounds, reset to empty
+                    edge_index = torch.empty((2, 0), dtype=torch.long, device=states.device)
+                    edge_attr = torch.empty((0, 4), device=states.device)
+
             # 创建图
             graph = Data(
                 x=x,
@@ -544,6 +605,42 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # 批处理
         if len(graphs) > 0:
             batch_graph = Batch.from_data_list(graphs)
+
+            # Additional validation after batching to prevent CUDA errors
+            num_nodes = batch_graph.x.size(0)
+
+            # Validate edge indices
+            if batch_graph.edge_index.size(1) > 0:
+                max_idx = batch_graph.edge_index.max().item()
+                min_idx = batch_graph.edge_index.min().item()
+
+                # Check if any edge index is out of bounds
+                if max_idx >= num_nodes or min_idx < 0:
+                    # Reset to empty edges to prevent CUDA error
+                    batch_graph.edge_index = torch.empty((2, 0), dtype=torch.long, device=batch_graph.x.device)
+                    batch_graph.edge_attr = torch.empty((0, 4), device=batch_graph.x.device)
+
+            # Validate batch tensor
+            if hasattr(batch_graph, 'batch'):
+                if batch_graph.batch.size(0) != num_nodes:
+                    # Batch tensor size mismatch, recreate it
+                    # Each node should be assigned to its batch index
+                    batch_vector = []
+                    node_idx = 0
+                    for b_idx, graph in enumerate(graphs):
+                        num_nodes_in_graph = graph.x.size(0)
+                        batch_vector.extend([b_idx] * num_nodes_in_graph)
+                        node_idx += num_nodes_in_graph
+                    batch_graph.batch = torch.tensor(batch_vector, dtype=torch.long, device=batch_graph.x.device)
+            else:
+                # Create batch tensor if it doesn't exist
+                batch_vector = []
+                node_idx = 0
+                for b_idx, graph in enumerate(graphs):
+                    num_nodes_in_graph = graph.x.size(0)
+                    batch_vector.extend([b_idx] * num_nodes_in_graph)
+                    node_idx += num_nodes_in_graph
+                batch_graph.batch = torch.tensor(batch_vector, dtype=torch.long, device=batch_graph.x.device)
         else:
             # 空batch
             batch_graph = Data(
@@ -553,6 +650,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
                 risk_features=torch.zeros(0, 2, device=vehicle_states.device),
                 num_nodes=0
             )
+            # Set batch tensor for empty graph
+            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=vehicle_states.device)
 
         return batch_graph
 

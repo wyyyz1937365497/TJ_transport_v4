@@ -244,7 +244,7 @@ def collect_data_parallel(
     start_time = time.time()
 
     print(f"\n{'='*70}")
-    print(f"🚀 开始并行数据收集 (Stable-Baselines3 VecEnv)")
+    print(f"[INFO] 开始并行数据收集 (Stable-Baselines3 VecEnv)")
     print(f"{'='*70}")
     print(f"   - Episodes: {num_episodes}")
     print(f"   - 并行环境: {num_envs}")
@@ -279,7 +279,7 @@ def collect_data_parallel(
             # 检查是否episode结束
             if done:
                 episode_count += 1
-                print(f"   ✅ Episode {episode_count}/{num_episodes} 完成 (env {env_idx})")
+                print(f"   [OK] Episode {episode_count}/{num_episodes} 完成 (env {env_idx})")
 
                 # 清理该环境的轨迹记录
                 if env_idx in all_trajectories:
@@ -310,7 +310,7 @@ def collect_data_parallel(
         }, f)
 
     print(f"\n{'='*70}")
-    print(f"✅ 数据收集完成！")
+    print(f"[OK] 数据收集完成！")
     print(f"   - Episodes: {episode_count}")
     print(f"   - 耗时: {time.time() - start_time:.1f}s")
     print(f"   - 数据文件: {filepath}")

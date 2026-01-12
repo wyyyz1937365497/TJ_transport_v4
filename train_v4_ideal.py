@@ -131,8 +131,13 @@ class Phase1WorldModelTrainer:
 
         print(f"[OK] Collected {len(data['observations'])} samples")
         if len(data['observations']) > 0:
-            print(f"    Observation shape: {data['observations'][0].vehicle_states.shape if hasattr(data['observations'][0], 'vehicle_states') else 'N/A'}")
-            print(f"    Next observation shape: {data['next_observations'][0].vehicle_states.shape if hasattr(data['next_observations'][0], 'vehicle_states') else 'N/A'}")
+            obs = data['observations'][0]
+            if hasattr(obs, 'vehicle_states'):
+                if isinstance(obs.vehicle_states, list):
+                    print(f"    Observation: {len(obs.vehicle_states)} vehicles")
+                else:
+                    print(f"    Observation shape: {obs.vehicle_states.shape}")
+            print(f"    Num vehicles: {obs.num_vehicles if hasattr(obs, 'num_vehicles') else 'N/A'}")
 
         # 3. 训练循环
         optimizer = torch.optim.Adam(
@@ -474,9 +479,9 @@ class Phase1WorldModelTrainer:
             risk_features = self._compute_risk_features(obs_trans)
             all_risk_features.append(risk_features)
 
-            # 4. 目标值
-            next_speed = self._extract_next_speed(next_trans)
-            next_position = self._extract_next_position(next_trans)
+            # 4. 目标值（使用obs的num_vehicles确保维度一致）
+            next_speed = self._extract_next_speed(next_trans, num_vehicles=num_veh)
+            next_position = self._extract_next_position(next_trans, num_vehicles=num_veh)
             conflict_label = self._compute_conflict_label(obs_trans, next_trans)
 
             all_next_speeds.append(next_speed)
@@ -631,27 +636,41 @@ class Phase1WorldModelTrainer:
 
     def _extract_next_speed(
         self,
-        trans: TrafficTransition
+        trans: TrafficTransition,
+        num_vehicles: Optional[int] = None
     ) -> torch.Tensor:
         """提取下一步的速度 [N, 1]"""
-        speeds = trans.speeds.copy()
+        # Use specified num_vehicles to match obs size, or use trans.num_vehicles
+        target_num = num_vehicles if num_vehicles is not None else trans.num_vehicles
+        actual_num = min(target_num, len(trans.speeds))  # Available vehicles in next_trans
+
+        speeds = trans.speeds[:actual_num].copy()
         speeds = np.maximum(speeds, 0.0)  # 确保非负
 
         # 归一化
         speeds_normalized = (speeds / 30.0).astype(np.float32)
 
+        # Pad to target_num if needed
+        if actual_num < target_num:
+            padded = np.zeros((target_num, 1), dtype=np.float32)
+            padded[:actual_num, 0] = speeds_normalized
+            return torch.from_numpy(padded)
+
         return torch.from_numpy(speeds_normalized).unsqueeze(-1)
 
     def _extract_next_position(
         self,
-        trans: TrafficTransition
+        trans: TrafficTransition,
+        num_vehicles: Optional[int] = None
     ) -> torch.Tensor:
         """提取下一步的位置 [N, 2]"""
-        num_veh = trans.num_vehicles
+        # Use specified num_vehicles to match obs size, or use trans.num_vehicles
+        target_num = num_vehicles if num_vehicles is not None else trans.num_vehicles
+        actual_num = min(target_num, trans.num_vehicles)  # Available vehicles in next_trans
 
-        positions = np.zeros((num_veh, 2), dtype=np.float32)
-        positions[:, 0] = trans.s_coords / 1000.0  # s
-        positions[:, 1] = trans.d_coords / 10.0     # d
+        positions = np.zeros((target_num, 2), dtype=np.float32)
+        positions[:actual_num, 0] = trans.s_coords[:actual_num] / 1000.0  # s
+        positions[:actual_num, 1] = trans.d_coords[:actual_num] / 10.0     # d
 
         return torch.from_numpy(positions)
 
@@ -670,11 +689,20 @@ class Phase1WorldModelTrainer:
         if num_veh == 0:
             return torch.zeros((0, 1), dtype=torch.float32)
 
+        # Use min to ensure we don't exceed available data in next_trans
+        n = min(num_veh, len(next_trans.accels), len(obs_trans.accels))
+
         # 计算加速度变化
-        accel_change = next_trans.accels[:num_veh] - obs_trans.accels[:num_veh]
+        accel_change = next_trans.accels[:n] - obs_trans.accels[:n]
 
         # 急刹检测：加速度变化 < -2.0 m/s²
         conflict_label = (accel_change < -2.0).astype(np.float32)
+
+        # Pad with zeros if needed to match num_veh
+        if n < num_veh:
+            padded = np.zeros((num_veh, 1), dtype=np.float32)
+            padded[:n, 0] = conflict_label
+            return torch.from_numpy(padded)
 
         return torch.from_numpy(conflict_label).unsqueeze(-1)
 

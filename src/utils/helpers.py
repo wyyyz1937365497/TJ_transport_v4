@@ -72,7 +72,7 @@ def save_config(
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ 配置已保存: {filepath}")
+    print(f"[OK] Configuration saved: {filepath}")
 
 
 def load_config(filepath: str) -> Dict[str, Any]:
@@ -136,10 +136,10 @@ def get_device(
     """
     if prefer_cuda and torch.cuda.is_available():
         device = torch.device(f'cuda:{cuda_id}')
-        print(f"✅ 使用CUDA: {torch.cuda.get_device_name(cuda_id)}")
+        print(f"[OK] Using CUDA: {torch.cuda.get_device_name(cuda_id)}")
     else:
         device = torch.device('cpu')
-        print(f"✅ 使用CPU")
+        print(f"[OK] Using CPU")
 
     return device
 
@@ -309,7 +309,7 @@ def load_checkpoint(
     epoch = checkpoint.get('epoch', -1)
     loss = checkpoint.get('loss', None)
 
-    print(f"✅ 检查点已加载: {checkpoint_path}")
+    print(f"[OK] Checkpoint loaded: {checkpoint_path}")
     print(f"   - Epoch: {epoch}")
     if loss is not None:
         print(f"   - Loss: {loss:.6f}")
@@ -352,4 +352,4 @@ def save_checkpoint(
     checkpoint.update(kwargs)
 
     torch.save(checkpoint, filepath)
-    print(f"✅ 检查点已保存: {filepath}")
+    print(f"[OK] Checkpoint saved: {filepath}")
