@@ -1,0 +1,862 @@
+"""
+理想架构 v4.0 - 基于约束的分层多智能体世界模型
+
+核心设计理念：
+1. 感知层：风险敏感异构 GNN (Risk-Sensitive Hetero-GNN)
+2. 预测层：潜在状态空间模型 (RSSM) + 多尺度解耦
+3. 决策层：影响力驱动 + 动态权重约束 + 稀疏控制
+4. 约束层：双模态安全屏障
+
+对应赛题三大挑战：
+- 挑战一（结构化表征）: 风险敏感异构图
+- 挑战二（前瞻性预测）: 多尺度世界模型
+- 挑战三（协同决策）: Top-K影响力 + 成本约束
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Any, Tuple, Optional
+import numpy as np
+
+
+# =============================================================================
+# 第一层：风险敏感异构GNN (感知层)
+# =============================================================================
+
+class RiskSensitiveGNN(nn.Module):
+    """
+    风险敏感异构图神经网络
+
+    核心创新：
+    1. 节点特征融入TTC（碰撞时间）和THW（车头时距）
+    2. Biased Attention：高风险边强制高权重
+    3. 层次化聚合：局部 -> 区域 -> 全局
+    """
+
+    def __init__(
+        self,
+        node_dim: int = 9,
+        edge_dim: int = 4,
+        hidden_dim: int = 64,
+        output_dim: int = 256,
+        num_layers: int = 3,
+        num_heads: int = 4,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+
+        # 节点特征编码器
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 边特征编码器
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 多层GNN（使用PyTorch Geometric）
+        try:
+            from torch_geometric.nn import GATConv
+            self.gnn_layers = nn.ModuleList([
+                GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
+                        edge_dim=hidden_dim, dropout=dropout, concat=True)
+                for _ in range(num_layers)
+            ])
+            self.use_pyg = True
+        except ImportError:
+            # Fallback: 手动实现注意力GNN
+            print("[WARNING] PyTorch Geometric not installed, using simplified GNN")
+            self.gnn_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout)
+                )
+                for _ in range(num_layers)
+            ])
+            self.use_pyg = False
+
+        # 风险感知注意力偏置
+        self.risk_bias = nn.Sequential(
+            nn.Linear(2, hidden_dim),  # TTC, THW -> 偏置
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+        # 层次化池化
+        self.local_pool = nn.Linear(hidden_dim * (num_heads if self.use_pyg else 1), hidden_dim)
+        self.global_pool = nn.Linear(hidden_dim, output_dim)
+
+        # 关键性评分头（用于Top-K选择）
+        self.importance_scorer = nn.Sequential(
+            nn.Linear(output_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        node_features: torch.Tensor,  # [N, node_dim]
+        edge_index: torch.Tensor,      # [2, E]
+        edge_features: torch.Tensor,   # [E, edge_dim]
+        risk_features: torch.Tensor,   # [N, 2] - TTC倒数, THW倒数
+        batch: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+
+        Returns:
+            node_embeddings: [N, output_dim] 节点嵌入
+            importance_scores: [N, 1] 节点重要性
+            global_embedding: [B, output_dim] 全局嵌入（如果提供batch）
+        """
+        # 1. 编码节点和边特征
+        h = self.node_encoder(node_features)  # [N, hidden_dim]
+        e = self.edge_encoder(edge_features)   # [E, hidden_dim]
+
+        # 2. 提取风险偏置
+        risk_bias = self.risk_bias(risk_features)  # [N, 1]
+
+        # 3. GNN层传播
+        if self.use_pyg:
+            for gnn_layer in self.gnn_layers:
+                # PyG版本
+                h = gnn_layer(h, edge_index, e)
+                h = F.relu(h)
+        else:
+            # 简化版本
+            for layer in self.gnn_layers:
+                # 聚合邻居特征
+                row, col = edge_index
+                neighbor_features = h[col]  # [E, hidden_dim]
+
+                # 拼接当前节点和邻居
+                combined = torch.cat([h[row], neighbor_features], dim=-1)
+                h_new = layer(combined)
+
+                # 更新
+                h = h_new + h  # 残差连接
+
+        # 4. 应用风险偏置
+        h = h + risk_bias  # 广播风险偏置
+
+        # 5. 计算节点嵌入
+        if self.use_pyg:
+            h_pooled = self.local_pool(h)
+        else:
+            h_pooled = h
+
+        node_embeddings = self.global_pool(h_pooled)
+
+        # 6. 计算重要性得分
+        importance_scores = self.importance_scorer(node_embeddings)
+
+        # 7. 全局池化（如果提供了batch）
+        if batch is not None:
+            from torch_geometric.nn import global_mean_pool
+            global_embedding = global_mean_pool(node_embeddings, batch)
+        else:
+            global_embedding = node_embeddings.mean(dim=0, keepdim=True)
+
+        return {
+            'node_embeddings': node_embeddings,
+            'importance_scores': importance_scores,
+            'global_embedding': global_embedding,
+            'risk_features': risk_features
+        }
+
+
+# =============================================================================
+# 第二层：多尺度RSSM世界模型 (预测层)
+# =============================================================================
+
+class MultiScaleRSSM(nn.Module):
+    """
+    多尺度潜在状态空间模型
+
+    核心创新：
+    1. 强制解耦 z = [z_flow, z_risk]
+    2. z_flow: 流演化预测（速度、密度）
+    3. z_risk: 风险演化预测（冲突概率）
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,    # GNN输出
+        hidden_dim: int = 128,    # LSTM隐藏维度
+        latent_dim: int = 64,     # 潜在状态维度
+        future_steps: int = 5,    # 预测未来步数
+        num_layers: int = 2,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.future_steps = future_steps
+        self.num_layers = num_layers
+
+        # 共享编码器
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # LSTM核心
+        self.lstm = nn.LSTM(
+            hidden_dim,
+            hidden_dim,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        # 解耦预测头
+        self.flow_predictor = nn.Sequential(  # z_flow: 流演化
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+
+        self.risk_predictor = nn.Sequential(  # z_risk: 风险演化
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+
+        # 速度预测器（用于监督学习）
+        self.speed_predictor = nn.Linear(hidden_dim, 1)
+
+        # 位置预测器（用于监督学习）
+        self.position_predictor = nn.Linear(hidden_dim, 2)
+
+        # 冲突预测器（用于风险监督）
+        self.conflict_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        node_embeddings: torch.Tensor,  # [B, N, input_dim] 或 [N, input_dim]
+        hidden_state: Optional[Tuple] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+
+        Returns:
+            z_flow: [B*N, latent_dim] 流演化特征
+            z_risk: [B*N, latent_dim] 风险演化特征
+            next_states: 预测的下一状态
+            conflict_probs: 冲突概率
+            new_hidden: LSTM隐藏状态
+        """
+        # 确保输入是3D
+        if node_embeddings.dim() == 2:
+            node_embeddings = node_embeddings.unsqueeze(0)  # [1, N, D]
+
+        batch_size, num_nodes, _ = node_embeddings.shape
+
+        # 编码
+        h = self.encoder(node_embeddings)  # [B, N, hidden_dim]
+
+        # LSTM处理（展平为序列）
+        h_flat = h.view(batch_size, num_nodes, -1)
+        h_flat = h_flat.permute(1, 0, 2)  # [N, B, hidden_dim]
+
+        lstm_out, new_hidden = self.lstm(h_flat, hidden_state)
+
+        # 恢复形状
+        lstm_out = lstm_out.permute(1, 0, 2)  # [B, N, hidden_dim]
+        lstm_out = lstm_out.reshape(batch_size * num_nodes, -1)
+
+        # 解耦预测
+        z_flow = self.flow_predictor(lstm_out)    # 流演化
+        z_risk = self.risk_predictor(lstm_out)    # 风险演化
+
+        # 附加预测头
+        speed_pred = self.speed_predictor(lstm_out)
+        pos_pred = self.position_predictor(lstm_out)
+        conflict_prob = self.conflict_predictor(lstm_out)
+
+        return {
+            'z_flow': z_flow,
+            'z_risk': z_risk,
+            'speed_pred': speed_pred,
+            'position_pred': pos_pred,
+            'conflict_prob': conflict_prob,
+            'hidden_state': new_hidden
+        }
+
+
+# =============================================================================
+# 第三层：动态权重门控网络 (决策层辅助)
+# =============================================================================
+
+class DynamicWeightGating(nn.Module):
+    """
+    动态权重门控网络
+
+    根据当前交通状态动态调整效率、稳定性、成本的权重
+
+    输入：全局交通状态
+    输出：w_eff, w_stab, w_cost (Softmax归一化)
+    """
+
+    def __init__(
+        self,
+        state_dim: int = 64,  # 全局状态维度
+        hidden_dim: int = 32
+    ):
+        super().__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 3)  # 3个权重
+        )
+
+    def forward(self, global_state: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+
+        Args:
+            global_state: [B, state_dim] 全局交通状态
+
+        Returns:
+            weights: [B, 3] Softmax归一化的权重 [w_eff, w_stab, w_cost]
+        """
+        logits = self.mlp(global_state)
+        weights = F.softmax(logits, dim=-1)
+
+        return {
+            'w_eff': weights[..., 0:1],
+            'w_stab': weights[..., 1:2],
+            'w_cost': weights[..., 2:3],
+            'all_weights': weights
+        }
+
+
+# =============================================================================
+# 第三层：影响力驱动Top-K控制器 (决策层核心)
+# =============================================================================
+
+class InfluenceBasedController(nn.Module):
+    """
+    基于影响力的Top-K控制器
+
+    核心设计：
+    1. 影响力评分 = α·Importance(GNN) + β·Impact(Predicted)
+    2. Top-K选择：只控制K辆关键车
+    3. 动作生成：加速度 + 换道概率
+    """
+
+    def __init__(
+        self,
+        gnn_dim: int = 256,
+        flow_dim: int = 64,
+        risk_dim: int = 64,
+        global_dim: int = 32,
+        hidden_dim: int = 128,
+        action_dim: int = 2,
+        top_k: int = 5,
+        dropout: float = 0.2
+    ):
+        super().__init__()
+
+        self.gnn_dim = gnn_dim
+        self.flow_dim = flow_dim
+        self.risk_dim = risk_dim
+        self.global_dim = global_dim
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+        self.top_k = top_k
+
+        # 全局上下文编码器
+        self.global_encoder = nn.Sequential(
+            nn.Linear(global_dim, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.LayerNorm(32)
+        )
+
+        # 特征融合层
+        fusion_input = gnn_dim + flow_dim + risk_dim + 32
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(fusion_input, 384),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(384),
+            nn.Linear(384, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim)
+        )
+
+        # 影响力评分网络（改进版）
+        self.influence_scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()  # 归一化到[0,1]
+        )
+
+        # 价值网络（三头：Q, Cost, Advantage）
+        self.value_network = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+        self.cost_value_network = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+        self.advantage_network = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+        # 动作生成网络
+        self.action_generator = nn.ModuleDict({
+            'acceleration': nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout * 0.5),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Tanh()  # [-1,1] -> 映射到[-3,2] m/s²
+            ),
+            'lane_change': nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout * 0.5),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()  # [0,1] -> 换道概率
+            )
+        })
+
+    def forward(
+        self,
+        gnn_embedding: torch.Tensor,
+        z_flow: torch.Tensor,
+        z_risk: torch.Tensor,
+        global_metrics: torch.Tensor,
+        vehicle_ids: List[str],
+        is_icv: torch.Tensor,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        deterministic: bool = False
+    ) -> Dict[str, Any]:
+        """
+        前向传播（带Top-K选择）
+
+        Returns:
+            selected_vehicle_ids: 选中的K辆车
+            raw_actions: 对应的动作
+            influence_scores: 影响力得分
+            ...
+        """
+        device = gnn_embedding.device
+        batch_size = gnn_embedding.size(0)
+
+        # 1. 编码全局上下文
+        global_context = self.global_encoder(global_metrics)  # [B, 32]
+
+        # 2. 扩展全局特征到每个车辆
+        if batch_size > 1:
+            global_context = global_context.expand(-1, gnn_embedding.size(1), -1)
+            global_context = global_context.reshape(-1, 32)
+        else:
+            global_context = global_context.squeeze(0)
+
+        # 3. 特征融合
+        fused = torch.cat([
+            gnn_embedding.reshape(-1, self.gnn_dim),
+            z_flow.reshape(-1, self.flow_dim),
+            z_risk.reshape(-1, self.risk_dim),
+            global_context
+        ], dim=-1)
+
+        fused_features = self.fusion_layer(fused)  # [N, hidden_dim]
+
+        # 4. 过滤ICV车辆
+        icv_mask = is_icv.bool()
+        icv_indices = torch.where(icv_mask)[0]
+
+        if len(icv_indices) == 0:
+            return {
+                'selected_vehicle_ids': [],
+                'raw_actions': torch.zeros(0, self.action_dim, device=device),
+                'influence_scores': torch.zeros(0, device=device),
+                'value_estimates': torch.zeros(0, device=device),
+                'cost_estimates': torch.zeros(0, device=device),
+                'advantage_estimates': torch.zeros(0, device=device)
+            }
+
+        # 5. 计算影响力得分
+        icv_features = fused_features[icv_mask]
+        influence_scores = self.influence_scorer(icv_features).squeeze(-1)
+
+        # 6. Top-K选择
+        k = min(self.top_k, len(icv_indices))
+        top_k_scores, top_k_local_indices = torch.topk(
+            influence_scores, k, largest=True, sorted=True
+        )
+
+        selected_indices = icv_indices[top_k_local_indices]
+        selected_vehicle_ids = [vehicle_ids[i] for i in selected_indices.cpu().numpy()]
+
+        # 7. 为选中的车辆生成动作
+        selected_features = fused_features[selected_indices]
+
+        accel_actions = self.action_generator['acceleration'](selected_features)
+        lane_actions = self.action_generator['lane_change'](selected_features)
+
+        raw_actions = torch.cat([accel_actions, lane_actions], dim=-1)
+
+        # 8. 价值估计
+        value_estimates = self.value_network(fused_features).squeeze(-1)
+        cost_estimates = self.cost_value_network(fused_features).squeeze(-1)
+        advantage_estimates = self.advantage_network(fused_features).squeeze(-1)
+
+        return {
+            'selected_vehicle_ids': selected_vehicle_ids,
+            'selected_indices': selected_indices.cpu().numpy().tolist(),
+            'raw_actions': raw_actions,
+            'influence_scores': influence_scores,
+            'top_k_scores': top_k_scores,
+            'value_estimates': value_estimates,
+            'cost_estimates': cost_estimates,
+            'advantage_estimates': advantage_estimates
+        }
+
+
+# =============================================================================
+# 第四层：双模态安全屏障 (约束层)
+# =============================================================================
+
+class SafetyBarrier(nn.Module):
+    """
+    双模态安全屏障
+
+    Level 1: 规则卫士 - 简单约束检查
+    Level 2: 紧急避险 - TTC<2s 强制制动
+    """
+
+    def __init__(
+        self,
+        max_accel: float = 2.0,
+        max_decel: float = -3.0,
+        emergency_decel: float = -5.0,
+        safe_ttc_threshold: float = 2.0,  # 秒
+        min_speed: float = 0.0
+    ):
+        super().__init__()
+
+        self.max_accel = max_accel
+        self.max_decel = max_decel
+        self.emergency_decel = emergency_decel
+        self.safe_ttc_threshold = safe_ttc_threshold
+        self.min_speed = min_speed
+
+    def forward(
+        self,
+        actions: torch.Tensor,  # [N, 2] - [accel, lane_change]
+        vehicle_states: List[Dict[str, Any]],
+        ttc_values: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        应用安全屏障
+
+        Returns:
+            safe_actions: [N, 2] 修正后的动作
+            barrier_info: 安全屏障触发信息
+        """
+        safe_actions = actions.clone()
+        barrier_triggered = {
+            'level1_count': 0,
+            'level2_count': 0,
+            'emergency_vehicles': []
+        }
+
+        for i, (action, state) in enumerate(zip(actions, vehicle_states)):
+            # Level 1: 基本约束检查
+            accel = action[0].item()
+
+            # 限制加速度范围
+            if accel > self.max_accel:
+                safe_actions[i, 0] = self.max_accel
+                barrier_triggered['level1_count'] += 1
+            elif accel < self.max_decel:
+                safe_actions[i, 0] = self.max_decel
+                barrier_triggered['level1_count'] += 1
+
+            # 确保速度不会变为负数
+            current_speed = state.get('speed', 0.0)
+            predicted_speed = current_speed + accel * 0.1  # 0.1秒步长
+            if predicted_speed < self.min_speed:
+                safe_actions[i, 0] = max(self.max_decel, -current_speed / 0.1)
+
+            # Level 2: TTC紧急检查
+            if ttc_values is not None and ttc_values[i] < self.safe_ttc_threshold:
+                # 强制制动
+                safe_actions[i, 0] = self.emergency_decel
+                barrier_triggered['level2_count'] += 1
+                barrier_triggered['emergency_vehicles'].append(i)
+
+        return safe_actions, barrier_triggered
+
+
+# =============================================================================
+# 完整的v4.0架构
+# =============================================================================
+
+class IdealTrafficControllerV4(nn.Module):
+    """
+    理想交通控制器 v4.0
+
+    完整架构：
+    1. Risk-Sensitive GNN (感知)
+    2. Multi-Scale RSSM (预测)
+    3. Dynamic Weight Gating (元控制)
+    4. Influence-Based Controller (决策)
+    5. Safety Barrier (约束)
+    """
+
+    def __init__(
+        self,
+        node_dim: int = 9,
+        edge_dim: int = 4,
+        global_dim: int = 32,
+        gnn_hidden_dim: int = 64,
+        gnn_output_dim: int = 256,
+        rssm_hidden_dim: int = 128,
+        rssm_latent_dim: int = 64,
+        controller_hidden_dim: int = 128,
+        top_k: int = 5,
+        dropout: float = 0.2,
+        device: str = 'cuda'
+    ):
+        super().__init__()
+
+        self.device = torch.device(device)
+        self.top_k = top_k
+
+        # 1. 感知层：风险敏感GNN
+        self.perception_layer = RiskSensitiveGNN(
+            node_dim=node_dim,
+            edge_dim=edge_dim,
+            hidden_dim=gnn_hidden_dim,
+            output_dim=gnn_output_dim,
+            dropout=dropout
+        )
+
+        # 2. 预测层：多尺度RSSM
+        self.prediction_layer = MultiScaleRSSM(
+            input_dim=gnn_output_dim,
+            hidden_dim=rssm_hidden_dim,
+            latent_dim=rssm_latent_dim,
+            dropout=dropout
+        )
+
+        # 3. 决策层：影响力控制器
+        self.decision_layer = InfluenceBasedController(
+            gnn_dim=gnn_output_dim,
+            flow_dim=rssm_latent_dim,
+            risk_dim=rssm_latent_dim,
+            global_dim=global_dim,
+            hidden_dim=controller_hidden_dim,
+            top_k=top_k,
+            dropout=dropout
+        )
+
+        # 4. 动态权重门控
+        self.weight_gating = DynamicWeightGating(
+            state_dim=gnn_output_dim
+        )
+
+        # 5. 安全屏障
+        self.safety_barrier = SafetyBarrier()
+
+        # 初始化隐藏状态
+        self.register_buffer('rssm_hidden', None)
+
+    def forward(
+        self,
+        observation: Dict[str, Any],
+        deterministic: bool = False,
+        alpha: float = 0.6,
+        beta: float = 0.4
+    ) -> Dict[str, Any]:
+        """
+        完整前向传播
+
+        Returns:
+            包含所有中间结果和最终动作的字典
+        """
+        # 1. 感知层：风险敏感GNN
+        gnn_output = self.perception_layer(
+            node_features=observation['node_features'],
+            edge_index=observation['edge_index'],
+            edge_features=observation['edge_features'],
+            risk_features=observation['risk_features'],
+            batch=observation.get('batch')
+        )
+
+        node_embeddings = gnn_output['node_embeddings']
+        importance_scores = gnn_output['importance_scores']
+        global_embedding = gnn_output['global_embedding']
+
+        # 2. 预测层：多尺度RSSM
+        rssm_output = self.prediction_layer(
+            node_embeddings=node_embeddings,
+            hidden_state=None  # 或传入之前的隐藏状态
+        )
+
+        z_flow = rssm_output['z_flow']
+        z_risk = rssm_output['z_risk']
+
+        # 3. 动态权重门控
+        weight_output = self.weight_gating(global_embedding)
+        dynamic_weights = weight_output['all_weights']
+
+        # 4. 决策层：Top-K控制器
+        decision_output = self.decision_layer(
+            gnn_embedding=node_embeddings,
+            z_flow=z_flow,
+            z_risk=z_risk,
+            global_metrics=observation['global_metrics'],
+            vehicle_ids=observation['vehicle_ids'],
+            is_icv=observation['is_icv'],
+            alpha=alpha,
+            beta=beta,
+            deterministic=deterministic
+        )
+
+        # 5. 安全屏障（如果有车辆状态）
+        safe_actions = decision_output['raw_actions']
+        barrier_info = {}
+
+        if 'vehicle_states' in observation:
+            safe_actions, barrier_info = self.safety_barrier(
+                actions=decision_output['raw_actions'],
+                vehicle_states=observation['vehicle_states'],
+                ttc_values=observation.get('ttc_values')
+            )
+
+        return {
+            # 最终输出
+            'selected_vehicle_ids': decision_output['selected_vehicle_ids'],
+            'safe_actions': safe_actions,
+            'influence_scores': decision_output['influence_scores'],
+
+            # 中间结果（用于分析）
+            'gnn_output': gnn_output,
+            'rssm_output': rssm_output,
+            'dynamic_weights': dynamic_weights,
+            'decision_output': decision_output,
+            'barrier_info': barrier_info
+        }
+
+    def compute_loss(
+        self,
+        batch: Dict[str, Any],
+        targets: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        计算多任务损失
+
+        损失组成：
+        1. 预测损失：轨迹预测 + 风险预测
+        2. 价值损失：Q值 + 成本值
+        3. 影响力损失：鼓励稀疏选择
+        """
+        # 前向传播
+        output = self.forward(batch, deterministic=False)
+
+        losses = {}
+
+        # 1. 预测损失
+        speed_pred = output['rssm_output']['speed_pred']
+        speed_target = targets.get('speed_target')
+        if speed_target is not None:
+            losses['speed_mse'] = F.mse_loss(speed_pred, speed_target)
+
+        # 2. 风险预测损失
+        conflict_prob = output['rssm_output']['conflict_prob']
+        conflict_target = targets.get('conflict_target')
+        if conflict_target is not None:
+            losses['conflict_bce'] = F.binary_cross_entropy(
+                conflict_prob.squeeze(-1),
+                conflict_target.float()
+            )
+
+        # 3. 价值损失（如果提供）
+        value_estimates = output['decision_output']['value_estimates']
+        value_target = targets.get('value_target')
+        if value_target is not None:
+            losses['value_loss'] = F.mse_loss(
+                value_estimates,
+                value_target
+            )
+
+        # 4. 成本价值损失
+        cost_estimates = output['decision_output']['cost_estimates']
+        cost_target = targets.get('cost_target')
+        if cost_target is not None:
+            losses['cost_value_loss'] = F.mse_loss(
+                cost_estimates,
+                cost_target
+            )
+
+        # 5. 稀疏性损失（鼓励只选择少数车辆）
+        influence_scores = output['influence_scores']
+        selected_count = len(output['selected_vehicle_ids'])
+        total_count = len(batch['vehicle_ids'])
+        sparsity_loss = (selected_count / max(total_count, 1)) - 0.15  # 目标15%
+        losses['sparsity'] = torch.tensor(sparsity_loss, device=self.device)
+
+        return losses
