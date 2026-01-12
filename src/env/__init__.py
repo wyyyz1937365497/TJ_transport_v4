@@ -3,13 +3,15 @@ SUMO环境模块
 """
 
 from .sumo_env import SumoEnvironment
-try:
-    from .data_collector import EfficientDataCollector, TrajectoryDataset
-    _data_collector_available = True
-except ImportError:
-    _data_collector_available = False
+from .competition_env import CompetitionSumoEnv
+from .gym_wrapper import GymSumoEnv, make_gym_env
+from .vec_env import create_parallel_envs, ParallelEnvWrapper
 
-__all__ = ['SumoEnvironment']
-
-if _data_collector_available:
-    __all__.extend(['EfficientDataCollector', 'TrajectoryDataset'])
+__all__ = [
+    'SumoEnvironment',
+    'CompetitionSumoEnv',
+    'GymSumoEnv',
+    'make_gym_env',
+    'create_parallel_envs',
+    'ParallelEnvWrapper',
+]
