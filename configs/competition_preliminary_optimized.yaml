@@ -104,7 +104,7 @@ training:
     use_mixed_precision: true
     gradient_clip: 1.0
     warmup_epochs: 5
-    phase1_model_path: "checkpoints/competition/world_model_phase1.pth"
+    phase1_model_path: "checkpoints/competition/v4_phase1/world_model_final.pth"
 
   # ⚡ Phase 2性能优化
   phase2:
@@ -120,7 +120,7 @@ training:
     update_epochs: 10
     batch_size: 512    # ⚡ 从256增加到512 - 更大的batch
     n_steps: 2048      # ⚡ 从4096减少到2048 - 更频繁更新
-    phase2_model_path: "checkpoints/competition/ppo_phase2.pth"
+    phase2_model_path: "checkpoints/competition/v4_phase2/shielded_ppo.zip"
 
   phase3:
     enabled: true

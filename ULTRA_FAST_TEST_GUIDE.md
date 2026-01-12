@@ -16,16 +16,16 @@ python train_v4_ideal.py --config configs/competition_ultra_fast_test.yaml --pha
 | 阶段 | 原始步数 | 优化步数 | 说明 |
 |------|---------|---------|------|
 | Phase 1 | 50 episodes × 30 epochs | **3 episodes × 3 epochs** | 快速数据收集 |
-| Phase 2 | 200,000 步 | **1,000 步** | 最少验证训练 |
-| Phase 3 | 100,000 步 | **500 步** | 快速微调 |
-| Phase 4 | 100,000 步 | **500 步** | 快速约束优化 |
+| Phase 2 | 200,000 步 | **496 步** | 最少验证训练（16×31=496，1个rollout） |
+| Phase 3 | 100,000 步 | **248 步** | 快速微调（4×62=248，1个rollout） |
+| Phase 4 | 100,000 步 | **248 步** | 快速约束优化（由Phase 3执行） |
 
 ### 2️⃣ 增大batch_size（提升GPU利用率）
 
 | 参数 | 原始值 | 优化值 | 提升 |
 |------|--------|--------|------|
 | Phase 1 batch | 256 | **128** | 中等batch |
-| Phase 2 batch | 256 | **512** | ⚡ 2倍GPU利用 |
+| Phase 2 batch | 256 | **256** | GPU利用率优化 |
 
 ### 3️⃣ 增加并行度（加速环境）
 
@@ -33,6 +33,7 @@ python train_v4_ideal.py --config configs/competition_ultra_fast_test.yaml --pha
 |------|--------|--------|------|
 | Phase 1 workers | 8 | **8** | 保持 |
 | Phase 2 envs | 8 | **16** | ⚡ 2倍并行 |
+| Phase 2 n_steps | 4096 | **31** | ⚡ 小rollout快速更新 |
 
 ### 4️⃣ 缩短episode长度
 
@@ -98,14 +99,14 @@ python train_v4_ideal.py --config configs/competition_ultra_fast_test.yaml --pha
 
 ### 只运行Phase 3（端到端微调）
 ```bash
-# 约1-2分钟（需要Phase 2完成）
+# 约1分钟（需要Phase 2完成）
 python train_v4_ideal.py --config configs/competition_ultra_fast_test.yaml --phase 3
 ```
 
 ### 只运行Phase 4（约束优化）
 ```bash
-# 约1-2分钟（需要Phase 2完成）
-python train_v4_ideal.py --config configs/competition_ultra_fast_test.yaml --phase 4
+# 注意：Phase 4由Phase 3训练器执行
+# 运行Phase 3即可，它会自动执行约束优化
 ```
 
 ## 📂 输出文件位置
@@ -119,7 +120,8 @@ checkpoints/ultra_fast_test/
 ├── v4_phase2/
 │   ├── shielded_ppo.zip              # Phase 2输出（SB3格式）
 │   └── shielded_ppo.pth              # Phase 2输出（PyTorch格式）
-└── final_model.pth                   # 最终模型（如果运行了Phase 4）
+└── v4_phase3/
+    └── ideal_v4_final.zip            # Phase 3输出（最终模型）
 ```
 
 ## 💡 提示和技巧
@@ -165,15 +167,15 @@ python train_v4_ideal.py --config configs/competition_quick_test.yaml --phase al
 
 [PHASE 2] Shielded PPO Training
 [INFO] Using 16 parallel environments
-[DONE] Phase 2 complete! (3-4分钟)
+[INFO] Total timesteps: 496 (16 envs × 31 steps × 1 rollout)
+[DONE] Phase 2 complete! (约2分钟)
 
-[PHASE 3] End-to-End Fine-tuning
-[DONE] Phase 3 complete! (1-2分钟)
+[PHASE 3] Lagrangian Constrained Optimization
+[INFO] Using 4 parallel environments
+[INFO] Total timesteps: 248 (4 envs × 62 steps × 1 rollout)
+[DONE] Phase 3 complete! (约1分钟)
 
-[PHASE 4] Constrained Optimization
-[DONE] Phase 4 complete! (1-2分钟)
-
-[SUCCESS] Training pipeline finished! (总计5-10分钟)
+[SUCCESS] Training pipeline finished! (总计约5分钟)
 ```
 
 ## 🚨 常见问题
@@ -185,17 +187,17 @@ python train_v4_ideal.py --config configs/competition_quick_test.yaml --phase al
 - **公式**: `显示步数 = num_envs × n_steps × 更新轮数`
 - **配置示例**:
   - `num_envs: 16`
-  - `n_steps: 62`
-  - `total_timesteps: 1000`
-- **计算**: `16 × 62 = 992` 步/轮次
-- **进度条**: 显示 `992/1000` → 训练完成
+  - `n_steps: 31`
+  - `total_timesteps: 496`
+- **计算**: `16 × 31 = 496` 步/轮次
+- **进度条**: 显示 `496/496` → 训练完成
 
 **正常进度显示**:
 ```
-100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 992/1000 [ 0:00:20 < 0:00:00 , 10 it/s ]
+100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 496/496 [ 0:00:20 < 0:00:00 , 10 it/s ]
 ```
 
-如果看到 `4448/1000` 这样的显示，说明配置没有正确读取。修复后应该看到接近 `1000/1000` 的显示。
+如果看到 `1984/1000` 这样的显示，说明配置没有正确读取。修复后应该看到接近 `496/496` 的显示。
 
 ### Q: 为什么要增加num_envs和batch_size？
 

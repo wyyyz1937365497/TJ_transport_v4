@@ -107,41 +107,49 @@ training:
     use_mixed_precision: true
     gradient_clip: 1.0
     warmup_epochs: 1
-    phase1_model_path: "checkpoints/ultra_fast_test/world_model_phase1.pth"
+    phase1_model_path: "checkpoints/ultra_fast_test/v4_phase1/world_model_final.pth"
 
   # ⚡⚡ Phase 2: 高吞吐量PPO训练
   phase2:
     enabled: true
     num_envs: 16        # ⚡⚡ 大幅增加并行环境（关键！）
-    total_timesteps: 1000   # ⚡ 最少训练步数
+    total_timesteps: 496    # ⚡ 最少训练步数（16*31=496，1个rollout）
     learning_rate: 3.0e-4
     gamma: 0.99
     gae_lambda: 0.95
     clip_epsilon: 0.2
     entropy_coef: 0.01
     value_loss_coef: 0.5
-    update_epochs: 3       # 减少更新轮数
-    batch_size: 512        # ⚡⚡ 大batch提升GPU利用率
-    n_steps: 62            # ⚡ 小rollout（更快更新，16*62=992，接近1000）
+    update_epochs: 1       # 减少更新轮数
+    batch_size: 256        # 减小batch大小
+    n_steps: 31            # ⚡ 小rollout（16*31=496，确保不超过500步）
     max_grad_norm: 0.5
-    phase2_model_path: "checkpoints/ultra_fast_test/ppo_phase2.pth"
+    phase2_model_path: "checkpoints/ultra_fast_test/v4_phase2/shielded_ppo.zip"
 
   # ⚡ Phase 3: 快速端到端微调
   phase3:
     enabled: true
-    total_timesteps: 500    # ⚡ 最少步数
+    num_envs: 4            # Phase 3使用较少环境
+    total_timesteps: 248    # ⚡ 最少步数（4×62=248，1个rollout）
     learning_rate: 1.0e-5
     freeze_bn: true
-    phase3_model_path: "checkpoints/ultra_fast_test/e2e_phase3.pth"
+    n_steps: 62            # ⚡ 小rollout（4×62=248，确保不超过250步）
+    batch_size: 128        # 适中的batch size
+    update_epochs: 1       # 减少更新轮数
+    phase3_model_path: "checkpoints/ultra_fast_test/v4_phase2/ideal_v4_final.zip"
 
-  # ⚡ Phase 4: 快速约束优化
+  # ⚡ Phase 4: 快速约束优化（实际由Phase 3训练器执行）
   phase4:
     enabled: true
-    total_timesteps: 500    # ⚡ 最少步数
+    total_timesteps: 248    # ⚡ 最少步数（与Phase 3一致）
+    num_envs: 4            # 与Phase 3一致
     cost_limit: 0.1
     learning_rate: 1.0e-4
+    n_steps: 62            # 与Phase 3一致
+    batch_size: 128        # 与Phase 3一致
+    update_epochs: 1       # 与Phase 3一致
     lagrangian_multiplier_init: 0.1
-    final_model_path: "checkpoints/ultra_fast_test/final_model.pth"
+    final_model_path: "checkpoints/ultra_fast_test/v4_phase2/ideal_v4_final.zip"
 
 # =============================================================================
 # 评估配置 - 最小化

@@ -998,11 +998,18 @@ class Phase2ShieldedPPOTrainer:
         sb3_path = os.path.join(self.checkpoint_dir, 'shielded_ppo.zip')
         model.save(sb3_path)
 
+        # 保存兼容格式，过滤掉动态buffer
         compat_path = os.path.join(self.checkpoint_dir, 'shielded_ppo.pth')
+        state_dict = model.policy.state_dict()
+        # 移除不应该保存的动态buffer
+        keys_to_remove = [k for k in state_dict.keys() if 'prev_weights' in k or 'rssm_hidden' in k]
+        for key in keys_to_remove:
+            del state_dict[key]
+
         torch.save({
             'model_type': 'sb3',
             'phase': 2,
-            'policy_state_dict': model.policy.state_dict(),
+            'policy_state_dict': state_dict,
             'config': self.config
         }, compat_path)
 
@@ -1083,7 +1090,9 @@ class Phase3ConstrainedOptimizer:
 
         # 1. 创建环境
         env_config = self.config.get('environment', {})
-        num_envs = 4
+        # 从配置读取num_envs，如果没有则使用默认值4
+        phase3_config = self.config.get('training', {}).get('phase3', {})
+        num_envs = phase3_config.get('num_envs', 4)
 
         vec_env_wrapper = create_parallel_envs(
             config=env_config,
@@ -1096,12 +1105,58 @@ class Phase3ConstrainedOptimizer:
 
         # 2. 创建拉格朗日PPO
         print("\n[INFO] Creating Lagrangian PPO...")
-        model = self._create_lagrangian_ppo(vec_env)
+        model = self._create_lagrangian_ppo(vec_env, num_envs)
 
-        # 3. 加载Phase 2权重
-        print(f"\n[INFO] Loading Phase 2 weights...")
-        phase2_model = PPO.load(phase2_checkpoint)
-        model.set_parameters(phase2_model.get_parameters())
+        # 3. 加载Phase 2权重（优先加载.pth文件，因为已经清理过动态buffer）
+        # 尝试加载清理过的.pth文件
+        phase2_pth = phase2_checkpoint.replace('.zip', '.pth')
+        loaded_weights = False
+
+        if os.path.exists(phase2_pth):
+            print(f"\n[INFO] Loading Phase 2 weights from {phase2_pth}...")
+            try:
+                checkpoint = torch.load(phase2_pth, map_location=self.device)
+                if 'policy_state_dict' in checkpoint:
+                    # 过滤掉可能存在的动态buffer
+                    state_dict = checkpoint['policy_state_dict']
+                    filtered_state_dict = {k: v for k, v in state_dict.items()
+                                          if 'prev_weights' not in k and 'rssm_hidden' not in k}
+                    model.policy.load_state_dict(filtered_state_dict, strict=False)
+                    print("[OK] Phase 2 weights loaded successfully from .pth file")
+                    loaded_weights = True
+            except Exception as e:
+                print(f"[WARNING] Failed to load .pth file: {e}")
+
+        # 如果.pth加载失败，尝试加载.zip文件
+        if not loaded_weights:
+            print(f"\n[INFO] Loading Phase 2 weights from {phase2_checkpoint}...")
+            try:
+                phase2_model = PPO.load(phase2_checkpoint)
+                # 获取参数并过滤动态buffer
+                params = phase2_model.get_parameters()
+                filtered_params = {}
+                for key, value in params.items():
+                    if 'prev_weights' not in key and 'rssm_hidden' not in key:
+                        filtered_params[key] = value
+                model.set_parameters(filtered_params, exact_match=False)
+                print("[OK] Phase 2 weights loaded successfully from .zip file")
+                loaded_weights = True
+            except Exception as e:
+                print(f"[WARNING] Failed to load Phase 2 weights: {e}")
+
+        # 如果Phase 2加载失败，尝试加载Phase 1权重
+        if not loaded_weights:
+            print("[INFO] Falling back to Phase 1 weights...")
+            phase1_path = self.config.get('training', {}).get('phase1', {}).get('phase1_model_path')
+            if phase1_path and os.path.exists(phase1_path):
+                try:
+                    self._load_phase1_weights(model.policy, phase1_path)
+                    print("[OK] Loaded Phase 1 weights as fallback")
+                except Exception as e2:
+                    print(f"[WARNING] Failed to load Phase 1 weights: {e2}")
+                    print("[INFO] Starting from scratch with random initialization")
+            else:
+                print("[INFO] No Phase 1 checkpoint found, starting from scratch")
 
         # 4. 解冻所有组件
         print("\n[UNFREEZE] Unfreezing all components...")
@@ -1121,11 +1176,18 @@ class Phase3ConstrainedOptimizer:
         final_path = os.path.join(self.checkpoint_dir, 'ideal_v4_final.zip')
         model.save(final_path)
 
+        # 保存兼容格式，过滤掉动态buffer
         compat_path = os.path.join(self.checkpoint_dir, 'ideal_v4_final.pth')
+        state_dict = model.policy.state_dict()
+        # 移除不应该保存的动态buffer
+        keys_to_remove = [k for k in state_dict.keys() if 'prev_weights' in k or 'rssm_hidden' in k]
+        for key in keys_to_remove:
+            del state_dict[key]
+
         torch.save({
             'model_type': 'sb3',
             'phase': 3,
-            'policy_state_dict': model.policy.state_dict(),
+            'policy_state_dict': state_dict,
             'config': self.config
         }, compat_path)
 
@@ -1136,7 +1198,7 @@ class Phase3ConstrainedOptimizer:
 
         return final_path
 
-    def _create_lagrangian_ppo(self, vec_env):
+    def _create_lagrangian_ppo(self, vec_env, num_envs):
         """创建拉格朗日PPO"""
 
         class LagrangianPPO(PPO):
@@ -1160,17 +1222,21 @@ class Phase3ConstrainedOptimizer:
 
         policy_class = create_ideal_traffic_policy_v4(self.config)
 
+        # 从配置读取Phase 3训练参数
+        phase3_config = self.config.get('training', {}).get('phase3', {})
+        phase4_config = self.config.get('training', {}).get('phase4', {})
+
         return LagrangianPPO(
             policy_class,
             vec_env,
             verbose=1,
             tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/v4_phase3',
-            learning_rate=1e-4,
+            learning_rate=phase3_config.get('learning_rate', 1e-4),
             cost_limit=self.cost_limit,
-            lambda_init=0.1,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
+            lambda_init=phase4_config.get('lagrangian_multiplier_init', 0.1),
+            n_steps=phase3_config.get('n_steps', 2048),
+            batch_size=phase3_config.get('batch_size', 64),
+            n_epochs=phase3_config.get('update_epochs', 10),
             device=str(self.device)
         )
 

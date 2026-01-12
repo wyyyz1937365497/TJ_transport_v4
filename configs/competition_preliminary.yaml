@@ -115,7 +115,7 @@ training:
     use_mixed_precision: true     # 启用混合精度加速
     gradient_clip: 1.0            # 梯度裁剪
     warmup_epochs: 5              # 学习率warmup
-    phase1_model_path: "checkpoints/competition/world_model_phase1.pth"
+    phase1_model_path: "checkpoints/competition/v4_phase1/world_model_final.pth"
 
   # 阶段2: PPO训练 - 主要策略学习阶段
   phase2:
@@ -131,7 +131,7 @@ training:
     update_epochs: 10  # 每次更新轮数
     batch_size: 256    # PPO批次大小（增大提升稳定性）
     n_steps: 4096      # 每次rollout步数（增大提升样本效率）
-    phase2_model_path: "checkpoints/competition/ppo_phase2.pth"
+    phase2_model_path: "checkpoints/competition/v4_phase2/shielded_ppo.zip"
 
   # 阶段3: 端到端微调 - 联合优化所有模块
   phase3:
