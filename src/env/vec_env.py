@@ -34,7 +34,7 @@ class ParallelSumoEnvs:
         self,
         config: Dict[str, Any],
         num_envs: int = 4,
-        base_port: int = 8813,
+        base_port: Optional[int] = None,
         monitor_dir: Optional[str] = None,
         seed: Optional[int] = None
     ):
@@ -44,12 +44,15 @@ class ParallelSumoEnvs:
         Args:
             config: SUMO配置
             num_envs: 并行环境数量
-            base_port: 起始端口
+            base_port: 起始端口（如果为None，从config读取）
             monitor_dir: 监控日志目录
             seed: 随机种子
         """
         self.config = config
         self._num_envs = num_envs  # 使用私有名称避免冲突
+        # 从config读取base_port，如果没有提供且config中也没有，使用默认值8813
+        if base_port is None:
+            base_port = config.get('environment', {}).get('port', 8813)
         self.base_port = base_port
         self.seed = seed
 
@@ -180,7 +183,7 @@ class ParallelSumoEnvs:
 def create_parallel_envs(
     config: Dict[str, Any],
     num_envs: int = 4,
-    base_port: int = 8813,
+    base_port: Optional[int] = None,
     monitor_dir: Optional[str] = None,
     seed: Optional[int] = None
 ) -> ParallelSumoEnvs:
@@ -190,7 +193,7 @@ def create_parallel_envs(
     Args:
         config: SUMO配置
         num_envs: 并行环境数量
-        base_port: 起始端口
+        base_port: 起始端口（如果为None，从config读取）
         monitor_dir: 监控目录
         seed: 随机种子
 

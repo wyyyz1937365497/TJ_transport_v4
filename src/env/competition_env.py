@@ -42,6 +42,16 @@ class CompetitionSumoEnv(SumoEnvironment):
     ):
         super().__init__(config, use_gui=use_gui, port=port, disable_port_retry=disable_port_retry)
 
+        # 读取比赛配置中的奖励权重
+        competition_config = config.get('competition', {})
+        reward_weights = competition_config.get('reward_weights', {})
+        self.speed_norm_factor = reward_weights.get('speed_norm', 1.0 / 30.0)  # 速度归一化因子
+        self.throughput_weight = reward_weights.get('throughput', 10.0)  # 吞吐量权重
+        self.efficiency_weights = competition_config.get('efficiency_weights', [5.0, 3.0, 2.0])  # 效率权重
+        self.stability_weight = competition_config.get('stability_weight', 0.5)  # 稳定性权重
+        self.congestion_penalty_weight = competition_config.get('congestion_penalty_weight', 2.0)  # 拥堵惩罚权重
+        self.stopped_penalty_weight = competition_config.get('stopped_penalty_weight', 1.0)  # 停车惩罚权重
+
         # 初始化优化的Frenet坐标系(基于固定路网)
         net_xml_path = config.get('net_file', '仿真环境_初赛_1.0/仿真环境-初赛/net.xml')
         if Path(net_xml_path).exists():
@@ -423,39 +433,40 @@ class CompetitionSumoEnv(SumoEnvironment):
         # ========== 1. 效率得分 Sefficiency ==========
         # 1.1 速度得分（鼓励高速）
         avg_speed = np.mean(speeds) if speeds else 0.0
-        speed_score = avg_speed / 30.0  # 归一化到0-30m/s
+        speed_score = avg_speed * self.speed_norm_factor  # 使用配置的归一化因子
 
         # 1.2 吞吐量得分（鼓励高到达率）
         arrived_count = len(self.stats.get('arrived_vehicles', []))
         current_time = self.current_step * self.config.get('step_length', 0.1)
-        throughput_score = arrived_count / max(current_time, 1.0) * 10.0  # 放大权重
+        throughput_score = arrived_count / max(current_time, 1.0) * self.throughput_weight  # 使用配置的权重
 
         # 1.3 完成率得分
         departed_count = len(self.stats.get('departed_vehicles', []))
         completion_score = (arrived_count / max(departed_count, 1)) if departed_count > 0 else 0.0
 
-        # 综合效率得分
+        # 综合效率得分（使用配置的权重）
+        w_speed, w_throughput, w_completion = self.efficiency_weights
         efficiency_score = (
-            5.0 * speed_score +      # 速度权重5
-            3.0 * throughput_score +  # 吞吐量权重3
-            2.0 * completion_score    # 完成率权重2
+            w_speed * speed_score +
+            w_throughput * throughput_score +
+            w_completion * completion_score
         )
 
         # ========== 2. 稳定性得分 Sstability ==========
         # 2.1 速度方差惩罚
         if len(speeds) > 1:
             speed_std = np.std(speeds)
-            stability_score = -0.5 * (speed_std / 10.0)  # 惩罚速度波动
+            stability_score = -self.stability_weight * (speed_std / 10.0)  # 使用配置的权重
         else:
             stability_score = 0.0
 
-        # 2.2 拥堵惩罚
+        # 2.2 拥堵惩罚（使用配置的权重）
         congestion_ratio = sum(1 for s in speeds if s < 1.0) / len(speeds) if speeds else 0.0
-        congestion_penalty = -2.0 * congestion_ratio
+        congestion_penalty = -self.congestion_penalty_weight * congestion_ratio
 
-        # 2.3 停车惩罚
+        # 2.3 停车惩罚（使用配置的权重）
         stopped_ratio = sum(1 for s in speeds if s < 0.1) / len(speeds) if speeds else 0.0
-        stopped_penalty = -1.0 * stopped_ratio
+        stopped_penalty = -self.stopped_penalty_weight * stopped_ratio
 
         # 综合稳定性得分
         stability_total = stability_score + congestion_penalty + stopped_penalty

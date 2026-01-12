@@ -38,10 +38,18 @@ environment:
   # ⚡⚡ 大幅增加并行度（关键优化）
   num_parallel_workers: 8  # Phase 1数据收集：8个并行worker
 
+  # 环境约束
+  max_vehicles: 32    # 最大车辆数
+  port: 8813          # SUMO默认端口
+
 # =============================================================================
 # 模型架构 - 保持不变
 # =============================================================================
 model:
+  # 基础模型配置
+  state_dim: 9       # 车辆状态维度
+  history_dim: 32    # 历史特征维度
+
   gnn:
     node_dim: 9
     edge_dim: 4
@@ -55,7 +63,7 @@ model:
   world_model:
     input_dim: 256
     hidden_dim: 128
-    latent_dim: 64
+    latent_dim: 64     # 潜在空间维度
     future_steps: 5
     num_layers: 2
     bidirectional: false
@@ -164,6 +172,23 @@ logging:
 competition:
   use_accurate_frenet: true
   enable_prediction_loop: true
+
+  # 奖励权重配置
+  reward_weights:
+    speed_norm: 0.0333       # 速度归一化因子 (1/30)
+    throughput: 10.0         # 吞吐量权重
+
+  # 效率得分权重
+  efficiency_weights: [5.0, 3.0, 2.0]  # [平峰, 早高峰, 晚高峰]
+
+  # 稳定性权重
+  stability_weight: 0.5      # 稳定性权重
+
+  # 拥堵惩罚权重
+  congestion_penalty_weight: 2.0
+
+  # 停车惩罚权重
+  stopped_penalty_weight: 1.0
 
   prediction_weights:
     risk_vehicle_boost: 1.3

@@ -44,7 +44,10 @@ class SumoEnvironment:
     ):
         self.config = config
         self.use_gui = use_gui
-        self.port = port if port is not None else 8813  # 默认端口
+        # 从config读取端口，如果没有提供且config中也没有，使用默认值8813
+        if port is None:
+            port = config.get('port', 8813)
+        self.port = port
         self.disable_port_retry = disable_port_retry  # 是否禁用端口重试
 
         # SUMO配置

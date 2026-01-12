@@ -89,7 +89,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         self.prediction_layer = MultiScaleRSSM(
             input_dim=gnn_config.get('output_dim', 256),
             hidden_dim=wm_config.get('hidden_dim', 128),
-            latent_dim=wm_config.get('hidden_dim', 64),
+            latent_dim=wm_config.get('latent_dim', 64),
             future_steps=wm_config.get('future_steps', 5),
             num_layers=wm_config.get('num_layers', 2),
             dropout=wm_config.get('dropout', 0.1)
@@ -100,8 +100,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # ============================================================
         self.weight_gating = EnhancedDynamicWeightGating(
             state_dim=gnn_config.get('output_dim', 256),
-            history_dim=32,
-            prediction_dim=wm_config.get('hidden_dim', 64) * 2,
+            history_dim=model_config.get('history_dim', 32),
+            prediction_dim=wm_config.get('latent_dim', 64) * 2,
             hidden_dim=128,
             dropout=gnn_config.get('dropout', 0.1),
             use_temporal_smoothing=True
@@ -113,8 +113,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         ctrl_config = model_config.get('controller', {})
         self.decision_layer = EnhancedInfluenceBasedController(
             gnn_dim=gnn_config.get('output_dim', 256),
-            flow_dim=wm_config.get('hidden_dim', 64),
-            risk_dim=wm_config.get('hidden_dim', 64),
+            flow_dim=wm_config.get('latent_dim', 64),
+            risk_dim=wm_config.get('latent_dim', 64),
             global_dim=ctrl_config.get('global_dim', 32),
             hidden_dim=ctrl_config.get('hidden_dim', 128),
             action_dim=ctrl_config.get('action_dim', 2),

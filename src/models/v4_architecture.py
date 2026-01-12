@@ -1395,6 +1395,7 @@ class IdealTrafficControllerV4(nn.Module):
         rssm_hidden_dim: int = 128,
         rssm_latent_dim: int = 64,
         controller_hidden_dim: int = 128,
+        history_dim: int = 32,
         top_k: int = 5,
         dropout: float = 0.2,
         device: str = 'cuda'
@@ -1438,7 +1439,7 @@ class IdealTrafficControllerV4(nn.Module):
         # 4. 动态权重门控：增强版（场景识别+时间平滑）
         self.weight_gating = EnhancedDynamicWeightGating(
             state_dim=gnn_output_dim,
-            history_dim=32,
+            history_dim=history_dim,
             prediction_dim=rssm_latent_dim * 2,
             hidden_dim=128,
             dropout=dropout,
