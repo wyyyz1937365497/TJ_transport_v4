@@ -1,12 +1,14 @@
 """
-SB3 PPO策略网络 - v4.0理想架构版本（完全整合版）
+SB3 PPO策略网络 - v4.0理想架构版本
 
-核心改进：
+核心功能：
 1. 完全整合v4_architecture.py中的所有模块
-2. 使用真正的"影响力驱动Top-K控制器"
-3. 实现动态权重门控
-4. 添加成本约束的拉格朗日优化
+2. 使用增强的影响力驱动Top-K控制器（可学习权重）
+3. 增强的动态权重门控（场景识别）
+4. 拉格朗日约束优化（动态λ更新）
 5. 优化GNN边构建（使用空间邻近而非全连接）
+
+所有增强功能默认启用。
 """
 
 import torch
@@ -20,8 +22,10 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from .v4_architecture import (
     RiskSensitiveGNN,
     MultiScaleRSSM,
-    DynamicWeightGating,
-    InfluenceBasedController
+    EnhancedDynamicWeightGating,
+    EnhancedInfluenceBasedController,
+    LagrangianOptimizer,
+    IdealTrafficControllerV4
 )
 
 
@@ -29,12 +33,12 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
     """
     理想交通策略 v4.0 - SB3 PPO 完全整合版
 
-    架构层次：
+    架构层次（增强功能默认启用）：
     1. 感知层：RiskSensitiveGNN（风险敏感异构图）
     2. 预测层：MultiScaleRSSM（多尺度世界模型）
-    3. 元控制层：DynamicWeightGating（动态权重门控）
-    4. 决策层：InfluenceBasedController（影响力驱动Top-K控制器）
-    5. 约束层：Cost Critic + 拉格朗日优化
+    3. 元控制层：EnhancedDynamicWeightGating（场景识别权重门控）
+    4. 决策层：EnhancedInfluenceBasedController（可学习权重+自适应Top-K）
+    5. 约束层：LagrangianOptimizer（动态拉格朗日优化）
     """
 
     def __init__(
@@ -90,30 +94,37 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         )
 
         # ============================================================
-        # 3. 元控制层：动态权重门控
+        # 3. 元控制层：增强的动态权重门控（场景识别）
         # ============================================================
-        self.weight_gating = DynamicWeightGating(
+        self.weight_gating = EnhancedDynamicWeightGating(
             state_dim=gnn_config.get('output_dim', 256),
-            hidden_dim=64
+            history_dim=32,
+            prediction_dim=wm_config.get('hidden_dim', 64) * 2,
+            hidden_dim=128,
+            dropout=gnn_config.get('dropout', 0.1),
+            use_temporal_smoothing=True
         )
 
         # ============================================================
-        # 4. 决策层：影响力驱动Top-K控制器
+        # 4. 决策层：增强的影响力控制器（可学习权重+自适应Top-K）
         # ============================================================
         ctrl_config = model_config.get('controller', {})
-        self.decision_layer = InfluenceBasedController(
+        self.decision_layer = EnhancedInfluenceBasedController(
             gnn_dim=gnn_config.get('output_dim', 256),
             flow_dim=wm_config.get('hidden_dim', 64),
             risk_dim=wm_config.get('hidden_dim', 64),
             global_dim=ctrl_config.get('global_dim', 32),
             hidden_dim=ctrl_config.get('hidden_dim', 128),
             action_dim=ctrl_config.get('action_dim', 2),
-            top_k=self.top_k,
-            dropout=ctrl_config.get('dropout', 0.2)
+            base_top_k=self.top_k,
+            max_top_k=min(self.top_k + 3, 10),
+            min_top_k=max(self.top_k - 2, 2),
+            dropout=ctrl_config.get('dropout', 0.2),
+            use_learnable_weights=True
         )
 
         # ============================================================
-        # 5. 成本价值网络（拉格朗日约束）
+        # 5. 成本价值网络
         # ============================================================
         self.cost_critic = nn.Sequential(
             nn.Linear(ctrl_config.get('hidden_dim', 128), 64),
@@ -121,6 +132,17 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             nn.Dropout(0.1),
             nn.Linear(64, 1)
         )
+
+        # ============================================================
+        # 6. 拉格朗日优化器（动态约束优化）
+        # ============================================================
+        self.lagrangian_optimizer = LagrangianOptimizer(
+            cost_limit=0.1,
+            lambda_init=0.1,
+            adaptive_penalty=True
+        )
+
+        # ============================================================
 
         # ============================================================
         # LSTM隐藏状态（用于世界模型）
