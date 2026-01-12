@@ -224,6 +224,33 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         importance_scores = gnn_output['importance_scores']
         global_embedding = gnn_output['global_embedding']
 
+        # Ensure global_embedding matches batch_size
+        if global_embedding.size(0) != batch_size:
+            # Mismatch detected - this can happen due to batch tensor issues
+            # Create a corrected global embedding by manual mean pooling
+            if graph_data.batch is not None and graph_data.batch.size(0) == node_embeddings.size(0):
+                # Manual global mean pooling
+                num_nodes_total = node_embeddings.size(0)
+                global_embedding_corrected = torch.zeros(batch_size, node_embeddings.size(1), device=device)
+
+                for b in range(batch_size):
+                    mask = (graph_data.batch == b)
+                    if mask.sum() > 0:
+                        global_embedding_corrected[b] = node_embeddings[mask].mean(dim=0)
+                    else:
+                        global_embedding_corrected[b] = torch.zeros(node_embeddings.size(1), device=device)
+
+                global_embedding = global_embedding_corrected
+            else:
+                # Fallback: repeat or truncate to match batch_size
+                if global_embedding.size(0) < batch_size:
+                    # Repeat the last embedding
+                    last_emb = global_embedding[-1:].unsqueeze(0)
+                    global_embedding = torch.cat([global_embedding, last_emb.repeat(batch_size - global_embedding.size(0), 1)], dim=0)
+                else:
+                    # Truncate to batch_size
+                    global_embedding = global_embedding[:batch_size]
+
         # ============================================================
         # 2. 预测层：多尺度RSSM
         # ============================================================

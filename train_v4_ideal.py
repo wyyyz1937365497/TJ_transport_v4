@@ -951,21 +951,24 @@ class Phase2ShieldedPPOTrainer:
         print("\n[INFO] Creating v4.0 policy network...")
         policy_class = create_ideal_traffic_policy_v4(self.config)
 
+        # Read Phase 2 training config
+        phase2_config = self.config.get('training', {}).get('phase2', {})
+
         model = PPO(
             policy_class,
             vec_env,
             verbose=1,
             tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/v4_phase2',
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=128,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,
-            vf_coef=0.5,
-            max_grad_norm=0.5,
+            learning_rate=phase2_config.get('learning_rate', 3e-4),
+            n_steps=phase2_config.get('n_steps', 2048),
+            batch_size=phase2_config.get('batch_size', 512),
+            n_epochs=phase2_config.get('update_epochs', 10),
+            gamma=phase2_config.get('gamma', 0.99),
+            gae_lambda=phase2_config.get('gae_lambda', 0.95),
+            clip_range=phase2_config.get('clip_epsilon', 0.2),
+            ent_coef=phase2_config.get('entropy_coef', 0.01),
+            vf_coef=phase2_config.get('value_loss_coef', 0.5),
+            max_grad_norm=phase2_config.get('max_grad_norm', 0.5),
             seed=self.config.get('seed', 42),
             device=str(self.device)
         )
@@ -1222,30 +1225,111 @@ def main():
     # 设置随机种子
     set_seed(config.get('seed', 42))
 
+    # 获取checkpoint路径
+    checkpoint_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
+
+    # 定义checkpoint路径
+    phase1_path = os.path.join(checkpoint_dir, 'v4_phase1/world_model_final.pth')
+    phase2_path = os.path.join(checkpoint_dir, 'v4_phase2/shielded_ppo.zip')
+    phase3_path = os.path.join(checkpoint_dir, 'v4_phase2/shielded_ppo.pth')  # Phase 3的输入
+    final_path = os.path.join(checkpoint_dir, 'v4_phase2/final_model.pth')
+
     # 创建训练器
     phase1_checkpoint = None
     phase2_checkpoint = None
 
-    if args.phase in ['1', 'all']:
+    # 检测已有的checkpoint并确定起始阶段
+    if args.phase == 'all':
+        # 自动检测应该从哪个阶段开始
+        start_phase = 1
+        if os.path.exists(phase3_path) or os.path.exists(final_path):
+            print("[INFO] 所有阶段已完成，从Phase 3重新开始")
+            start_phase = 3
+        elif os.path.exists(phase2_path):
+            print("[INFO] Phase 1已完成，从Phase 2开始")
+            start_phase = 2
+            phase1_checkpoint = phase1_path
+        elif os.path.exists(phase1_path):
+            print("[INFO] Phase 1 checkpoint存在，从Phase 2开始")
+            start_phase = 2
+            phase1_checkpoint = phase1_path
+        else:
+            print("[INFO] 从Phase 1开始训练")
+            start_phase = 1
+
+        # 执行训练
+        if start_phase <= 1:
+            trainer1 = Phase1WorldModelTrainer(config)
+            phase1_checkpoint = trainer1.train()
+
+        if start_phase <= 2:
+            # 如果没有Phase 1 checkpoint但需要运行Phase 2，尝试查找
+            if not phase1_checkpoint and not os.path.exists(phase1_path):
+                print("[WARNING] Phase 1 checkpoint未找到，Phase 2可能效果不佳")
+                phase1_checkpoint = None
+            elif not phase1_checkpoint and os.path.exists(phase1_path):
+                phase1_checkpoint = phase1_path
+
+            trainer2 = Phase2ShieldedPPOTrainer(config)
+            phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
+
+        if start_phase <= 3:
+            # Phase 3是约束优化，需要Phase 2的checkpoint
+            if not phase2_checkpoint:
+                # 尝试使用默认路径
+                if os.path.exists(phase2_path):
+                    phase2_checkpoint = phase2_path
+                else:
+                    print("[WARNING] Phase 2 checkpoint未找到，无法运行Phase 3")
+                    print("[HINT] 请先运行: python train_v4_ideal.py --config <config> --phase 2")
+                    return
+
+            trainer3 = Phase3ConstrainedOptimizer(config)
+            trainer3.train(phase2_checkpoint=phase2_checkpoint)
+
+    elif args.phase == '1':
+        # 只运行Phase 1
         trainer1 = Phase1WorldModelTrainer(config)
         phase1_checkpoint = trainer1.train()
 
-    if args.phase in ['2', 'all']:
+    elif args.phase == '2':
+        # 从Phase 2开始
+        # 检查Phase 1 checkpoint
+        if os.path.exists(phase1_path):
+            print(f"[INFO] 使用现有Phase 1 checkpoint: {phase1_path}")
+            phase1_checkpoint = phase1_path
+        else:
+            print("[WARNING] Phase 1 checkpoint未找到！")
+            print("[HINT] Phase 1训练是必须的。请先运行: python train_v4_ideal.py --config <config> --phase 1")
+            user_input = input("是否仍然继续Phase 2训练？(y/N): ")
+            if user_input.lower() != 'y':
+                print("[ABORT] 训练已取消")
+                return
+            phase1_checkpoint = None
+
         trainer2 = Phase2ShieldedPPOTrainer(config)
         phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
 
-    if args.phase in ['3', 'all']:
+    elif args.phase == '3':
+        # 从Phase 3开始
+        # 检查Phase 2 checkpoint
+        if os.path.exists(phase2_path):
+            print(f"[INFO] 使用现有Phase 2 checkpoint: {phase2_path}")
+            phase2_checkpoint = phase2_path
+        else:
+            print("[WARNING] Phase 2 checkpoint未找到！")
+            print("[HINT] Phase 2训练是必须的。请先运行: python train_v4_ideal.py --config <config> --phase 2")
+            user_input = input("是否仍然继续Phase 3训练？(y/N): ")
+            if user_input.lower() != 'y':
+                print("[ABORT] 训练已取消")
+                return
+            phase2_checkpoint = None
+
         trainer3 = Phase3ConstrainedOptimizer(config)
-        # 如果没有Phase 2 checkpoint，使用默认路径
-        if not phase2_checkpoint:
-            phase2_checkpoint = os.path.join(
-                config.get('paths', {}).get('checkpoint_dir', 'checkpoints'),
-                'v4_phase2/shielded_ppo.zip'
-            )
         trainer3.train(phase2_checkpoint=phase2_checkpoint)
 
     print("\n" + "="*80)
-    print("[SUCCESS] Complete training pipeline finished!")
+    print("[SUCCESS] Training pipeline finished!")
     print("="*80)
 
 
