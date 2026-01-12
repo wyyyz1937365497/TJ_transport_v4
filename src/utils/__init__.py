@@ -17,13 +17,6 @@ from .helpers import (
     save_checkpoint
 )
 
-from .multi_gpu import (
-    setup_multi_gpu_training,
-    adjust_hyperparameters_for_multi_gpu,
-    print_gpu_info,
-    monitor_gpu_usage
-)
-
 from .frenet_utils import (
     FrenetCoordinateSystem,
     LaneCenterline,
@@ -44,10 +37,6 @@ __all__ = [
     'AverageMeter',
     'load_checkpoint',
     'save_checkpoint',
-    'setup_multi_gpu_training',
-    'adjust_hyperparameters_for_multi_gpu',
-    'print_gpu_info',
-    'monitor_gpu_usage',
     'FrenetCoordinateSystem',
     'LaneCenterline',
     'get_frenet_system',

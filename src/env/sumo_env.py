@@ -237,6 +237,14 @@ class SumoEnvironment:
         traci.simulationStep()
         self.current_step += 1
 
+        # 更新到达车辆统计
+        if TRACI_AVAILABLE:
+            try:
+                newly_arrived = traci.simulation.getArrivedIDList()
+                self.stats['arrived_vehicles'].update(newly_arrived)
+            except Exception:
+                pass
+
         # 获取观测
         observation = self._get_observation()
 
@@ -539,7 +547,7 @@ class SumoEnvironment:
             'step': self.current_step,
             'vehicles': traci.vehicle.getIDCount(),
             'collisions': traci.simulation.getCollidingVehiclesNumber(),
-            'arrived': traci.simulation.getArrivedNumber(),
+            'arrived': list(self.stats.get('arrived_vehicles', set())),
             'departed': traci.simulation.getDepartedNumber()
         }
 
