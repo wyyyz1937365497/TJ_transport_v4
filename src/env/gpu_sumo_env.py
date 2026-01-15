@@ -66,7 +66,7 @@ class GPUSumoEnvironment:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
         # SUMO配置
-        self.sumo_cfg = config.get('sumo_cfg', '')
+        self.sumo_cfg = config.get('sumo_config', config.get('sumo_cfg', ''))
         self.step_length = config.get('step_length', 0.1)
 
         # 构建命令

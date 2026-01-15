@@ -9,7 +9,7 @@ seed: 42
 
 # 路径配置
 paths:
-  checkpoint_dir: checkpoints
+  checkpoint_dir: checkpoints/competition
   log_dir: logs
   tensorboard_dir: runs
 
@@ -18,9 +18,9 @@ paths:
 # =============================================================================
 environment:
   # SUMO配置
-  sumo_config: 仿真环境_初赛_1.0/仿真环境-初camp/sumo_config.sumocfg
-  net_file: 仿真环境_初赛_1.0/仿真环境-初camp/network.net.xml
-  route_file: 仿真环境_初赛_1.0/仿真环境-初camp/routes.rou.xml
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
 
   # 基础参数（会被课程学习覆盖）
   max_vehicles: 32
@@ -114,10 +114,10 @@ training:
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
     total_timesteps: 200000  # 总训练步数
-    num_envs: 8  # 并行环境数
+    num_envs: 16  # 并行环境数（优化：8 → 16）
     learning_rate: 3e-4
-    n_steps: 2048  # 每次更新收集的步数
-    batch_size: 512
+    n_steps: 4096  # 每次更新收集的步数（优化：2048 → 4096）
+    batch_size: 1024  # PPO batch大小（优化：512 → 1024）
     update_epochs: 10  # 每次更新的epoch数
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数

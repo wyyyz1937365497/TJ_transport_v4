@@ -14,6 +14,7 @@ SB3 PPO策略网络 - v4.0理想架构版本
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.jit import script
 import numpy as np
 from typing import Dict, List, Any, Tuple, Optional
 import gymnasium as gym
@@ -48,6 +49,79 @@ def safe_item(tensor: torch.Tensor) -> int:
     return int(tensor.item())
 
 
+@script
+def compute_risk_features_jit(
+    vehicle_states: torch.Tensor
+) -> torch.Tensor:
+    """
+    JIT编译的风险特征计算函数
+
+    计算TTC和THW的向量化版本
+
+    Args:
+        vehicle_states: [N, 9] - [s, d, vs, vd, speed, accel, lane, angle, is_icv]
+
+    Returns:
+        risk_features: [N, 2] - [ttc_inv, thw_inv]
+    """
+    N = vehicle_states.size(0)
+
+    if N == 0:
+        return torch.zeros(0, 2, device=vehicle_states.device)
+
+    # 特征提取
+    s = vehicle_states[:, 0] * 1000.0  # 纵向位置(m)
+    vs = vehicle_states[:, 2] * 30.0   # 纵向速度(m/s)
+    speed = (vehicle_states[:, 4] * 30.0).clamp(min=0.1)  # 总速度(m/s)
+    lane = vehicle_states[:, 6]        # 车道索引
+
+    # 构建距离矩阵 [N, N]
+    s_diff = s.unsqueeze(1) - s.unsqueeze(0)
+    lane_matrix = lane.unsqueeze(1) == lane.unsqueeze(0)
+
+    # 排除自己
+    not_self = ~torch.eye(N, dtype=torch.bool, device=vehicle_states.device)
+
+    # 前车掩码
+    ahead_mask = lane_matrix & (s_diff > 0) & not_self
+
+    # 初始化输出
+    ttc_inv = torch.zeros(N, device=vehicle_states.device)
+    thw_inv = torch.zeros(N, device=vehicle_states.device)
+
+    # 找最近的前车
+    s_gap_matrix = torch.where(ahead_mask, s_diff, torch.tensor(float('inf'), device=vehicle_states.device))
+    nearest_ahead_indices = torch.argmin(s_gap_matrix, dim=1)
+    has_ahead = ahead_mask.any(dim=1)
+
+    if has_ahead.any():
+        valid_indices = torch.where(has_ahead)[0]
+        nearest_idx = nearest_ahead_indices[valid_indices]
+        s_gap_valid = s_gap_matrix[valid_indices, nearest_idx]
+
+        vs_front_valid = vs[nearest_idx]
+        vs_self_valid = vs[valid_indices]
+        vs_diff = vs_self_valid - vs_front_valid
+
+        catching_up = vs_diff > 0.1
+
+        ttc = torch.where(
+            catching_up,
+            s_gap_valid / vs_diff.clamp(min=0.1),
+            torch.tensor(float('inf'), device=vehicle_states.device)
+        )
+        ttc_inv_valid = 1.0 / (ttc + 0.1)
+        ttc_inv_valid[~catching_up] = 0.0
+
+        thw = s_gap_valid / speed[valid_indices].clamp(min=0.1)
+        thw_inv_valid = 1.0 / (thw + 0.1)
+
+        ttc_inv[valid_indices] = ttc_inv_valid
+        thw_inv[valid_indices] = thw_inv_valid
+
+    return torch.stack([ttc_inv, thw_inv], dim=-1)
+
+
 class IdealTrafficPolicyV4(ActorCriticPolicy):
     """
     理想交通策略 v4.0 - SB3 PPO 完全整合版
@@ -73,6 +147,21 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             config = getattr(self.__class__, 'config', {})
         self.config = config
         self.cfg_device = config.get('device', 'cuda')  # Store config device separately
+
+        # ========== 双GPU配置 ==========
+        # cuda:0 用于训练（主模型）
+        # cuda:1 用于向量运算（风险特征、边构建等）
+        if torch.cuda.device_count() >= 2:
+            self.device_train = torch.device('cuda:0')  # 主训练设备
+            self.device_compute = torch.device('cuda:1')  # 向量计算设备
+            print(f"[GPU] 双GPU模式：训练=cuda:0, 计算=cuda:1")
+        else:
+            self.device_train = self.device  # 单GPU回退
+            self.device_compute = self.device
+            if torch.cuda.device_count() == 1:
+                print(f"[GPU] 单GPU模式：所有计算使用cuda:0")
+            else:
+                print(f"[GPU] 使用CPU")
 
         # 调用父类初始化
         super().__init__(
@@ -625,110 +714,140 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         batch_size: int
     ) -> Dict[str, torch.Tensor]:
         """
-        使用空间邻近关系构建图（而非全连接）
+        使用空间邻近关系构建图（向量化优化版本 + 双GPU）
 
         Returns:
             图数据字典（用于PyTorch Geometric）
         """
-        from torch_geometric.data import Data, Batch
+        from torch_geometric.data import Data
 
-        graphs = []
+        device_train = vehicle_states.device  # cuda:0（训练设备）
+        device_compute = self.device_compute  # cuda:1（计算设备）
 
-        for b in range(batch_size):
-            # 安全处理空张量
-            num_veh = safe_item(num_vehicles[b])
-            states = vehicle_states[b, :num_veh]  # [num_veh, 9]
+        # ============== 第1步：统计总节点数 ==============
+        num_veh_list = [min(safe_item(num_vehicles[b]), self.max_vehicles) for b in range(batch_size)]
+        total_nodes = sum(num_veh_list)
 
-            if num_veh == 0:
-                # 空图
-                graph = Data(
-                    x=torch.zeros(0, 9, device=vehicle_states.device),
-                    edge_index=torch.empty((2, 0), dtype=torch.long, device=vehicle_states.device),
-                    edge_attr=torch.empty((0, 4), device=vehicle_states.device),
-                    risk_features=torch.zeros(0, 2, device=vehicle_states.device),
-                    num_nodes=0
-                )
-                graphs.append(graph)
-                continue
-
-            # 节点特征
-            x = states  # [num_veh, 9]
-
-            # 计算风险特征（TTC, THW）
-            risk_features = self._compute_risk_features_spatial(states)
-
-            # 边特征（空间邻近）
-            edge_index, edge_attr = self._build_edges_spatial(states, num_veh)
-
-            # Validate edge indices to prevent CUDA errors
-            if edge_index.size(1) > 0:
-                max_idx = edge_index.max().item()
-                if max_idx >= num_veh:
-                    # Edge indices are out of bounds, reset to empty
-                    edge_index = torch.empty((2, 0), dtype=torch.long, device=states.device)
-                    edge_attr = torch.empty((0, 4), device=states.device)
-
-            # 创建图
-            graph = Data(
-                x=x,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                risk_features=risk_features,
-                num_nodes=num_veh
-            )
-
-            graphs.append(graph)
-
-        # 批处理
-        if len(graphs) > 0:
-            batch_graph = Batch.from_data_list(graphs)
-
-            # Additional validation after batching to prevent CUDA errors
-            num_nodes = batch_graph.x.size(0)
-
-            # Validate edge indices
-            if batch_graph.edge_index.size(1) > 0:
-                max_idx = batch_graph.edge_index.max().item()
-                min_idx = batch_graph.edge_index.min().item()
-
-                # Check if any edge index is out of bounds
-                if max_idx >= num_nodes or min_idx < 0:
-                    # Reset to empty edges to prevent CUDA error
-                    batch_graph.edge_index = torch.empty((2, 0), dtype=torch.long, device=batch_graph.x.device)
-                    batch_graph.edge_attr = torch.empty((0, 4), device=batch_graph.x.device)
-
-            # Validate batch tensor
-            if hasattr(batch_graph, 'batch'):
-                if batch_graph.batch.size(0) != num_nodes:
-                    # Batch tensor size mismatch, recreate it
-                    # Each node should be assigned to its batch index
-                    batch_vector = []
-                    node_idx = 0
-                    for b_idx, graph in enumerate(graphs):
-                        num_nodes_in_graph = graph.x.size(0)
-                        batch_vector.extend([b_idx] * num_nodes_in_graph)
-                        node_idx += num_nodes_in_graph
-                    batch_graph.batch = torch.tensor(batch_vector, dtype=torch.long, device=batch_graph.x.device)
-            else:
-                # Create batch tensor if it doesn't exist
-                batch_vector = []
-                node_idx = 0
-                for b_idx, graph in enumerate(graphs):
-                    num_nodes_in_graph = graph.x.size(0)
-                    batch_vector.extend([b_idx] * num_nodes_in_graph)
-                    node_idx += num_nodes_in_graph
-                batch_graph.batch = torch.tensor(batch_vector, dtype=torch.long, device=batch_graph.x.device)
-        else:
+        if total_nodes == 0:
             # 空batch
             batch_graph = Data(
-                x=torch.zeros(0, 9, device=vehicle_states.device),
-                edge_index=torch.empty((2, 0), dtype=torch.long, device=vehicle_states.device),
-                edge_attr=torch.empty((0, 4), device=vehicle_states.device),
-                risk_features=torch.zeros(0, 2, device=vehicle_states.device),
+                x=torch.zeros(0, 9, device=device_train),
+                edge_index=torch.empty((2, 0), dtype=torch.long, device=device_train),
+                edge_attr=torch.empty((0, 4), device=device_train),
+                risk_features=torch.zeros(0, 2, device=device_train),
                 num_nodes=0
             )
-            # Set batch tensor for empty graph
-            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=vehicle_states.device)
+            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=device_train)
+            return batch_graph
+
+        # ============== 双GPU优化：将数据传到cuda:1进行向量计算 ==============
+        # 仅当双GPU可用时才传输
+        use_dual_gpu = (device_train != device_compute)
+        if use_dual_gpu:
+            vehicle_states_compute = vehicle_states.to(device_compute)  # 传到cuda:1
+        else:
+            vehicle_states_compute = vehicle_states
+
+        # ============== 第2步：收集所有节点特征（在cuda:1上计算）=============
+        all_x = []
+        all_risk_features = []
+        node_offset = 0
+        all_edge_indices = []
+        all_edge_attrs = []
+
+        for b in range(batch_size):
+            num_veh = num_veh_list[b]
+
+            if num_veh == 0:
+                continue
+
+            # 提取当前batch样本的车辆状态，确保不会越界
+            actual_num_veh = min(num_veh, vehicle_states_compute.size(1))
+            if actual_num_veh <= 0:
+                continue
+                
+            states = vehicle_states_compute[b, :actual_num_veh]  # [num_veh, 9]
+
+            # 节点特征
+            all_x.append(states)
+
+            # 风险特征（在cuda:1上计算）
+            risk_features = self._compute_risk_features_spatial(states)
+            all_risk_features.append(risk_features)
+
+            # 边特征（在cuda:1上计算）
+            edge_index, edge_attr = self._build_edges_spatial(states, actual_num_veh)
+
+            # 偏移边索引（合并到全局图）
+            if edge_index.size(1) > 0:
+                edge_index_offset = edge_index + node_offset
+                # 确保边索引不超出范围
+                max_valid_idx = node_offset + actual_num_veh - 1
+                valid_mask = (edge_index_offset[0] <= max_valid_idx) & (edge_index_offset[1] <= max_valid_idx)
+                if valid_mask.any():
+                    edge_index_filtered = edge_index_offset[:, valid_mask]
+                    edge_attr_filtered = edge_attr[valid_mask]
+                    all_edge_indices.append(edge_index_filtered)
+                    all_edge_attrs.append(edge_attr_filtered)
+
+            # 更新节点偏移
+            node_offset += actual_num_veh
+
+        # ============== 第3步：合并所有节点特征（仍在cuda:1）=============
+        if not all_x:
+            # 如果没有有效的节点，返回空图
+            batch_graph = Data(
+                x=torch.zeros(0, 9, device=device_train),
+                edge_index=torch.empty((2, 0), dtype=torch.long, device=device_train),
+                edge_attr=torch.empty((0, 4), device=device_train),
+                risk_features=torch.zeros(0, 2, device=device_train),
+                num_nodes=0
+            )
+            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=device_train)
+            return batch_graph
+            
+        x = torch.cat(all_x, dim=0)  # [total_nodes, 9]
+        risk_features_cat = torch.cat(all_risk_features, dim=0)  # [total_nodes, 2]
+
+        # ============== 第4步：合并所有边（仍在cuda:1）=============
+        if len(all_edge_indices) > 0:
+            edge_index = torch.cat(all_edge_indices, dim=1)  # [2, total_edges]
+            edge_attr = torch.cat(all_edge_attrs, dim=0)  # [total_edges, 4]
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device_compute)
+            edge_attr = torch.empty((0, 4), device=device_compute)
+
+        # ============== 第5步：创建batch向量（在cuda:0上）=============
+        batch_vector = []
+        for b, num_veh in enumerate(num_veh_list):
+            if num_veh > 0:
+                batch_vector.extend([b] * num_veh)
+        batch_tensor = torch.tensor(batch_vector, dtype=torch.long, device=device_train)  # [total_nodes]
+
+        # ============== 双GPU优化：将计算结果传回cuda:0 ==============
+        if use_dual_gpu:
+            x = x.to(device_train)
+            risk_features_cat = risk_features_cat.to(device_train)
+            edge_index = edge_index.to(device_train)
+            edge_attr = edge_attr.to(device_train)
+
+        # ============== 第6步：创建并验证图 ==============
+        batch_graph = Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            risk_features=risk_features_cat,
+            num_nodes=total_nodes
+        )
+        batch_graph.batch = batch_tensor
+
+        # 验证边索引
+        if edge_index.size(1) > 0:
+            max_idx = edge_index.max().item()
+            if max_idx >= total_nodes:
+                # 边索引越界，重置为空边
+                batch_graph.edge_index = torch.empty((2, 0), dtype=torch.long, device=device_train)
+                batch_graph.edge_attr = torch.empty((0, 4), device=device_train)
 
         return batch_graph
 
@@ -737,7 +856,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         vehicle_states: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算风险特征（基于Frenet坐标的精确版本）
+        计算风险特征（向量化优化版本 + JIT编译）
 
         TTC (Time To Collision): 纵向距离 / 相对速度（仅当追赶前车时）
         THW (Time Headway): 纵向距离 / 自车速度
@@ -748,69 +867,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         Returns:
             risk_features: [N, 2] - [ttc_inv, thw_inv]
         """
-        N = vehicle_states.size(0)
-
-        if N == 0:
-            return torch.zeros(0, 2, device=vehicle_states.device)
-
-        # 特征索引: [s, d, vs, vd, speed, accel, lane, angle, is_icv]
-        s = vehicle_states[:, 0] * 1000.0  # 反归一化：纵向位置(m)
-        d = vehicle_states[:, 1] * 10.0    # 反归一化：横向偏移(m)
-        vs = vehicle_states[:, 2] * 30.0   # 反归一化：纵向速度(m/s)
-        speed = vehicle_states[:, 4] * 30.0.clamp(min=0.1)  # 反归一化：总速度(m/s)
-        lane = vehicle_states[:, 6]        # 车道索引
-
-        ttc_inv = torch.zeros(N, device=vehicle_states.device)
-        thw_inv = torch.zeros(N, device=vehicle_states.device)
-
-        # 为每辆车找到同车道的前车（基于Frenet坐标）
-        for i in range(N):
-            # 同车道且不是自己
-            same_lane = (lane == lane[i]) & (torch.arange(N, device=vehicle_states.device) != i)
-
-            # 在前面的车辆
-            ahead = same_lane & (s > s[i])
-
-            if ahead.any():
-                # 计算所有前车的纵向距离
-                ahead_distances = s[ahead] - s[i]
-
-                # 找最近的前车
-                nearest_ahead_idx = torch.argmin(ahead_distances)
-                ahead_mask = torch.where(ahead)[0]
-
-                if len(ahead_mask) > 0:
-                    nearest_ahead = ahead_mask[nearest_ahead_idx]
-
-                    # 纵向距离（gap）
-                    s_gap = ahead_distances[nearest_ahead_idx].item()
-
-                    # 前车和自车的纵向速度
-                    vs_front = vs[nearest_ahead]
-                    vs_self = vs[i]
-
-                    # TTC计算：纵向距离 / 相对速度
-                    # 只有当自车速度 > 前车速度（追赶）时才有碰撞风险
-                    vs_diff = vs_self - vs_front
-
-                    if vs_diff > 0.1:  # 正在追赶前车
-                        ttc = s_gap / vs_diff
-                        ttc_inv[i] = 1.0 / (ttc + 0.1)  # 避免除零
-                    else:
-                        # 没有追尾风险（自车慢于或等于前车速度）
-                        ttc_inv[i] = 0.0
-
-                    # THW计算：纵向距离 / 自车速度
-                    thw = s_gap / speed[i]
-                    thw_inv[i] = 1.0 / (thw + 0.1)  # 避免除零
-            else:
-                # 前面没有车，风险低
-                ttc_inv[i] = 0.0
-                thw_inv[i] = 0.0
-
-        risk_features = torch.stack([ttc_inv, thw_inv], dim=-1)
-
-        return risk_features
+        # 使用JIT编译的版本（首次调用时编译，后续调用更快）
+        return compute_risk_features_jit(vehicle_states)
 
     def _build_edges_spatial(
         self,
@@ -818,7 +876,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         num_vehicles: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        构建边（空间邻近版本）
+        构建边（向量化优化版本）
 
         Returns:
             edge_index: [2, E]
@@ -832,85 +890,84 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
                 torch.empty((0, 4), device=vehicle_states.device)
             )
 
+        device = vehicle_states.device
+
         # 特征索引: [s, d, vs, vd, speed, accel, lane, angle, is_icv]
-        s = vehicle_states[:, 0] * 1000.0  # 反归一化
-        d = vehicle_states[:, 1] * 10.0
-        lane = vehicle_states[:, 6]
+        s = vehicle_states[:, 0] * 1000.0  # 反归一化 [N]
+        d = vehicle_states[:, 1] * 10.0    # [N]
+        lane = vehicle_states[:, 6]         # [N]
 
-        sources = []
-        targets = []
-        edge_features = []
+        # ============== 向量化计算距离矩阵 ==============
+        # 计算所有车对之间的距离 [N, N]
+        s_diff = s.unsqueeze(1) - s.unsqueeze(0)  # [N, N]
+        d_diff = d.unsqueeze(1) - d.unsqueeze(0)  # [N, N]
+        lane_diff_matrix = lane.unsqueeze(1) - lane.unsqueeze(0)  # [N, N]
 
-        # 为每辆车找到最近的邻居
+        # Frenet距离
+        s_distance = torch.abs(s_diff)
+        d_distance = torch.abs(d_diff) + torch.abs(lane_diff_matrix) * 3.5
+
+        # 加权距离
+        distances = torch.sqrt(
+            (s_distance * 1.0)**2 +
+            (d_distance * 0.3)**2
+        )  # [N, N]
+
+        # ============== 找到交互半径内的邻居 ==============
+        # 排除自己
+        not_self = ~torch.eye(num_veh, dtype=torch.bool, device=device)
+
+        # 邻居掩码：在交互半径内 + 不是自己
+        neighbor_mask = (distances < self.interaction_radius) & not_self  # [N, N]
+
+        # ============== 限制最大邻居数 ==============
+        # 对每个节点，选择最近的max_neighbors个邻居
+        sources_list = []
+        targets_list = []
+
         for i in range(num_veh):
-            # 计算与其他车辆的Frenet距离
-            s_diff = s - s[i]
-            d_diff = d - d[i]
-            lane_diff = lane - lane[i]
+            # 找到i的邻居
+            neighbors = torch.where(neighbor_mask[i])[0]
 
-            # Frenet坐标系的原生距离度量
-            # 纵向距离（沿车道）
-            s_distance = torch.abs(s_diff)
+            if len(neighbors) == 0:
+                continue
 
-            # 横向距离（考虑车道宽度）
-            # d_diff: 同车道的横向偏移差
-            # lane_diff * 3.5: 不同车道间的距离（标准车道宽度约3.5m）
-            d_distance = torch.abs(d_diff) + torch.abs(lane_diff) * 3.5
-
-            # Frenet加权距离（纵向更重要）
-            # 纵向权重: 1.0（主要影响交互）
-            # 横向权重: 0.3（次要影响，不同车道距离远）
-            distances = torch.sqrt(
-                (s_distance * 1.0)**2 +
-                (d_distance * 0.3)**2
-            )
-
-            # 找到交互半径内的邻居（排除自己）
-            mask = (distances < self.interaction_radius) & (distances > 0.1)
-
-            neighbors = torch.where(mask)[0]
-
-            # 限制最大邻居数
+            # 限制邻居数量
             if len(neighbors) > self.max_neighbors:
-                # 选择最近的邻居
-                _, sorted_indices = torch.topk(distances[neighbors],
-                                              self.max_neighbors, largest=False)
-                neighbors = neighbors[sorted_indices]
+                # 根据距离排序，选择最近的
+                neighbor_distances = distances[i, neighbors]
+                _, topk_indices = torch.topk(neighbor_distances, self.max_neighbors, largest=False)
+                neighbors = neighbors[topk_indices]
 
-            # 创建边
-            for j in neighbors:
-                sources.append(i)
-                targets.append(j.item())
+            # 添加边
+            sources_list.append(torch.full_like(neighbors, i, dtype=torch.long))
+            targets_list.append(neighbors)
 
-                # 边特征
-                state_i = vehicle_states[i]
-                state_j = vehicle_states[j.item()]
-
-                rel_speed = state_i[4] - state_j[4]  # 速度差
-                rel_s = state_i[0] - state_j[0]       # 纵向位置差
-                lane_diff = abs(state_i[6] - state_j[6])  # 车道差
-                both_icv = state_i[8] * state_j[8]     # 都是ICV
-
-                edge_features.append([rel_speed, rel_s, lane_diff, both_icv])
-
-        if len(sources) == 0:
-            # 没有边
+        if len(sources_list) == 0:
             return (
-                torch.empty((2, 0), dtype=torch.long, device=vehicle_states.device),
-                torch.empty((0, 4), device=vehicle_states.device)
+                torch.empty((2, 0), dtype=torch.long, device=device),
+                torch.empty((0, 4), device=device)
             )
 
-        edge_index = torch.tensor(
-            [sources, targets],
-            device=vehicle_states.device,
-            dtype=torch.long
-        )
+        # 合并所有边
+        sources = torch.cat(sources_list)  # [E]
+        targets = torch.cat(targets_list)  # [E]
 
-        edge_attr = torch.tensor(
-            edge_features,
-            device=vehicle_states.device,
-            dtype=torch.float32
-        )
+        # ============== 向量化计算边特征 ==============
+        # 提取源节点和目标节点的状态
+        source_states = vehicle_states[sources]  # [E, 9]
+        target_states = vehicle_states[targets]  # [E, 9]
+
+        # 计算边特征
+        rel_speed = source_states[:, 4] - target_states[:, 4]  # [E]
+        rel_s = source_states[:, 0] - target_states[:, 0]      # [E]
+        lane_diff_edge = torch.abs(source_states[:, 6] - target_states[:, 6])  # [E]
+        both_icv = source_states[:, 8] * target_states[:, 8]   # [E]
+
+        edge_attr = torch.stack([rel_speed, rel_s, lane_diff_edge, both_icv], dim=1)  # [E, 4]
+
+        # 构建edge_index
+        edge_index = torch.stack([sources, targets], dim=0)  # [2, E]
 
         return edge_index, edge_attr
 

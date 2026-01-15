@@ -112,11 +112,12 @@ class TrafficTransition:
 class EnhancedTrainingCallback(BaseCallback):
     """增强训练回调 - 记录所有增强功能的指标 + 进度输出"""
 
-    def __init__(self, enhanced_manager: EnhancedTrainingManager, verbose: int = 1):
+    def __init__(self, enhanced_manager: EnhancedTrainingManager, total_timesteps: int, verbose: int = 1):
         super().__init__(verbose)
         self.enhanced_manager = enhanced_manager
+        self.total_timesteps = total_timesteps
         self.last_print_step = 0
-        self.print_freq = 5000  # 每5000步打印一次
+        self.print_freq = 1000  # 每1000步打印一次
 
     def _on_step(self) -> bool:
         # 每隔一定步数打印进度
@@ -127,20 +128,24 @@ class EnhancedTrainingCallback(BaseCallback):
 
     def _print_progress(self):
         """打印训练进度（类似阶段1的样式）"""
-        # 获取当前指标
-        ep_rew_mean = self.logger.name_to_value.get('rollout/ep_rew_mean', 0.0)
-        ep_len_mean = self.logger.name_to_value.get('rollout/ep_len_mean', 0.0)
-        fps = self.logger.name_to_value.get('time/fps', 0.0)
-
         # 计算进度百分比
         progress = self.num_timesteps / self.total_timesteps * 100
 
-        # 打印进度
-        print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
-              f"({progress:.1f}%) | "
-              f"Reward: {ep_rew_mean:.2f} | "
-              f"Length: {ep_len_mean:.1f} | "
-              f"FPS: {fps:.0f}", end='', flush=True)
+        # 获取当前指标
+        ep_rew_mean = self.logger.name_to_value.get('rollout/ep_rew_mean')
+        ep_len_mean = self.logger.name_to_value.get('rollout/ep_len_mean')
+        fps = self.logger.name_to_value.get('time/fps')
+
+        # 如果还没有指标数据（第一个rollout还没完成），只显示进度
+        if ep_rew_mean is None or ep_len_mean is None or fps is None:
+            print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
+                  f"({progress:.1f}%) | Waiting for first rollout...", end='', flush=True)
+        else:
+            print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
+                  f"({progress:.1f}%) | "
+                  f"Reward: {ep_rew_mean:.2f} | "
+                  f"Length: {ep_len_mean:.1f} | "
+                  f"FPS: {fps:.0f}", end='', flush=True)
 
     def _on_rollout_end(self) -> None:
         """Rollout结束后的处理"""
@@ -203,7 +208,7 @@ class Phase1WorldModelTrainer:
         self.num_episodes = phase1_config.get('num_episodes', 50)
         self.epochs = phase1_config.get('epochs', 30)
         self.batch_size = phase1_config.get('batch_size', 256)
-        self.learning_rate = phase1_config.get('learning_rate', 1e-4)
+        self.learning_rate = float(phase1_config.get('learning_rate', 1e-4))
         self.num_workers = phase1_config.get('num_parallel_workers', 4)
 
         # 数据缓存
@@ -651,6 +656,7 @@ class Phase2PPOTrainer:
 
         self.total_timesteps = phase2_config.get('total_timesteps', 200000)
         self.num_envs = phase2_config.get('num_envs', 8)
+        self.n_steps = phase2_config.get('n_steps', 2048)
 
         print(f"\n[PHASE 2] Configuration:")
         print(f"  Total Timesteps: {self.total_timesteps}")
@@ -689,12 +695,15 @@ class Phase2PPOTrainer:
 
         phase2_config = self.config.get('training', {}).get('phase2', {})
 
+        # 确保learning_rate被转换为float类型
+        learning_rate = float(phase2_config.get('learning_rate', 3e-4))
+
         model = PPO(
             policy_class,
             vec_env,
             verbose=1,
             tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/phase2',
-            learning_rate=phase2_config.get('learning_rate', 3e-4),
+            learning_rate=learning_rate,
             n_steps=phase2_config.get('n_steps', 2048),
             batch_size=phase2_config.get('batch_size', 512),
             n_epochs=phase2_config.get('update_epochs', 10),
@@ -777,6 +786,7 @@ class Phase2PPOTrainer:
 
         enhanced_callback = EnhancedTrainingCallback(
             enhanced_manager=self.enhanced_manager,
+            total_timesteps=self.total_timesteps,
             verbose=1
         )
         callbacks.append(enhanced_callback)
@@ -882,13 +892,20 @@ class Phase3ConstrainedOptimizer:
             vec_env,
             verbose=1,
             tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/phase3',
-            learning_rate=phase3_config.get('learning_rate', 1e-4),
+            learning_rate=float(phase3_config.get('learning_rate', 1e-4)),
             cost_limit=phase3_config.get('cost_limit', 0.1),
             lambda_init=0.1,
             n_steps=phase3_config.get('n_steps', 2048),
             batch_size=phase3_config.get('batch_size', 64),
             n_epochs=phase3_config.get('update_epochs', 10),
-            device=str(self.device)
+            gamma=phase3_config.get('gamma', 0.99),
+            gae_lambda=phase3_config.get('gae_lambda', 0.95),
+            clip_range=phase3_config.get('clip_epsilon', 0.2),
+            ent_coef=phase3_config.get('entropy_coef', 0.01),
+            vf_coef=phase3_config.get('value_loss_coef', 0.5),
+            max_grad_norm=phase3_config.get('max_grad_norm', 0.5),
+            seed=self.config.get('seed', 42),
+            device=self.device
         )
 
     def _create_callbacks(self):
@@ -906,6 +923,7 @@ class Phase3ConstrainedOptimizer:
         # 添加增强训练回调（包含进度输出）
         enhanced_callback = EnhancedTrainingCallback(
             enhanced_manager=self.enhanced_manager,
+            total_timesteps=self.total_timesteps,
             verbose=1
         )
         callbacks.append(enhanced_callback)

@@ -51,7 +51,7 @@ class SumoEnvironment:
         self.disable_port_retry = disable_port_retry  # 是否禁用端口重试
 
         # SUMO配置
-        self.sumo_cfg = config.get('sumo_cfg', '')
+        self.sumo_cfg = config.get('sumo_config', config.get('sumo_cfg', ''))
         self.net_file = config.get('net_file', '')
         self.route_file = config.get('route_file', '')
         self.step_length = config.get('step_length', 0.1)
