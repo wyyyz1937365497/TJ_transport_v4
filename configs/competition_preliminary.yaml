@@ -102,7 +102,27 @@ model:
 # 训练配置 - 针对初赛的优化训练流程
 # =============================================================================
 training:
-  # 阶段1: World Model预训练 - 学习交通动态模式
+  # ========== 增强功能配置 ==========
+  curriculum:
+    enabled: true  # 启用课程学习
+    auto_advance: true  # 自动晋级
+    min_episodes_per_level: 50  # 每级别最少训练episodes
+    levels: 5  # 难度级别数
+
+  prioritized_replay:
+    enabled: true  # 启用优先经验回放
+    capacity: 100000  # 缓冲区容量
+    alpha: 0.6  # 优先级指数
+    beta_start: 0.4  # 重要性采样初始值
+    beta_frames: 100000  # beta线性增长到1的帧数
+
+  failure_bank:
+    enabled: true  # 启用失败案例库
+    max_size: 1000  # 最大存储案例数
+    auto_detect: true  # 自动检测失败
+    failure_sampling_ratio: 0.3  # 训练时失败案例占比（30%）
+
+  # ========== 阶段1: World Model预训练 - 学习交通动态模式 ==========
   phase1:
     enabled: true
     num_episodes: 50  # 50 episodes充分学习交通动态

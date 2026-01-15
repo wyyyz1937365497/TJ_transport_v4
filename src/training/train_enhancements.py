@@ -827,45 +827,32 @@ class EnhancedTrainingManager:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
 
-        # 1. 课程学习
+        # 1. 课程学习（始终启用）
         curriculum_config = config.get('training', {}).get('curriculum', {})
-        if curriculum_config.get('enabled', False):
-            self.curriculum = CurriculumManager(config)
-        else:
-            self.curriculum = None
+        self.curriculum = CurriculumManager(config)
 
-        # 2. 优先经验回放
+        # 2. 优先经验回放（始终启用）
         per_config = config.get('training', {}).get('prioritized_replay', {})
-        if per_config.get('enabled', False):
-            self.replay_buffer = PrioritizedReplayBuffer(
-                capacity=per_config.get('capacity', 100000),
-                alpha=per_config.get('alpha', 0.6),
-                beta_start=per_config.get('beta_start', 0.4),
-                beta_frames=per_config.get('beta_frames', 100000)
-            )
-        else:
-            self.replay_buffer = None
+        self.replay_buffer = PrioritizedReplayBuffer(
+            capacity=per_config.get('capacity', 100000),
+            alpha=per_config.get('alpha', 0.6),
+            beta_start=per_config.get('beta_start', 0.4),
+            beta_frames=per_config.get('beta_frames', 100000)
+        )
 
-        # 3. 失败案例库
+        # 3. 失败案例库（始终启用）
         failure_config = config.get('training', {}).get('failure_bank', {})
-        if failure_config.get('enabled', False):
-            self.failure_bank = FailureCaseBank(
-                max_size=failure_config.get('max_size', 1000)
-            )
-        else:
-            self.failure_bank = None
+        self.failure_bank = FailureCaseBank(
+            max_size=failure_config.get('max_size', 1000)
+        )
 
     def get_curriculum_env_config(self, base_config: Dict) -> Dict:
         """获取当前课程学习级别的环境配置"""
-        if self.curriculum is None:
-            return base_config
-
         return self.curriculum.get_env_config_for_current_level(base_config)
 
     def update_curriculum_progress(self, reward: float, success: bool):
         """更新课程学习进度"""
-        if self.curriculum is not None:
-            self.curriculum.update_progress(reward, success)
+        self.curriculum.update_progress(reward, success)
 
     def detect_failure(
         self,
@@ -875,9 +862,6 @@ class EnhancedTrainingManager:
         reward: float
     ):
         """检测失败案例"""
-        if self.failure_bank is None:
-            return None
-
         return self.failure_bank.detect_failure(state, action, next_state, reward)
 
     def add_failure_case(
@@ -889,8 +873,7 @@ class EnhancedTrainingManager:
         info: Dict
     ):
         """添加失败案例"""
-        if self.failure_bank is not None:
-            self.failure_bank.add_failure(state, action, failure_type, severity, info)
+        self.failure_bank.add_failure(state, action, failure_type, severity, info)
 
     def compute_priority(
         self,
@@ -899,26 +882,18 @@ class EnhancedTrainingManager:
         td_error: Optional[float] = None
     ) -> float:
         """计算优先级"""
-        if self.replay_buffer is None:
-            return 0.5
-
         return self.replay_buffer.compute_traffic_priority(reward, info, td_error)
 
     def get_stats(self) -> Dict[str, Any]:
         """获取所有增强功能的统计信息"""
         stats = {}
 
-        if self.curriculum is not None:
-            stats['curriculum'] = self.curriculum.get_stats()
-
-        if self.replay_buffer is not None:
-            stats['replay_buffer'] = {
-                'size': len(self.replay_buffer),
-                'frame': self.replay_buffer.frame
-            }
-
-        if self.failure_bank is not None:
-            stats['failure_bank'] = self.failure_bank.get_stats()
+        stats['curriculum'] = self.curriculum.get_stats()
+        stats['replay_buffer'] = {
+            'size': len(self.replay_buffer),
+            'frame': self.replay_buffer.frame
+        }
+        stats['failure_bank'] = self.failure_bank.get_stats()
 
         return stats
 

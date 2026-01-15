@@ -78,6 +78,14 @@ class GPUSumoEnvironment:
         self.is_connected = False
         self.current_step = 0
 
+        # 统计信息
+        self.stats = {
+            'arrived_vehicles': set(),
+            'departed_vehicles': set(),
+            'started_vehicles': set(),
+            'ended_vehicles': set()
+        }
+
         # 缓存（GPU tensors）
         self._vehicle_states_cache = None
         self._global_stats_cache = None
@@ -91,14 +99,14 @@ class GPUSumoEnvironment:
             # 编译归一化函数
             self._normalize_features = script(self._normalize_features_impl)
 
-            # 编译全局统计计算
-            self._compute_global_stats_gpu = script(self._compute_global_stats_gpu_impl)
+            # 编译全局统计计算的实现函数（不编译wrapper）
+            self._compute_global_stats_gpu_impl_jit = script(self._compute_global_stats_gpu_impl)
 
             print("[OK] JIT编译完成")
         except Exception as e:
             print(f"[WARNING] JIT编译失败: {e}")
             self._normalize_features = self._normalize_features_impl
-            self._compute_global_stats_gpu = self._compute_global_stats_gpu_impl
+            self._compute_global_stats_gpu_impl_jit = self._compute_global_stats_gpu_impl
 
     def _build_sumo_command(self) -> List[str]:
         """构建SUMO命令"""
@@ -162,6 +170,14 @@ class GPUSumoEnvironment:
         self.start()
         self.current_step = 0
 
+        # 重置统计信息
+        self.stats = {
+            'arrived_vehicles': set(),
+            'departed_vehicles': set(),
+            'started_vehicles': set(),
+            'ended_vehicles': set()
+        }
+
         return self._get_observation_gpu()
 
     def step(self, actions: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
@@ -184,6 +200,19 @@ class GPUSumoEnvironment:
         # 推进仿真
         traci.simulationStep()
         self.current_step += 1
+
+        # 更新到达/出发车辆统计
+        try:
+            newly_arrived = traci.simulation.getArrivedIDList()
+            self.stats['arrived_vehicles'].update(newly_arrived)
+        except Exception:
+            pass
+
+        try:
+            newly_departed = traci.simulation.getDepartedIDList()
+            self.stats['departed_vehicles'].update(newly_departed)
+        except Exception:
+            pass
 
         # 获取观测（GPU加速）
         observation = self._get_observation_gpu()
@@ -381,7 +410,7 @@ class GPUSumoEnvironment:
         # 转换为GPU tensors
         states_tensor = self._convert_to_gpu_tensors(vehicle_data, all_vehicle_ids)
 
-        # 计算全局统计（GPU加速）
+        # 计算全局统计（GPU加速）- wrapper函数内部会获取TraCI统计信息
         global_stats = self._compute_global_stats_gpu(states_tensor)
 
         # 选择ICV车辆
@@ -518,9 +547,11 @@ class GPUSumoEnvironment:
 
         return normalized
 
-    def _compute_global_stats_gpu_impl(self, states_tensor: torch.Tensor) -> torch.Tensor:
+    def _compute_global_stats_gpu(self, states_tensor: torch.Tensor) -> torch.Tensor:
         """
-        计算全局统计（GPU加速版）
+        计算全局统计（GPU加速版）- Wrapper函数
+
+        这个函数作为JIT编译函数的wrapper，先获取TraCI统计信息，然后调用编译后的函数。
 
         Args:
             states_tensor: [N, 13] tensor on GPU
@@ -528,8 +559,67 @@ class GPUSumoEnvironment:
         Returns:
             stats: [16] tensor on GPU
         """
+        # 获取TraCI统计信息（在JIT编译函数之外）
+        collision_count = 0.0
+        min_expected = 0.0
+
+        try:
+            import libsumo as traci_lib
+        except ImportError:
+            import traci as traci_lib
+
+        try:
+            collision_count = float(traci_lib.simulation.getCollidingVehiclesNumber())
+        except:
+            collision_count = 0.0
+
+        try:
+            min_expected = traci_lib.simulation.getMinExpectedNumber()
+        except:
+            min_expected = 0.0
+
+        # 获取仿真参数（在JIT编译函数之外）
+        current_step = float(self.current_step)
+        step_length = float(self.step_length)
+        max_steps = float(self.config.get('max_steps', 36000))
+
+        # 调用JIT编译的函数
+        return self._compute_global_stats_gpu_impl_jit(
+            states_tensor,
+            collision_count,
+            min_expected,
+            current_step,
+            step_length,
+            max_steps
+        )
+
+    @staticmethod
+    def _compute_global_stats_gpu_impl(
+        states_tensor: torch.Tensor,
+        collision_count: float,
+        min_expected: float,
+        current_step: float,
+        step_length: float,
+        max_steps: float
+    ) -> torch.Tensor:
+        """
+        计算全局统计（GPU加速版）- JIT编译版本
+
+        注意：这是一个静态方法（无self），JIT编译时需要
+
+        Args:
+            states_tensor: [N, 13] tensor on GPU
+            collision_count: 碰撞车辆数（从外部传入）
+            min_expected: 最小期望车辆数（从外部传入）
+            current_step: 当前仿真步数（从外部传入）
+            step_length: 仿真步长（从外部传入）
+            max_steps: 最大仿真步数（从外部传入）
+
+        Returns:
+            stats: [16] tensor on GPU
+        """
         if states_tensor.size(0) == 0:
-            return torch.zeros(16, device=self.device)
+            return torch.zeros(16, device=states_tensor.device)
 
         num_vehicles = states_tensor.size(0)
 
@@ -538,7 +628,7 @@ class GPUSumoEnvironment:
         accelerations = states_tensor[:, 11]  # [N]
         lane_indices = states_tensor[:, 9]  # [N]
 
-        stats = torch.zeros(16, device=self.device)
+        stats = torch.zeros(16, device=states_tensor.device)
 
         # 速度统计（GPU加速）
         stats[0] = torch.mean(speeds)
@@ -554,28 +644,22 @@ class GPUSumoEnvironment:
         stats[6] = num_vehicles
 
         # 时间信息
-        stats[7] = self.current_step * self.step_length
+        stats[7] = current_step * step_length
 
         # 车道分布
         stats[8] = torch.mean(lane_indices.float())
 
-        # 碰撞检测
-        try:
-            stats[9] = float(traci.simulation.getCollidingVehiclesNumber())
-        except:
-            stats[9] = 0.0
+        # 碰撞检测（从外部传入）
+        stats[9] = collision_count
 
-        # 网络负载
-        try:
-            min_expected = traci.simulation.getMinExpectedNumber()
-            stats[12] = min_expected
-            stats[14] = num_vehicles / max(min_expected + num_vehicles, 1)
-        except:
-            stats[12] = 0.0
-            stats[14] = 0.0
+        # 网络负载（从外部传入）
+        stats[12] = min_expected
+        # 使用max()替代torch.clamp()，因为JIT中scalar操作更简单
+        total_vehicles = min_expected + num_vehicles
+        stats[14] = num_vehicles / max(total_vehicles, 1.0)
 
         # 仿真进度
-        stats[15] = self.current_step / self.config.get('max_steps', 36000)
+        stats[15] = current_step / max_steps
 
         return stats
 

@@ -46,12 +46,18 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     EvalCallback,
     BaseCallback
 )
+
+# 进度条支持
+from tqdm import tqdm
 
 # 添加项目路径
 project_root = Path(__file__).parent
@@ -69,6 +75,12 @@ from src.training import (
     FailureCaseBank,
     EnhancedTrainingManager,
     create_enhanced_training_manager
+)
+from src.training.multi_gpu_utils import (
+    MultiGPUManager,
+    ProgressTracker,
+    DataCollectionProgress,
+    TrainingMetrics
 )
 from src.utils.helpers import set_seed, get_device
 
@@ -140,12 +152,18 @@ class EnhancedTrainingCallback(BaseCallback):
 # =============================================================================
 
 class Phase1WorldModelTrainer:
-    """Phase 1: 世界模型预训练（增强版）"""
+    """Phase 1: 世界模型预训练（增强版 + 双卡支持）"""
 
     def __init__(self, config: Dict[str, Any], enhanced_manager: EnhancedTrainingManager):
         self.config = config
         self.enhanced_manager = enhanced_manager
-        self.device = get_device()
+
+        # 初始化多GPU管理器
+        self.gpu_manager = MultiGPUManager(config)
+        self.device = self.gpu_manager.device
+
+        # 初始化训练指标记录器
+        self.metrics = TrainingMetrics()
 
         # Checkpoint目录
         base_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
@@ -165,16 +183,16 @@ class Phase1WorldModelTrainer:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_file = os.path.join(self.cache_dir, 'data.pkl')
 
+        # 打印配置
         print(f"\n[PHASE 1] Configuration:")
         print(f"  Episodes: {self.num_episodes}")
         print(f"  Epochs: {self.epochs}")
         print(f"  Batch Size: {self.batch_size}")
         print(f"  Learning Rate: {self.learning_rate}")
         print(f"  Parallel Workers: {self.num_workers}")
-
-        if enhanced_manager.curriculum:
-            print(f"  🎓 Curriculum Learning: ENABLED")
-            print(f"     Levels: {len(enhanced_manager.curriculum.levels)}")
+        print(f"  Effective Batch Size: {self.gpu_manager.get_effective_batch_size(self.batch_size)}")
+        print(f"  [OK] Curriculum Learning: ENABLED (default)")
+        print(f"     Levels: {len(enhanced_manager.curriculum.levels)}")
 
     def train(self) -> str:
         """训练世界模型"""
@@ -197,7 +215,10 @@ class Phase1WorldModelTrainer:
             device=str(self.device)
         ).to(self.device)
 
-        # 2. 收集数据（带课程学习）
+        # 多GPU包装
+        model = self.gpu_manager.wrap_model(model)
+
+        # 2. 收集数据（带课程学习和进度条）
         print("\n[DATA] Collecting training data...")
         data = self._collect_data()
 
@@ -209,77 +230,174 @@ class Phase1WorldModelTrainer:
 
         print(f"\n[TRAIN] Starting training...")
         best_loss = float('inf')
+        num_samples = len(data['observations'])
+        num_batches_per_epoch = (num_samples + self.batch_size - 1) // self.batch_size
 
-        for epoch in range(self.epochs):
-            model.train()
-            epoch_loss = 0.0
-            num_batches = 0
+        # 创建进度跟踪器
+        progress = ProgressTracker(
+            total_epochs=self.epochs,
+            num_batches_per_epoch=num_batches_per_epoch,
+            phase_name="PHASE 1"
+        )
 
-            indices = np.random.permutation(len(data['observations']))
+        try:
+            for epoch in range(self.epochs):
+                progress.start_epoch(epoch)
+                model.train()
+                epoch_loss = 0.0
+                num_batches = 0
 
-            for batch_start in range(0, len(indices), self.batch_size):
-                batch_end = min(batch_start + self.batch_size, len(indices))
-                batch_indices = indices[batch_start:batch_end]
+                indices = np.random.permutation(num_samples)
 
-                if len(batch_indices) == 0:
-                    continue
+                for batch_start in range(0, num_samples, self.batch_size):
+                    batch_end = min(batch_start + self.batch_size, num_samples)
+                    batch_indices = indices[batch_start:batch_end]
 
-                batch = self._prepare_batch(data, batch_indices)
+                    if len(batch_indices) == 0:
+                        continue
 
-                # 前向传播
-                gnn_output = model.perception_layer(
-                    node_features=batch['node_features'],
-                    edge_index=batch['edge_index'],
-                    edge_features=batch['edge_features'],
-                    risk_features=batch['risk_features']
+                    batch = self._prepare_batch(data, batch_indices)
+
+                    # 前向传播（处理多GPU）
+                    if self.gpu_manager.multi_gpu:
+                        gnn_output = model.module.perception_layer(
+                            node_features=batch['node_features'],
+                            edge_index=batch['edge_index'],
+                            edge_features=batch['edge_features'],
+                            risk_features=batch['risk_features']
+                        )
+
+                        rssm_output = model.module.prediction_layer(
+                            node_embeddings=gnn_output['node_embeddings']
+                        )
+                    else:
+                        gnn_output = model.perception_layer(
+                            node_features=batch['node_features'],
+                            edge_index=batch['edge_index'],
+                            edge_features=batch['edge_features'],
+                            risk_features=batch['risk_features']
+                        )
+
+                        rssm_output = model.prediction_layer(
+                            node_embeddings=gnn_output['node_embeddings']
+                        )
+
+                    # 计算损失
+                    loss_dict = self._compute_loss(rssm_output, batch)
+                    total_loss = (loss_dict['speed_mse'] * 1.0 +
+                                loss_dict['position_mse'] * 0.5 +
+                                loss_dict['conflict_bce'] * 2.0)
+
+                    # 反向传播
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+                    epoch_loss += total_loss.item()
+                    num_batches += 1
+
+                    # 更新batch进度
+                    progress.update_batch(
+                        batch_idx=num_batches - 1,
+                        loss=total_loss.item(),
+                        extra_metrics={'lr': f'{optimizer.param_groups[0]["lr"]:.1e}'}
+                    )
+
+                scheduler.step()
+                avg_loss = epoch_loss / max(num_batches, 1)
+
+                # 检查是否最佳
+                is_best = avg_loss < best_loss
+                if is_best:
+                    best_loss = avg_loss
+                    checkpoint_path = os.path.join(self.checkpoint_dir, 'best.pth')
+
+                    # 保存模型（自动处理DataParallel包装）
+                    model_state = self.gpu_manager.get_model_state_dict(model)
+
+                    torch.save({
+                        'model_state_dict': model_state,
+                        'config': self.config,
+                        'epoch': epoch,
+                        'loss': avg_loss
+                    }, checkpoint_path)
+
+                # 结束epoch
+                progress.end_epoch(
+                    avg_loss=avg_loss,
+                    is_best=is_best,
+                    extra_metrics={'lr': optimizer.param_groups[0]["lr"]}
                 )
 
-                rssm_output = model.prediction_layer(
-                    node_embeddings=gnn_output['node_embeddings']
+                # 记录指标
+                self.metrics.update(
+                    epoch=epoch,
+                    train_loss=avg_loss,
+                    learning_rate=optimizer.param_groups[0]["lr"]
                 )
 
-                # 计算损失
-                loss_dict = self._compute_loss(rssm_output, batch)
-                total_loss = loss_dict['speed_mse'] * 1.0 + loss_dict['position_mse'] * 0.5 + loss_dict['conflict_bce'] * 2.0
-
-                # 反向传播
-                optimizer.zero_grad()
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
-                epoch_loss += total_loss.item()
-                num_batches += 1
-
-            scheduler.step()
-
-            avg_loss = epoch_loss / max(num_batches, 1)
-            print(f"Epoch {epoch+1}/{self.epochs} - Loss: {avg_loss:.4f}")
-
-            # 保存最佳模型
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                checkpoint_path = os.path.join(self.checkpoint_dir, 'best.pth')
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'config': self.config,
-                    'epoch': epoch,
-                    'loss': avg_loss
-                }, checkpoint_path)
+        finally:
+            progress.close()
 
         # 保存最终模型
         final_path = os.path.join(self.checkpoint_dir, 'final.pth')
+        model_state = self.gpu_manager.get_model_state_dict(model)
+
         torch.save({
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_state,
             'config': self.config,
             'epoch': self.epochs
         }, final_path)
 
         print(f"\n[DONE] Phase 1 complete!")
-        print(f"   Best loss: {best_loss:.4f}")
-        print(f"   Final model: {final_path}")
+
+        # 打印训练摘要
+        self.metrics.print_summary()
 
         return final_path
+
+    def _validate_cached_data(self, data: Dict[str, Any]) -> bool:
+        """
+        验证缓存数据的完整性和格式
+
+        Args:
+            data: 加载的缓存数据
+
+        Returns:
+            True if valid, False otherwise
+        """
+        required_keys = ['observations', 'next_observations']
+
+        # 检查必需的键
+        for key in required_keys:
+            if key not in data:
+                print(f"[CACHE] Missing key: {key}")
+                return False
+
+        # 检查数据长度
+        obs_len = len(data['observations'])
+        next_obs_len = len(data['next_observations'])
+
+        if obs_len == 0:
+            print(f"[CACHE] Empty observations")
+            return False
+
+        if obs_len != next_obs_len:
+            print(f"[CACHE] Length mismatch: observations={obs_len}, next_observations={next_obs_len}")
+            return False
+
+        # 检查第一个样本的格式
+        try:
+            first_obs = data['observations'][0]
+            if not hasattr(first_obs, 'num_vehicles'):
+                print(f"[CACHE] Invalid observation format")
+                return False
+        except Exception as e:
+            print(f"[CACHE] Failed to validate first observation: {e}")
+            return False
+
+        return True
 
     def _collect_data(self) -> Dict[str, Any]:
         """收集训练数据（支持课程学习和并行收集）"""
@@ -288,9 +406,18 @@ class Phase1WorldModelTrainer:
             print(f"[CACHE] Loading from cache...")
             try:
                 with open(self.cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
-                print("[CACHE] Failed, recollecting...")
+                    cached_data = pickle.load(f)
+
+                # 验证缓存数据格式
+                if self._validate_cached_data(cached_data):
+                    print(f"[CACHE] Cache loaded successfully")
+                    return cached_data
+                else:
+                    print(f"[CACHE] Invalid cache format, recollecting...")
+                    os.remove(self.cache_file)
+            except Exception as e:
+                print(f"[CACHE] Failed to load cache: {e}")
+                print(f"[CACHE] Recollecting data...")
 
         print("[COLLECT] Collecting data...")
 
@@ -348,23 +475,30 @@ class Phase1WorldModelTrainer:
 
         collect_func = partial(_collect_worker, env_config=env_config, max_steps=500)
 
-        with Pool(processes=num_workers) as pool:
-            worker_results = []
-            for worker_id, count in enumerate(episode_counts):
-                if count > 0:
-                    result = pool.apply_async(collect_func, (worker_id, count))
-                    worker_results.append(result)
+        # 创建数据收集进度跟踪器
+        collect_progress = DataCollectionProgress(num_workers)
 
-            completed = 0
-            for result in worker_results:
-                try:
-                    worker_obs, worker_next_obs = result.get(timeout=600)
-                    observations.extend(worker_obs)
-                    next_observations.extend(worker_next_obs)
-                    completed += 1
-                    print(f"   Worker {completed}/{len(worker_results)} completed")
-                except Exception as e:
-                    print(f"   [WARNING] Worker failed: {e}")
+        try:
+            with Pool(processes=num_workers) as pool:
+                worker_results = []
+                for worker_id, count in enumerate(episode_counts):
+                    if count > 0:
+                        result = pool.apply_async(collect_func, (worker_id, count))
+                        worker_results.append((worker_id, result))
+
+                for worker_id, result in worker_results:
+                    try:
+                        worker_obs, worker_next_obs = result.get(timeout=600)
+                        observations.extend(worker_obs)
+                        next_observations.extend(worker_next_obs)
+
+                        # 更新进度
+                        collect_progress.update_worker(worker_id, len(worker_obs))
+
+                    except Exception as e:
+                        print(f"\n   [WARNING] Worker {worker_id} failed: {e}")
+        finally:
+            collect_progress.close()
 
         print(f"   [OK] Collected {len(observations)} transitions")
 
@@ -489,13 +623,9 @@ class Phase2PPOTrainer:
         print(f"\n[PHASE 2] Configuration:")
         print(f"  Total Timesteps: {self.total_timesteps}")
         print(f"  Parallel Envs: {self.num_envs}")
-
-        if enhanced_manager.curriculum:
-            print(f"  🎓 Curriculum Learning: ENABLED")
-        if enhanced_manager.replay_buffer:
-            print(f"  ⚡ Prioritized Replay: ENABLED")
-        if enhanced_manager.failure_bank:
-            print(f"  🛡️  Failure Bank: ENABLED")
+        print(f"  [OK] Curriculum Learning: ENABLED (default)")
+        print(f"  [OK] Prioritized Replay: ENABLED (default)")
+        print(f"  [OK] Failure Bank: ENABLED (default)")
 
     def train(self, phase1_checkpoint: Optional[str] = None) -> str:
         """训练PPO"""
@@ -995,8 +1125,6 @@ def main():
     parser.add_argument('--phase', type=str, default='all',
                         choices=['1', '2', '3', 'all'],
                         help='训练阶段 (默认: all)')
-    parser.add_argument('--no-enhancements', action='store_true',
-                        help='禁用增强功能（课程学习、PER、失败案例库）')
     parser.add_argument('--device', type=str, default='cuda',
                         help='设备 (默认: cuda)')
     parser.add_argument('--verbose', action='store_true',
@@ -1007,29 +1135,8 @@ def main():
     # 加载配置
     config = load_config(args.config)
 
-    # 禁用增强功能
-    if args.no_enhancements:
-        print("\n[INFO] Enhancements DISABLED")
-        config.setdefault('training', {})
-        config['training'].setdefault('curriculum', {})
-        config['training']['curriculum']['enabled'] = False
-        config['training'].setdefault('prioritized_replay', {})
-        config['training']['prioritized_replay']['enabled'] = False
-        config['training'].setdefault('failure_bank', {})
-        config['training']['failure_bank']['enabled'] = False
-    else:
-        # 默认启用增强功能
-        print("\n[INFO] 🚀 Enhancements ENABLED (默认)")
-        config.setdefault('training', {})
-        config['training'].setdefault('curriculum', {})
-        if 'enabled' not in config['training']['curriculum']:
-            config['training']['curriculum']['enabled'] = True
-        config['training'].setdefault('prioritized_replay', {})
-        if 'enabled' not in config['training']['prioritized_replay']:
-            config['training']['prioritized_replay']['enabled'] = True
-        config['training'].setdefault('failure_bank', {})
-        if 'enabled' not in config['training']['failure_bank']:
-            config['training']['failure_bank']['enabled'] = True
+    # 增强功能默认启用（课程学习、PER、失败案例库）
+    # 配置文件中已设置enabled=true，无需额外处理
 
     # 设置随机种子
     set_seed(config.get('seed', 42))
@@ -1038,8 +1145,8 @@ def main():
     enhanced_manager = create_enhanced_training_manager(config)
 
     # 显示配置
-    print("\n" + "="*80)
-    print("🚀 Training Pipeline - v4.0 Architecture")
+    print("="*80)
+    print("Training Pipeline - v4.0 Architecture")
     print("="*80)
 
     print("\n[CONFIG]")
@@ -1048,20 +1155,9 @@ def main():
     print(f"  Device: {args.device}")
 
     print("\n[ENHANCEMENTS]")
-    if enhanced_manager.curriculum:
-        print(f"  ✅ Curriculum Learning: ENABLED")
-    else:
-        print(f"  ❌ Curriculum Learning: DISABLED")
-
-    if enhanced_manager.replay_buffer:
-        print(f"  ✅ Prioritized Replay: ENABLED")
-    else:
-        print(f"  ❌ Prioritized Replay: DISABLED")
-
-    if enhanced_manager.failure_bank:
-        print(f"  ✅ Failure Bank: ENABLED")
-    else:
-        print(f"  ❌ Failure Bank: DISABLED")
+    print(f"  [OK] Curriculum Learning: ENABLED (default)")
+    print(f"  [OK] Prioritized Replay: ENABLED (default)")
+    print(f"  [OK] Failure Bank: ENABLED (default)")
 
     # 路径
     checkpoint_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
