@@ -214,9 +214,22 @@ class GymSumoEnv(gym.Env):
 
         # 拼接所有特征为一个扁平数组
         flat_obs = np.array(vehicle_features, dtype=np.float32)
+
+        # 确保global_stats是32维（兼容不同环境）
+        global_stats_flat = global_stats.flatten()
+        if len(global_stats_flat) < 32:
+            # 如果维度不足，padding到32维
+            global_stats_flat = np.concatenate([
+                global_stats_flat,
+                np.zeros(32 - len(global_stats_flat), dtype=np.float32)
+            ])
+        elif len(global_stats_flat) > 32:
+            # 如果维度过多，截断到32维
+            global_stats_flat = global_stats_flat[:32]
+
         flat_obs = np.concatenate([
             flat_obs,                              # 车辆状态特征 (MAX_VEHICLES * FEATURES_PER_VEHICLE)
-            global_stats.flatten(),                # 全局统计特征 (32)
+            global_stats_flat,                     # 全局统计特征 (32)
             [len(vehicle_states)]                  # 车辆数量 (1)
         ]).astype(np.float32)
 

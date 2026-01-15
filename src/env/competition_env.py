@@ -325,9 +325,33 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         stats = np.zeros(32)
 
-        # [0-15]: 原有统计（继承自父类）
-        base_stats = super()._compute_global_stats(vehicle_states)
-        stats[:16] = base_stats
+        # [0-15]: 原有统计（使用父类的GPU统计方法）
+        try:
+            # 转换为GPU tensor格式
+            vehicle_data = []
+            for vid in vehicle_states.keys():
+                state = vehicle_states[vid]
+                vehicle_data.append([
+                    state.get('s', 0.0),
+                    state.get('d', 0.0),
+                    state.get('vs', 0.0),
+                    state.get('vd', 0.0),
+                    state.get('speed', 0.0),
+                    state.get('acceleration', 0.0),
+                    state.get('lane_index', 0.0),
+                    state.get('angle', 0.0),
+                    1.0 if vid in self.icv_ids else 0.0
+                ])
+
+            if vehicle_data:
+                states_tensor = torch.tensor(vehicle_data, dtype=torch.float32, device=self.device)
+                base_stats_tensor = self._compute_global_stats_gpu(states_tensor)
+                stats[:16] = base_stats_tensor.cpu().numpy()
+            else:
+                stats[:16] = 0.0
+        except Exception as e:
+            # 如果GPU统计失败，使用零向量
+            stats[:16] = 0.0
 
         speeds = [v['speed'] for v in vehicle_states.values()]
         accelerations = [v['acceleration'] for v in vehicle_states.values()]

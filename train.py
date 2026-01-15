@@ -110,14 +110,37 @@ class TrafficTransition:
 # =============================================================================
 
 class EnhancedTrainingCallback(BaseCallback):
-    """增强训练回调 - 记录所有增强功能的指标"""
+    """增强训练回调 - 记录所有增强功能的指标 + 进度输出"""
 
     def __init__(self, enhanced_manager: EnhancedTrainingManager, verbose: int = 1):
         super().__init__(verbose)
         self.enhanced_manager = enhanced_manager
+        self.last_print_step = 0
+        self.print_freq = 5000  # 每5000步打印一次
 
     def _on_step(self) -> bool:
+        # 每隔一定步数打印进度
+        if self.num_timesteps - self.last_print_step >= self.print_freq:
+            self._print_progress()
+            self.last_print_step = self.num_timesteps
         return True
+
+    def _print_progress(self):
+        """打印训练进度（类似阶段1的样式）"""
+        # 获取当前指标
+        ep_rew_mean = self.logger.name_to_value.get('rollout/ep_rew_mean', 0.0)
+        ep_len_mean = self.logger.name_to_value.get('rollout/ep_len_mean', 0.0)
+        fps = self.logger.name_to_value.get('time/fps', 0.0)
+
+        # 计算进度百分比
+        progress = self.num_timesteps / self.total_timesteps * 100
+
+        # 打印进度
+        print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
+              f"({progress:.1f}%) | "
+              f"Reward: {ep_rew_mean:.2f} | "
+              f"Length: {ep_len_mean:.1f} | "
+              f"FPS: {fps:.0f}", end='', flush=True)
 
     def _on_rollout_end(self) -> None:
         """Rollout结束后的处理"""
@@ -145,6 +168,11 @@ class EnhancedTrainingCallback(BaseCallback):
         # 记录PER统计
         if self.enhanced_manager.replay_buffer:
             self.logger.record('replay_buffer/size', len(self.enhanced_manager.replay_buffer))
+
+    def _on_training_end(self) -> None:
+        """训练结束时的处理"""
+        print()  # 换行
+        print(f"\n[DONE] Training completed at step {self.num_timesteps}")
 
 
 # =============================================================================
@@ -693,12 +721,16 @@ class Phase2PPOTrainer:
         # 创建回调
         callbacks = self._create_callbacks()
 
-        # 训练
+        # 训练（禁用内置进度条，使用自定义进度输出）
         print("\n[TRAIN] Starting training...")
+        print(f"[INFO] Total timesteps: {self.total_timesteps:,}")
+        print(f"[INFO] Parallel environments: {self.num_envs}")
+        print(f"[INFO] Updates per rollout: {self.n_steps}")
+
         model.learn(
             total_timesteps=self.total_timesteps,
             callback=callbacks,
-            progress_bar=True
+            progress_bar=False  # 禁用内置进度条，使用自定义回调
         )
 
         # 保存最终模型（使用配置文件中指定的路径）
@@ -759,9 +791,10 @@ class Phase2PPOTrainer:
 class Phase3ConstrainedOptimizer:
     """Phase 3: 拉格朗日约束优化"""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], enhanced_manager: EnhancedTrainingManager = None):
         self.config = config
         self.device = get_device()
+        self.enhanced_manager = enhanced_manager or EnhancedTrainingManager(config)
 
         base_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
         self.checkpoint_dir = os.path.join(base_dir, 'phase3')
@@ -770,6 +803,7 @@ class Phase3ConstrainedOptimizer:
         phase3_config = config.get('training', {}).get('phase3', {})
         self.total_timesteps = phase3_config.get('total_timesteps', 100000)
         self.num_envs = phase3_config.get('num_envs', 4)
+        self.n_steps = phase3_config.get('n_steps', 2048)
 
     def train(self, phase2_checkpoint: str) -> str:
         """训练拉格朗日优化模型"""
@@ -808,11 +842,16 @@ class Phase3ConstrainedOptimizer:
         # 训练
         callbacks = self._create_callbacks()
 
+        # 训练（禁用内置进度条，使用自定义进度输出）
         print("\n[TRAIN] Starting training...")
+        print(f"[INFO] Total timesteps: {self.total_timesteps:,}")
+        print(f"[INFO] Parallel environments: {self.num_envs}")
+        print(f"[INFO] Updates per rollout: {self.n_steps}")
+
         model.learn(
             total_timesteps=self.total_timesteps,
             callback=callbacks,
-            progress_bar=True
+            progress_bar=False  # 禁用内置进度条
         )
 
         # 保存
@@ -863,6 +902,13 @@ class Phase3ConstrainedOptimizer:
             save_replay_buffer=False
         )
         callbacks.append(checkpoint_callback)
+
+        # 添加增强训练回调（包含进度输出）
+        enhanced_callback = EnhancedTrainingCallback(
+            enhanced_manager=self.enhanced_manager,
+            verbose=1
+        )
+        callbacks.append(enhanced_callback)
 
         return callbacks
 
@@ -1260,7 +1306,7 @@ def main():
             print("[PHASE 3] 端到端微调 - 联合优化所有模块")
             print(f"{'='*80}")
 
-            trainer3 = Phase3ConstrainedOptimizer(config)
+            trainer3 = Phase3ConstrainedOptimizer(config, enhanced_manager)
             trainer3.train(phase2_checkpoint=phase2_checkpoint)
 
             # 自动保存Phase 3权重

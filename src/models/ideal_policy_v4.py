@@ -29,6 +29,25 @@ from .v4_architecture import (
 )
 
 
+# =============================================================================
+# 工具函数
+# =============================================================================
+
+def safe_item(tensor: torch.Tensor) -> int:
+    """
+    安全地从张量中提取标量值，处理空张量情况
+
+    Args:
+        tensor: 输入张量
+
+    Returns:
+        张量的标量值，如果张量为空则返回0
+    """
+    if tensor.numel() == 0:
+        return 0
+    return int(tensor.item())
+
+
 class IdealTrafficPolicyV4(ActorCriticPolicy):
     """
     理想交通策略 v4.0 - SB3 PPO 完全整合版
@@ -351,7 +370,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         if batch_size > 1:
             # Batch模式：使用第一个样本的图结构
             graph_data = features_dict['graph_data']
-            num_veh = int(features_dict['num_vehicles'][0].item())
+            num_veh = safe_item(features_dict['num_vehicles'][0])
             vehicle_ids = [f"veh_{i}" for i in range(num_veh)]
             is_icv = torch.zeros(self.max_vehicles, device=device)
             is_icv[:num_veh] = 1.0
@@ -361,7 +380,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         else:
             # 单样本模式
             graph_data = features_dict['graph_data']
-            num_veh = int(features_dict['num_vehicles'].item())
+            num_veh = safe_item(features_dict['num_vehicles'])
             vehicle_ids = [f"veh_{i}" for i in range(num_veh)]
             is_icv = torch.zeros(self.max_vehicles, device=device)
             is_icv[:num_veh] = 1.0
@@ -488,7 +507,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             importance = features_dict['importance_scores']
 
             # 确定实际车辆数
-            num_veh = int(features_dict['num_vehicles'].item())
+            num_veh = safe_item(features_dict['num_vehicles'])
 
             # 车辆ID列表（模拟）
             vehicle_ids = [f"veh_{i}" for i in range(num_veh)]
@@ -616,12 +635,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         graphs = []
 
         for b in range(batch_size):
-            # 检查张量是否为空
-            if num_vehicles[b].numel() == 0:
-                num_veh = 0
-            else:
-                num_veh = int(num_vehicles[b].item())
-
+            # 安全处理空张量
+            num_veh = safe_item(num_vehicles[b])
             states = vehicle_states[b, :num_veh]  # [num_veh, 9]
 
             if num_veh == 0:
