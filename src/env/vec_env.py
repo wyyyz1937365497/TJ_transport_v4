@@ -36,7 +36,8 @@ class ParallelSumoEnvs:
         num_envs: int = 4,
         base_port: Optional[int] = None,
         monitor_dir: Optional[str] = None,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        device: str = 'cuda'
     ):
         """
         初始化并行环境
@@ -47,9 +48,11 @@ class ParallelSumoEnvs:
             base_port: 起始端口（如果为None，从config读取）
             monitor_dir: 监控日志目录
             seed: 随机种子
+            device: GPU设备 ('cuda' or 'cpu')
         """
         self.config = config
         self._num_envs = num_envs  # 使用私有名称避免冲突
+        self.device = device  # 保存设备信息
         # 从config读取base_port，如果没有提供且config中也没有，使用默认值8813
         if base_port is None:
             base_port = config.get('environment', {}).get('port', 8813)
@@ -74,11 +77,12 @@ class ParallelSumoEnvs:
             # 每个环境使用不同端口
             port = self.base_port + rank * 10
 
-            # 创建环境
+            # 创建环境（GPU加速版）
             env = make_gym_env(
                 config=self.config,
                 port=port,
-                seed=seed
+                seed=seed,
+                device=self.device  # 传递设备参数
             )
 
             return env
@@ -185,7 +189,8 @@ def create_parallel_envs(
     num_envs: int = 4,
     base_port: Optional[int] = None,
     monitor_dir: Optional[str] = None,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    device: str = 'cuda'
 ) -> ParallelSumoEnvs:
     """
     创建并行SUMO环境的便捷函数
@@ -196,6 +201,7 @@ def create_parallel_envs(
         base_port: 起始端口（如果为None，从config读取）
         monitor_dir: 监控目录
         seed: 随机种子
+        device: GPU设备 ('cuda' or 'cpu')
 
     Returns:
         ParallelSumoEnvs实例
@@ -205,7 +211,8 @@ def create_parallel_envs(
         num_envs=num_envs,
         base_port=base_port,
         monitor_dir=monitor_dir,
-        seed=seed
+        seed=seed,
+        device=device
     )
 
 

@@ -9,12 +9,12 @@
 """
 
 import numpy as np
-import traci
+import torch
 from typing import Dict, List, Set, Any, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
 
-from .sumo_env import SumoEnvironment
+from .gpu_sumo_env import GPUSumoEnvironment
 
 # 导入优化的Frenet工具
 import sys
@@ -22,15 +22,16 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils.frenet_utils import get_frenet_system
 
 
-class CompetitionSumoEnv(SumoEnvironment):
+class CompetitionSumoEnv(GPUSumoEnvironment):
     """
-    比赛专用SUMO环境
+    比赛专用SUMO环境（GPU加速版）
 
     改进点：
     1. 车辆状态使用Frenet坐标系（s, d）
     2. 添加干预成本跟踪
     3. 奖励函数匹配比赛评价标准
     4. 添加吞吐量和通行时间统计
+    5. 使用Libsumo + GPU加速
     """
 
     def __init__(
@@ -38,9 +39,10 @@ class CompetitionSumoEnv(SumoEnvironment):
         config: Dict[str, Any],
         use_gui: bool = False,
         port: Optional[int] = None,
-        disable_port_retry: bool = False
+        disable_port_retry: bool = False,
+        device: str = 'cuda'
     ):
-        super().__init__(config, use_gui=use_gui, port=port, disable_port_retry=disable_port_retry)
+        super().__init__(config, use_gui=use_gui, port=port, device=device)
 
         # 读取比赛配置中的奖励权重
         competition_config = config.get('competition', {})
@@ -142,7 +144,7 @@ class CompetitionSumoEnv(SumoEnvironment):
 
     def _get_observation(self) -> Dict[str, Any]:
         """
-        获取观测（使用优化的Frenet坐标系）
+        获取观测（使用优化的Frenet坐标系 + GPU加速）
 
         返回的车辆状态包含：
         - s: 沿车道中心线的距离
@@ -153,42 +155,56 @@ class CompetitionSumoEnv(SumoEnvironment):
         - in_bottleneck: 是否在瓶颈区域
         - edge_id: 边ID
         """
-        all_vehicle_ids = traci.vehicle.getIDList()
+        # 导入traci（可能是libsumo）
+        try:
+            import libsumo as traci_lib
+        except ImportError:
+            import traci as traci_lib
+
+        all_vehicle_ids = traci_lib.vehicle.getIDList()
         vehicle_states = {}
         valid_vehicle_ids = []
-        icv_ids = set()
 
-        # 选择ICV
+        # 使用GPU选择ICV（如果可用）
         control_ratio = self.config.get('control_ratio', 0.25)
         num_icv = max(1, int(len(all_vehicle_ids) * control_ratio))
 
+        icv_ids = set()
         if len(all_vehicle_ids) > 0:
-            icv_indices = np.random.choice(
-                len(all_vehicle_ids),
-                size=min(num_icv, len(all_vehicle_ids)),
-                replace=False
-            )
-            icv_ids = {all_vehicle_ids[i] for i in icv_indices}
+            # 使用GPU进行随机采样（如果可用）
+            if torch.cuda.is_available() and self.device.type == 'cuda':
+                icv_indices = torch.randperm(
+                    len(all_vehicle_ids),
+                    device=self.device
+                )[:num_icv]
+                icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
+            else:
+                icv_indices = np.random.choice(
+                    len(all_vehicle_ids),
+                    size=min(num_icv, len(all_vehicle_ids)),
+                    replace=False
+                )
+                icv_ids = {all_vehicle_ids[i] for i in icv_indices}
 
-        # ========== 优化: 使用TraCI订阅批量获取车辆状态 ==========
+        # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
         if len(all_vehicle_ids) > 0:
             # 定义要订阅的变量（使用traci.constants中的常量ID）
             var_list = [
-                traci.constants.VAR_SPEED,        # 0x40 - 速度
-                traci.constants.VAR_ACCELERATION,  # 0x72 - 加速度
-                traci.constants.VAR_ANGLE,        # 0x43 - 角度
-                traci.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
-                traci.constants.VAR_POSITION,     # 0x42 - 位置
-                traci.constants.VAR_LANE_ID       # 0x51 - 车道ID
+                traci_lib.constants.VAR_SPEED,        # 0x40 - 速度
+                traci_lib.constants.VAR_ACCELERATION,  # 0x72 - 加速度
+                traci_lib.constants.VAR_ANGLE,        # 0x43 - 角度
+                traci_lib.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
+                traci_lib.constants.VAR_POSITION,     # 0x42 - 位置
+                traci_lib.constants.VAR_LANE_ID       # 0x51 - 车道ID
             ]
 
-            # 批量订阅
+            # 批量订阅（Libsumo直接调用，无TCP开销）
             for veh_id in all_vehicle_ids:
-                traci.vehicle.subscribe(veh_id, var_list)
+                traci_lib.vehicle.subscribe(veh_id, var_list)
 
             # 一次性获取所有车辆的订阅数据
-            all_subscription_results = traci.vehicle.getAllSubscriptionResults()
+            all_subscription_results = traci_lib.vehicle.getAllSubscriptionResults()
         else:
             all_subscription_results = {}
 
@@ -198,21 +214,20 @@ class CompetitionSumoEnv(SumoEnvironment):
                 # 从订阅结果中获取数据（避免单独的TraCI调用）
                 if veh_id in all_subscription_results:
                     sub_data = all_subscription_results[veh_id]
-                    speed = sub_data.get(traci.constants.VAR_SPEED, 0.0)                     # VAR_SPEED (0x40)
-                    acceleration = sub_data.get(traci.constants.VAR_ACCELERATION, 0.0)       # VAR_ACCELERATION (0x72)
-                    angle = sub_data.get(traci.constants.VAR_ANGLE, 0.0)                     # VAR_ANGLE (0x43)
-                    lane_index = sub_data.get(traci.constants.VAR_LANE_INDEX, 0)             # VAR_LANE_INDEX (0x52)
-                    x, y = sub_data.get(traci.constants.VAR_POSITION, (0.0, 0.0))           # VAR_POSITION (0x42)
-                    lane_id = sub_data.get(traci.constants.VAR_LANE_ID, "")                  # VAR_LANE_ID (0x51)
+                    speed = sub_data.get(traci_lib.constants.VAR_SPEED, 0.0)                     # VAR_SPEED (0x40)
+                    acceleration = sub_data.get(traci_lib.constants.VAR_ACCELERATION, 0.0)       # VAR_ACCELERATION (0x72)
+                    angle = sub_data.get(traci_lib.constants.VAR_ANGLE, 0.0)                     # VAR_ANGLE (0x43)
+                    lane_index = sub_data.get(traci_lib.constants.VAR_LANE_INDEX, 0)             # VAR_LANE_INDEX (0x52)
+                    x, y = sub_data.get(traci_lib.constants.VAR_POSITION, (0.0, 0.0))           # VAR_POSITION (0x42)
+                    lane_id = sub_data.get(traci_lib.constants.VAR_LANE_ID, "")                  # VAR_LANE_ID (0x51)
                 else:
-                    # 订阅失败不应该发生，如果发生说明批量订阅有问题
-                    # 这是一个严重问题，会显著降低性能（慢5倍）
+                    # Libsumo订阅失败不应该发生
                     raise RuntimeError(
-                        f"[X] TraCI批量订阅失败，车辆 {veh_id} 不在订阅结果中。\n"
-                        f"   这会导致回退到逐个TraCI调用，性能降低约5倍。\n"
+                        f"[X] Libsumo批量订阅失败，车辆 {veh_id} 不在订阅结果中。\n"
+                        f"   这会导致性能严重下降。\n"
                         f"   当前订阅车辆数: {len(all_vehicle_ids)}\n"
                         f"   订阅结果车辆数: {len(all_subscription_results)}\n"
-                        f"   请检查TraCI订阅配置和SUMO版本兼容性。"
+                        f"   请检查Libsumo配置和SUMO版本兼容性。"
                     )
 
                 # 提取edge_id
@@ -234,9 +249,8 @@ class CompetitionSumoEnv(SumoEnvironment):
                     in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
                 else:
                     # 使用简化的Frenet坐标(SUMO原生)
-                    # 注意：这里仍然需要单独调用，但已经比之前少很多
-                    s = traci.vehicle.getLanePosition(veh_id)
-                    d = traci.vehicle.getLateralLanePosition(veh_id)
+                    s = traci_lib.vehicle.getLanePosition(veh_id)
+                    d = traci_lib.vehicle.getLateralLanePosition(veh_id)
                     heading_at_s = np.radians(self._get_lane_angle(lane_id))
                     in_bottleneck = False
 
@@ -260,8 +274,8 @@ class CompetitionSumoEnv(SumoEnvironment):
                     'lane_index': lane_index,
                     'angle': angle,
                     'edge_id': edge_id,
-                    'in_bottleneck': in_bottleneck,  # 新增:是否在瓶颈区域
-                    # 保留部分笛卡尔坐标用于调试（已经从订阅获取，无需重复调用）
+                    'in_bottleneck': in_bottleneck,  # 是否在瓶颈区域
+                    # 保留部分笛卡尔坐标用于调试
                     'x': x,
                     'y': y
                 }
@@ -287,8 +301,14 @@ class CompetitionSumoEnv(SumoEnvironment):
     def _get_lane_angle(self, lane_id: str) -> float:
         """获取车道的航向角"""
         try:
+            # 导入traci（可能是libsumo）
+            try:
+                import libsumo as traci_lib
+            except ImportError:
+                import traci as traci_lib
+
             edge_id = lane_id.split('_')[0]
-            angle = traci.edge.getAngle(edge_id)
+            angle = traci_lib.edge.getAngle(edge_id)
             return angle
         except:
             return 0.0
@@ -350,13 +370,19 @@ class CompetitionSumoEnv(SumoEnvironment):
         if not actions:
             return
 
+        # 导入traci（可能是libsumo）
+        try:
+            import libsumo as traci_lib
+        except ImportError:
+            import traci as traci_lib
+
         for veh_id, action in actions.items():
-            if veh_id not in traci.vehicle.getIDList():
+            if veh_id not in traci_lib.vehicle.getIDList():
                 continue
 
             try:
-                old_accel = traci.vehicle.getAcceleration(veh_id)
-                old_lane = traci.vehicle.getLaneIndex(veh_id)
+                old_accel = traci_lib.vehicle.getAcceleration(veh_id)
+                old_lane = traci_lib.vehicle.getLaneIndex(veh_id)
 
                 # 加速度变化
                 accel_change = abs(action[0] - old_accel)
@@ -372,7 +398,7 @@ class CompetitionSumoEnv(SumoEnvironment):
 
                 # 能耗估计（简化版）
                 # 能耗 ≈ 速度 × 加速度（正加速度消耗能量）
-                speed = traci.vehicle.getSpeed(veh_id)
+                speed = traci_lib.vehicle.getSpeed(veh_id)
                 if action[0] > 0:
                     self.intervention_stats['energy_consumption'] += speed * action[0] * 0.1  # dt=0.1s
 

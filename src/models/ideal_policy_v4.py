@@ -563,8 +563,38 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         fused = torch.cat([node_embeddings, z_flow, z_risk], dim=-1)
 
-        # 简化：平均池化
-        pooled = fused.mean(dim=0, keepdim=True)
+        # 优化：基于Frenet坐标的注意力池化
+        # 前提：需要获取原始vehicle_states来计算注意力权重
+        if 'vehicle_states' in features_dict:
+            vehicle_states = features_dict['vehicle_states'][:self.max_vehicles]
+            # 特征索引: [s, d, vs, vd, speed, accel, lane, angle, is_icv]
+            s = vehicle_states[:, 0]      # 纵向位置（归一化）
+            speed = vehicle_states[:, 4]  # 速度（归一化）
+            is_icv = vehicle_states[:, 8]  # ICV标志
+
+            # 注意力权重计算：
+            # 1. 前方车辆权重更高（s越大，权重越高）
+            # 2. 速度快的车辆权重更高
+            # 3. ICV车辆权重略高（因为可控）
+            attention_scores = torch.zeros_like(s)
+
+            # 前方重要性（s坐标：前方为正，权重高）
+            attention_scores += s * 2.0
+
+            # 速度重要性
+            attention_scores += speed * 1.0
+
+            # ICV重要性
+            attention_scores += is_icv * 0.5
+
+            # Softmax归一化
+            attention_weights = F.softmax(attention_scores, dim=0)
+
+            # 加权池化
+            pooled = (fused * attention_weights.unsqueeze(-1)).sum(dim=0, keepdim=True)
+        else:
+            # 回退到简单平均池化（如果没有vehicle_states）
+            pooled = fused.mean(dim=0, keepdim=True)
 
         cost_values = self.cost_critic(pooled)
         return cost_values
@@ -687,13 +717,16 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         vehicle_states: torch.Tensor
     ) -> torch.Tensor:
         """
-        计算风险特征（空间感知版本）
+        计算风险特征（基于Frenet坐标的精确版本）
+
+        TTC (Time To Collision): 纵向距离 / 相对速度（仅当追赶前车时）
+        THW (Time Headway): 纵向距离 / 自车速度
 
         Args:
-            vehicle_states: [N, 9]
+            vehicle_states: [N, 9] - [s, d, vs, vd, speed, accel, lane, angle, is_icv]
 
         Returns:
-            risk_features: [N, 2]
+            risk_features: [N, 2] - [ttc_inv, thw_inv]
         """
         N = vehicle_states.size(0)
 
@@ -701,15 +734,59 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             return torch.zeros(0, 2, device=vehicle_states.device)
 
         # 特征索引: [s, d, vs, vd, speed, accel, lane, angle, is_icv]
-        speed = vehicle_states[:, 4].clamp(min=0.1)  # 避免除零
+        s = vehicle_states[:, 0] * 1000.0  # 反归一化：纵向位置(m)
+        d = vehicle_states[:, 1] * 10.0    # 反归一化：横向偏移(m)
+        vs = vehicle_states[:, 2] * 30.0   # 反归一化：纵向速度(m/s)
+        speed = vehicle_states[:, 4] * 30.0.clamp(min=0.1)  # 反归一化：总速度(m/s)
+        lane = vehicle_states[:, 6]        # 车道索引
 
-        # 简化TTC计算（基于速度）
-        # TTC ~ 1 / (速度 + epsilon)
-        ttc_inv = 1.0 / (speed + 0.1)
+        ttc_inv = torch.zeros(N, device=vehicle_states.device)
+        thw_inv = torch.zeros(N, device=vehicle_states.device)
 
-        # 简化THW计算
-        # THW ~ 1 / (速度 * 安全距离因子)
-        thw_inv = 1.0 / (speed * 2.0 + 0.1)
+        # 为每辆车找到同车道的前车（基于Frenet坐标）
+        for i in range(N):
+            # 同车道且不是自己
+            same_lane = (lane == lane[i]) & (torch.arange(N, device=vehicle_states.device) != i)
+
+            # 在前面的车辆
+            ahead = same_lane & (s > s[i])
+
+            if ahead.any():
+                # 计算所有前车的纵向距离
+                ahead_distances = s[ahead] - s[i]
+
+                # 找最近的前车
+                nearest_ahead_idx = torch.argmin(ahead_distances)
+                ahead_mask = torch.where(ahead)[0]
+
+                if len(ahead_mask) > 0:
+                    nearest_ahead = ahead_mask[nearest_ahead_idx]
+
+                    # 纵向距离（gap）
+                    s_gap = ahead_distances[nearest_ahead_idx].item()
+
+                    # 前车和自车的纵向速度
+                    vs_front = vs[nearest_ahead]
+                    vs_self = vs[i]
+
+                    # TTC计算：纵向距离 / 相对速度
+                    # 只有当自车速度 > 前车速度（追赶）时才有碰撞风险
+                    vs_diff = vs_self - vs_front
+
+                    if vs_diff > 0.1:  # 正在追赶前车
+                        ttc = s_gap / vs_diff
+                        ttc_inv[i] = 1.0 / (ttc + 0.1)  # 避免除零
+                    else:
+                        # 没有追尾风险（自车慢于或等于前车速度）
+                        ttc_inv[i] = 0.0
+
+                    # THW计算：纵向距离 / 自车速度
+                    thw = s_gap / speed[i]
+                    thw_inv[i] = 1.0 / (thw + 0.1)  # 避免除零
+            else:
+                # 前面没有车，风险低
+                ttc_inv[i] = 0.0
+                thw_inv[i] = 0.0
 
         risk_features = torch.stack([ttc_inv, thw_inv], dim=-1)
 
@@ -746,13 +823,27 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         # 为每辆车找到最近的邻居
         for i in range(num_veh):
-            # 计算与其他车辆的距离
+            # 计算与其他车辆的Frenet距离
             s_diff = s - s[i]
             d_diff = d - d[i]
             lane_diff = lane - lane[i]
 
-            # 欧氏距离（简化）
-            distances = torch.sqrt(s_diff**2 + d_diff**2)
+            # Frenet坐标系的原生距离度量
+            # 纵向距离（沿车道）
+            s_distance = torch.abs(s_diff)
+
+            # 横向距离（考虑车道宽度）
+            # d_diff: 同车道的横向偏移差
+            # lane_diff * 3.5: 不同车道间的距离（标准车道宽度约3.5m）
+            d_distance = torch.abs(d_diff) + torch.abs(lane_diff) * 3.5
+
+            # Frenet加权距离（纵向更重要）
+            # 纵向权重: 1.0（主要影响交互）
+            # 横向权重: 0.3（次要影响，不同车道距离远）
+            distances = torch.sqrt(
+                (s_distance * 1.0)**2 +
+                (d_distance * 0.3)**2
+            )
 
             # 找到交互半径内的邻居（排除自己）
             mask = (distances < self.interaction_radius) & (distances > 0.1)

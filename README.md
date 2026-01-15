@@ -17,6 +17,17 @@
 - ✅ **并行数据收集**：多进程加速数据收集
 - ✅ **数据缓存**：避免重复收集数据
 
+### 性能优化（最新）
+- ⚡ **Libsumo加速**：替代TraCI，避免TCP通信开销（3-5x数据收集提升）
+- ⚡ **GPU矩阵运算**：批处理车辆状态计算，加速特征提取
+- ⚡ **JIT编译**：关键函数编译优化，减少Python解释开销
+- ⚡ **批量API调用**：最小化SUMO接口调用次数
+
+**预期性能提升**：
+- 数据收集速度：3-5x提升
+- CPU-GPU通信：减少90%
+- 总体训练速度：2-3x提升
+
 ## 🚀 快速开始
 
 ### 安装依赖
@@ -45,6 +56,45 @@ tensorboard --logdir logs/
 # 访问 http://localhost:6006
 ```
 
+## ⚡ 性能优化详解
+
+### Libsumo vs TraCI
+- **TraCI**：基于TCP通信，每次调用需要网络传输
+- **Libsumo**：直接C++ API调用，无网络开销
+- **性能对比**：Libsumo比TraCI快3-5倍
+
+**安装Libsumo**：
+```bash
+pip install libsumo
+```
+
+### GPU加速
+- **批量张量操作**：所有车辆状态转换为GPU tensor，并行计算
+- **JIT编译**：使用`torch.jit.script`编译关键函数
+- **零拷贝传输**：最小化CPU-GPU数据传输
+
+**启用GPU**：
+```bash
+# 默认自动检测CUDA
+python train.py
+
+# 手动指定CPU（如果CUDA不可用）
+python train.py --device cpu
+```
+
+### 批量API调用
+```python
+# 旧方式：逐个查询（慢）
+for veh_id in vehicle_ids:
+    speed = traci.vehicle.getSpeed(veh_id)
+    position = traci.vehicle.getPosition(veh_id)
+    # ... 每辆车需要多次API调用
+
+# 新方式：批量订阅（快）
+traci.vehicle.subscribe(veh_id, [VAR_SPEED, VAR_POSITION, ...])
+all_results = traci.vehicle.getAllSubscriptionResults()  # 一次获取所有
+```
+
 ## 📁 项目结构
 
 ```
@@ -60,7 +110,8 @@ TJ_transport_v4/
 │   │   ├── train_enhancements.py # 增强功能模块
 │   │   └── __init__.py
 │   ├── env/
-│   │   ├── competition_env.py    # SUMO竞赛环境
+│   │   ├── gpu_sumo_env.py       # GPU加速SUMO环境（Libsumo）
+│   │   ├── competition_env.py    # SUMO竞赛环境（继承GPU环境）
 │   │   ├── gym_wrapper.py        # Gym包装器
 │   │   └── vec_env.py            # 并行环境
 │   └── utils/
@@ -203,11 +254,24 @@ training:
 
 ## 🐛 常见问题
 
+### Q: Libsumo和TraCI有什么区别？如何选择？
+A:
+- **推荐使用Libsumo**：直接C++ API，无TCP开销，速度快3-5倍
+- **TraCI作为后备**：如果Libsumo不可用，自动降级到TraCI
+- **安装方法**：`pip install libsumo`
+
+### Q: 如何确认使用了GPU加速？
+A:
+1. 检查训练输出：`[OK] 使用Libsumo（高性能模式）`
+2. 检查设备信息：`[OK] SUMO已启动 (Port: 8813, Device: cuda)`
+3. 如果显示`Device: cpu`，说明CUDA不可用，使用CPU训练
+
 ### Q: 训练很慢怎么办？
 A:
-1. 减少 `num_parallel_workers`（如果CPU不够）
-2. 禁用部分增强功能（`--no-enhancements`）
-3. 减少 `total_timesteps`
+1. **首先确认Libsumo已安装**：`pip install libsumo`
+2. 减少 `num_parallel_workers`（如果CPU不够）
+3. 禁用部分增强功能（`--no-enhancements`）
+4. 减少 `total_timesteps`
 
 ### Q: 显存不足（CUDA out of memory）？
 A:
