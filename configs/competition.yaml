@@ -116,8 +116,8 @@ training:
     total_timesteps: 200000  # 总训练步数
     num_envs: 16  # 并行环境数（优化：8 → 16）
     learning_rate: 3e-4
-    n_steps: 8192  # 每次更新收集的步数（优化：4096 → 8192）
-    batch_size: 2048  # PPO batch大小（优化：1024 → 2048）
+    n_steps: 4096  # 每次更新收集的步数（优化：2048 → 4096）
+    batch_size: 1024  # PPO batch大小（优化：512 → 1024）
     update_epochs: 10  # 每次更新的epoch数
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数

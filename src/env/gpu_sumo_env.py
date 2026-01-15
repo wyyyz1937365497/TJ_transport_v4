@@ -475,7 +475,7 @@ class GPUSumoEnvironment:
 
     def _convert_to_gpu_tensors(self, vehicle_data: Dict[str, Dict], vehicle_ids: List[str]) -> torch.Tensor:
         """
-        转换数据为GPU tensors（批量操作）- 优化版
+        转换数据为GPU tensors（批量操作）
 
         Returns:
             states_tensor: [N, 13] tensor on GPU
@@ -489,7 +489,7 @@ class GPUSumoEnvironment:
             - 11: acceleration (scalar)
             - 12: id_hash (vehicle_id的哈希，用于跟踪)
         """
-        if not vehicle_data or not vehicle_ids:
+        if not vehicle_data:
             return torch.zeros((0, 13), device=self.device)
 
         num_vehicles = len(vehicle_ids)
@@ -497,62 +497,26 @@ class GPUSumoEnvironment:
         # 预分配tensors（在GPU上）
         states_tensor = torch.zeros((num_vehicles, 13), device=self.device)
 
-        # 创建车辆ID到索引的映射
-        id_to_idx = {vid: i for i, vid in enumerate(vehicle_ids)}
+        for i, veh_id in enumerate(vehicle_ids):
+            if veh_id not in vehicle_data:
+                continue
 
-        # 收集有效的车辆数据
-        valid_data = [(id_to_idx[vid], data) for vid in vehicle_ids if vid in vehicle_data]
-        
-        if not valid_data:
-            return states_tensor
+            data = vehicle_data[veh_id]
 
-        # 提取数据
-        indices, data_list = zip(*valid_data)
-        
-        # 批量提取各个属性
-        positions = torch.tensor([[data['position'][0], data['position'][1]] 
-                                 for data in data_list], 
-                                 device=self.device, dtype=torch.float32)
-        
-        speeds = torch.tensor([data['speed'] for data in data_list], 
-                             device=self.device, dtype=torch.float32)
-        
-        angles = torch.tensor([data['angle'] for data in data_list], 
-                             device=self.device, dtype=torch.float32)
-        
-        lane_indices = torch.tensor([data['lane_index'] for data in data_list], 
-                                   device=self.device, dtype=torch.float32)
-        
-        lane_positions = torch.tensor([data['lane_position'] for data in data_list], 
-                                     device=self.device, dtype=torch.float32)
-        
-        accelerations = torch.tensor([data['acceleration'] for data in data_list], 
-                                    device=self.device, dtype=torch.float32)
-
-        # 向量化计算速度和加速度分量
-        cos_angles = torch.cos(torch.deg2rad(angles))
-        sin_angles = torch.sin(torch.deg2rad(angles))
-        
-        vx = speeds * cos_angles
-        vy = speeds * sin_angles
-        ax = accelerations * cos_angles
-        ay = accelerations * sin_angles
-        
-        # 批量填充tensor
-        valid_indices = torch.tensor(indices, device=self.device)
-        states_tensor[valid_indices, 0:2] = positions  # x, y
-        states_tensor[valid_indices, 2] = 0.0  # z
-        states_tensor[valid_indices, 3] = speeds  # speed
-        states_tensor[valid_indices, 4] = vx  # vx
-        states_tensor[valid_indices, 5] = vy  # vy
-        states_tensor[valid_indices, 6] = ax  # ax
-        states_tensor[valid_indices, 7] = ay  # ay
-        states_tensor[valid_indices, 8] = angles  # angle
-        states_tensor[valid_indices, 9] = lane_indices  # lane_index
-        states_tensor[valid_indices, 10] = lane_positions  # lane_position
-        states_tensor[valid_indices, 11] = accelerations  # acceleration
-        states_tensor[valid_indices, 12] = torch.tensor([hash(vid) % (2**31) for vid in [vehicle_ids[i] for i in indices]], 
-                                                      device=self.device, dtype=torch.float32)
+            # 填充数据
+            states_tensor[i, 0] = data['position'][0]  # x
+            states_tensor[i, 1] = data['position'][1]  # y
+            states_tensor[i, 2] = 0.0  # z
+            states_tensor[i, 3] = data['speed']  # speed
+            states_tensor[i, 4] = data['speed'] * np.cos(np.radians(data['angle']))  # vx
+            states_tensor[i, 5] = data['speed'] * np.sin(np.radians(data['angle']))  # vy
+            states_tensor[i, 6] = data['acceleration'] * np.cos(np.radians(data['angle']))  # ax
+            states_tensor[i, 7] = data['acceleration'] * np.sin(np.radians(data['angle']))  # ay
+            states_tensor[i, 8] = data['angle']  # angle
+            states_tensor[i, 9] = data['lane_index']  # lane_index
+            states_tensor[i, 10] = data['lane_position']  # lane_position
+            states_tensor[i, 11] = data['acceleration']  # acceleration (scalar)
+            states_tensor[i, 12] = hash(veh_id) % (2**31)  # id_hash
 
         return states_tensor
 

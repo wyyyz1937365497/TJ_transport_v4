@@ -787,7 +787,6 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
                 if valid_mask.any():
                     edge_index_filtered = edge_index_offset[:, valid_mask]
                     edge_attr_filtered = edge_attr[valid_mask]
-
                     all_edge_indices.append(edge_index_filtered)
                     all_edge_attrs.append(edge_attr_filtered)
 
@@ -877,7 +876,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         num_vehicles: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        构建边（完全向量化优化版本）
+        构建边（向量化优化版本）
 
         Returns:
             edge_index: [2, E]
@@ -922,30 +921,37 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         neighbor_mask = (distances < self.interaction_radius) & not_self  # [N, N]
 
         # ============== 限制最大邻居数 ==============
-        # 对每一行，找到最近的max_neighbors个邻居
-        # 首先将非邻居的距离设为无穷大
-        masked_distances = torch.where(neighbor_mask, distances, torch.tensor(float('inf'), device=device))
-        
-        # 为每一行找到最多max_neighbors个最近的邻居
-        k = min(self.max_neighbors, num_veh - 1)  # 确保k不超过可能的邻居数
-        topk_distances, topk_indices = torch.topk(masked_distances, 
-                                                  k=k, 
-                                                  largest=False, 
-                                                  sorted=False)
-        
-        # 创建有效邻居掩码
-        valid_neighbors = topk_distances < float('inf')
-        
-        # 创建源节点和目标节点列表
-        row_indices = torch.arange(num_veh, device=device).unsqueeze(1).expand(-1, k)
-        source_nodes = row_indices[valid_neighbors]
-        target_nodes = topk_indices[valid_neighbors]
-        
-        if source_nodes.numel() == 0:
+        # 对每个节点，选择最近的max_neighbors个邻居
+        sources_list = []
+        targets_list = []
+
+        for i in range(num_veh):
+            # 找到i的邻居
+            neighbors = torch.where(neighbor_mask[i])[0]
+
+            if len(neighbors) == 0:
+                continue
+
+            # 限制邻居数量
+            if len(neighbors) > self.max_neighbors:
+                # 根据距离排序，选择最近的
+                neighbor_distances = distances[i, neighbors]
+                _, topk_indices = torch.topk(neighbor_distances, self.max_neighbors, largest=False)
+                neighbors = neighbors[topk_indices]
+
+            # 添加边
+            sources_list.append(torch.full_like(neighbors, i, dtype=torch.long))
+            targets_list.append(neighbors)
+
+        if len(sources_list) == 0:
             return (
                 torch.empty((2, 0), dtype=torch.long, device=device),
                 torch.empty((0, 4), device=device)
             )
+
+        # 合并所有边
+        sources = torch.cat(sources_list)  # [E]
+        targets = torch.cat(targets_list)  # [E]
 
         # ============== 向量化计算边特征 ==============
         # 提取源节点和目标节点的状态
@@ -965,42 +971,55 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         return edge_index, edge_attr
 
+    def freeze_perception(self):
+        """冻结感知层（GNN）"""
+        for param in self.perception_layer.parameters():
+            param.requires_grad = False
+        print("[OK] Frozen perception layer (GNN)")
 
-def create_ideal_traffic_policy_v4(config: Dict[str, Any]):
+    def freeze_prediction(self):
+        """冻结预测层（World Model）"""
+        for param in self.prediction_layer.parameters():
+            param.requires_grad = False
+        print("[OK] Frozen prediction layer (World Model)")
+
+    def freeze_decision(self):
+        """冻结决策层（Controller）"""
+        for param in self.decision_layer.parameters():
+            param.requires_grad = False
+        print("[OK] Frozen decision layer (Controller)")
+
+    def unfreeze_all(self):
+        """解冻所有组件"""
+        for param in self.perception_layer.parameters():
+            param.requires_grad = True
+        for param in self.prediction_layer.parameters():
+            param.requires_grad = True
+        for param in self.decision_layer.parameters():
+            param.requires_grad = True
+        print("[OK] Unfrozen all components")
+
+    def set_top_k(self, k: int):
+        """设置Top-K值"""
+        self.top_k = k
+        self.decision_layer.top_k = k
+        print(f"[OK] Top-K set to: {k}")
+
+
+def create_ideal_traffic_policy_v4(config: Dict[str, Any]) -> type:
     """
-    创建理想交通策略v4
-    
+    创建理想交通策略v4.0的工厂函数
+
     Args:
         config: 配置字典
-        
-    Returns:
-        IdealTrafficPolicyV4: 策略实例
-    """
-    import gymnasium as gym
-    import numpy as np
-    
-    # 创建虚拟的observation_space和action_space
-    # 根据代码上下文，观测空间似乎是321维的扁平化观测
-    observation_space = gym.spaces.Box(
-        low=-np.inf, high=np.inf, 
-        shape=(321,), dtype=np.float32
-    )
-    
-    # 根据代码上下文，动作空间似乎是64维的连续动作
-    action_space = gym.spaces.Box(
-        low=-1, high=1, 
-        shape=(64,), dtype=np.float32
-    )
-    
-    # 创建一个简单的学习率调度函数
-    def lr_schedule(progress_remaining):
-        # 线性衰减调度
-        return progress_remaining * config.get('training', {}).get('phase2', {}).get('learning_rate', 3e-4)
-    
-    return IdealTrafficPolicyV4(
-        observation_space=observation_space,
-        action_space=action_space,
-        lr_schedule=lr_schedule,
-        config=config
-    )
 
+    Returns:
+        IdealTrafficPolicyV4 类
+    """
+
+    class PolicyClass(IdealTrafficPolicyV4):
+        pass
+
+    PolicyClass.config = config
+
+    return PolicyClass
