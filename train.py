@@ -165,13 +165,13 @@ class Phase1WorldModelTrainer:
         # 初始化训练指标记录器
         self.metrics = TrainingMetrics()
 
-        # Checkpoint目录
-        base_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
-        self.checkpoint_dir = os.path.join(base_dir, 'phase1')
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-
         # 配置
         phase1_config = config.get('training', {}).get('phase1', {})
+
+        # 检查点路径（使用配置文件中的路径）
+        self.model_path = phase1_config.get('phase1_model_path', 'checkpoints/competition/phase1/world_model_final.pth')
+        self.checkpoint_dir = os.path.dirname(self.model_path)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.num_episodes = phase1_config.get('num_episodes', 50)
         self.epochs = phase1_config.get('epochs', 30)
         self.batch_size = phase1_config.get('batch_size', 256)
@@ -340,8 +340,8 @@ class Phase1WorldModelTrainer:
         finally:
             progress.close()
 
-        # 保存最终模型
-        final_path = os.path.join(self.checkpoint_dir, 'final.pth')
+        # 保存最终模型（使用配置文件中指定的路径）
+        final_path = self.model_path
         model_state = self.gpu_manager.get_model_state_dict(model)
 
         torch.save({
@@ -351,6 +351,7 @@ class Phase1WorldModelTrainer:
         }, final_path)
 
         print(f"\n[DONE] Phase 1 complete!")
+        print(f"   Model: {final_path}")
 
         # 打印训练摘要
         self.metrics.print_summary()
@@ -612,11 +613,14 @@ class Phase2PPOTrainer:
         self.enhanced_manager = enhanced_manager
         self.device = get_device()
 
-        base_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
-        self.checkpoint_dir = os.path.join(base_dir, 'phase2')
+        # 配置
+        phase2_config = config.get('training', {}).get('phase2', {})
+
+        # 检查点路径（使用配置文件中的路径）
+        self.model_path = phase2_config.get('phase2_model_path', 'checkpoints/competition/phase2/shielded_ppo.zip')
+        self.checkpoint_dir = os.path.dirname(self.model_path)
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-        phase2_config = config.get('training', {}).get('phase2', {})
         self.total_timesteps = phase2_config.get('total_timesteps', 200000)
         self.num_envs = phase2_config.get('num_envs', 8)
 
@@ -697,16 +701,15 @@ class Phase2PPOTrainer:
             progress_bar=True
         )
 
-        # 保存
-        final_path = os.path.join(self.checkpoint_dir, 'final.zip')
-        model.save(final_path)
+        # 保存最终模型（使用配置文件中指定的路径）
+        model.save(self.model_path)
 
         print(f"\n[DONE] Phase 2 complete!")
-        print(f"   Model: {final_path}")
+        print(f"   Model: {self.model_path}")
 
         vec_env.close()
 
-        return final_path
+        return self.model_path
 
     def _load_phase1_weights(self, policy, checkpoint_path: str):
         """加载Phase 1权重"""
@@ -1154,36 +1157,119 @@ def main():
     print(f"  [OK] Prioritized Replay: ENABLED (default)")
     print(f"  [OK] Failure Bank: ENABLED (default)")
 
-    # 路径
-    checkpoint_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
-    phase1_path = os.path.join(checkpoint_dir, 'phase1/final.pth')
-    phase2_path = os.path.join(checkpoint_dir, 'phase2/final.zip')
+    # 创建检查点管理器
+    from src.training.checkpoint_manager import PhaseCheckpointManager
+
+    checkpoint_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints/competition')
+    checkpoint_manager = PhaseCheckpointManager(checkpoint_dir)
+
+    # 显示训练状态
+    checkpoint_manager.print_training_status()
+
+    # 询问是否跳过已完成的阶段
+    skip_completed = False
+    if args.phase == 'all':
+        response = input("\n是否跳过已完成的阶段? (y/n, 默认: y): ").strip().lower()
+        skip_completed = response != 'n'
 
     # 执行训练
     phase1_checkpoint = None
     phase2_checkpoint = None
 
+    # Phase 1: World Model预训练
     if args.phase in ['all', '1']:
-        trainer1 = Phase1WorldModelTrainer(config, enhanced_manager)
-        phase1_checkpoint = trainer1.train()
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase1')
 
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 1 已完成，跳过训练")
+            print(f"[LOAD] 使用已有检查点: {checkpoint_path}")
+            phase1_checkpoint = checkpoint_path
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 1] World Model预训练 - 学习交通动态模式")
+            print(f"{'='*80}")
+
+            trainer1 = Phase1WorldModelTrainer(config, enhanced_manager)
+            phase1_checkpoint = trainer1.train()
+
+            # 自动保存Phase 1权重
+            if phase1_checkpoint:
+                print(f"\n[SAVE] 保存 Phase 1 检查点...")
+                # 权重已在训练器内部保存，这里只是更新元数据
+                checkpoint_manager._save_metadata('phase1', {
+                    'status': 'completed',
+                    'num_episodes': config.get('training', {}).get('phase1', {}).get('num_episodes', 50)
+                })
+                print(f"[OK] Phase 1 检查点已保存")
+
+    # Phase 2: PPO策略训练
     if args.phase in ['all', '2']:
-        if not phase1_checkpoint and os.path.exists(phase1_path):
-            phase1_checkpoint = phase1_path
+        # 确保有Phase 1检查点
+        if not phase1_checkpoint:
+            phase1_checkpoint = checkpoint_manager.get_checkpoint_path('phase1')
 
-        trainer2 = Phase2PPOTrainer(config, enhanced_manager)
-        phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
+        if not phase1_checkpoint:
+            print(f"\n[ERROR] Phase 1 检查点不存在!")
+            print(f"[HINT] 请先运行 Phase 1: python train.py --phase 1")
+            return
+        else:
+            print(f"\n[LOAD] 使用 Phase 1 检查点: {phase1_checkpoint}")
 
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase2')
+
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 2 已完成，跳过训练")
+            print(f"[LOAD] 使用已有检查点: {checkpoint_path}")
+            phase2_checkpoint = checkpoint_path
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 2] PPO策略训练 - 学习控制策略")
+            print(f"{'='*80}")
+
+            trainer2 = Phase2PPOTrainer(config, enhanced_manager)
+            phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
+
+            # 自动保存Phase 2权重
+            if phase2_checkpoint:
+                print(f"\n[SAVE] 保存 Phase 2 检查点...")
+                checkpoint_manager._save_metadata('phase2', {
+                    'status': 'completed',
+                    'total_timesteps': config.get('training', {}).get('phase2', {}).get('total_timesteps', 200000)
+                })
+                print(f"[OK] Phase 2 检查点已保存")
+
+    # Phase 3: 端到端微调
     if args.phase in ['all', '3']:
-        if not phase2_checkpoint and os.path.exists(phase2_path):
-            phase2_checkpoint = phase2_path
+        # 确保有Phase 2检查点
+        if not phase2_checkpoint:
+            phase2_checkpoint = checkpoint_manager.get_checkpoint_path('phase2')
 
-        if phase2_checkpoint:
+        if not phase2_checkpoint:
+            print(f"\n[ERROR] Phase 2 检查点不存在!")
+            print(f"[HINT] 请先运行 Phase 2: python train.py --phase 2")
+            return
+        else:
+            print(f"\n[LOAD] 使用 Phase 2 检查点: {phase2_checkpoint}")
+
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase3')
+
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 3 已完成，跳过训练")
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 3] 端到端微调 - 联合优化所有模块")
+            print(f"{'='*80}")
+
             trainer3 = Phase3ConstrainedOptimizer(config)
             trainer3.train(phase2_checkpoint=phase2_checkpoint)
-        else:
-            print("\n[ERROR] Phase 2 checkpoint not found!")
-            print("[HINT] Please run Phase 2 first: python train.py --phase 2")
+
+            # 自动保存Phase 3权重
+            print(f"\n[SAVE] 保存 Phase 3 检查点...")
+            checkpoint_manager._save_metadata('phase3', {
+                'status': 'completed',
+                'total_timesteps': config.get('training', {}).get('phase3', {}).get('total_timesteps', 100000)
+            })
+            print(f"[OK] Phase 3 检查点已保存")
 
     print("\n" + "="*80)
     print("[SUCCESS] Training Pipeline Finished!")

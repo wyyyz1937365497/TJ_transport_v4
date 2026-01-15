@@ -616,7 +616,12 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         graphs = []
 
         for b in range(batch_size):
-            num_veh = int(num_vehicles[b].item())
+            # 检查张量是否为空
+            if num_vehicles[b].numel() == 0:
+                num_veh = 0
+            else:
+                num_veh = int(num_vehicles[b].item())
+
             states = vehicle_states[b, :num_veh]  # [num_veh, 9]
 
             if num_veh == 0:
