@@ -1,0 +1,197 @@
+# 增强训练配置文件 - 初赛阶段（含所有增强功能）
+# 配置文件包含：课程学习、优先经验回放、失败案例库
+
+# =============================================================================
+# 基础配置
+# =============================================================================
+device: cuda  # 或 cpu
+seed: 42
+
+# 路径配置
+paths:
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  tensorboard_dir: runs
+
+# =============================================================================
+# 环境配置
+# =============================================================================
+environment:
+  # SUMO配置
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初camp/sumo_config.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初camp/network.net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初camp/routes.rou.xml
+
+  # 基础参数（会被课程学习覆盖）
+  max_vehicles: 32
+  inflow_rate: 2000
+  icv_ratio: 0.25  # 智能车渗透率（25%，符合赛题）
+  max_steps: 3600
+  warmup_steps: 300
+
+  # 奖励配置
+  rewards:
+    speed_weight: 1.0
+    efficiency_weight: 2.0
+    safety_weight: 3.0
+    intervention_cost_weight: 1.5
+
+  # 扰动级别（0-1）
+  disturbance_level: 0.0
+
+# =============================================================================
+# 模型配置 - v4.0架构
+# =============================================================================
+model:
+  # GNN配置
+  gnn:
+    node_dim: 9
+    edge_dim: 4
+    hidden_dim: 64
+    output_dim: 256
+    num_layers: 3
+    heads: 4
+    dropout: 0.1
+
+  # 世界模型配置
+  world_model:
+    hidden_dim: 128
+    latent_dim: 64
+    future_steps: 5
+    num_layers: 2
+    dropout: 0.1
+
+  # 控制器配置
+  controller:
+    global_dim: 32
+    hidden_dim: 128
+    action_dim: 2
+    top_k: 5  # 默认控制5辆车
+    dropout: 0.2
+
+  # 图构建配置
+  graph:
+    interaction_radius: 100.0  # 米
+    max_neighbors: 8
+
+  # 历史统计维度
+  history_dim: 32
+
+# =============================================================================
+# 训练配置（三阶段）
+# =============================================================================
+training:
+  # ========== 课程学习配置 ==========
+  curriculum:
+    enabled: true  # 启用课程学习
+    auto_advance: true  # 自动晋级
+    min_episodes_per_level: 50  # 每个级别最少训练episodes
+
+  # ========== 优先经验回放配置 ==========
+  prioritized_replay:
+    enabled: true  # 启用优先经验回放
+    capacity: 100000  # 缓冲区容量
+    alpha: 0.6  # 优先级指数（0=均匀，1=完全按优先级）
+    beta_start: 0.4  # 重要性采样初始值
+    beta_frames: 100000  # beta增长到1的帧数
+
+  # ========== 失败案例库配置 ==========
+  failure_bank:
+    enabled: true  # 启用失败案例库
+    max_size: 1000  # 最大存储案例数
+    auto_detect: true  # 自动检测失败
+    failure_sampling_ratio: 0.3  # 训练时失败案例占比（30%）
+
+  # ========== Phase 1: 世界模型预训练 ==========
+  phase1:
+    num_episodes: 50  # 数据收集episodes
+    epochs: 30  # 训练轮数
+    batch_size: 256
+    learning_rate: 1e-4
+    num_parallel_workers: 4
+    use_cache: true  # 使用数据缓存
+
+  # ========== Phase 2: 带安全屏障的PPO训练 ==========
+  phase2:
+    total_timesteps: 200000  # 总训练步数
+    num_envs: 8  # 并行环境数
+    learning_rate: 3e-4
+    n_steps: 2048  # 每次更新收集的步数
+    batch_size: 512
+    update_epochs: 10  # 每次更新的epoch数
+    gamma: 0.99  # 折扣因子
+    gae_lambda: 0.95  # GAE参数
+    clip_epsilon: 0.2  # PPO裁剪参数
+    entropy_coef: 0.01  # 熵系数
+    value_loss_coef: 0.5  # 价值损失系数
+    max_grad_norm: 0.5  # 梯度裁剪
+
+    # 增强功能集成
+    use_curriculum: true  # 使用课程学习
+    use_per: true  # 使用优先经验回放
+    use_failure_bank: true  # 使用失败案例库
+
+  # ========== Phase 3: 拉格朗日约束优化 ==========
+  phase3:
+    total_timesteps: 100000
+    num_envs: 4
+    learning_rate: 1e-4
+    n_steps: 2048
+    batch_size: 64
+    update_epochs: 10
+    cost_limit: 0.1  # 成本约束（干预率不超过10%）
+
+  # ========== Phase 4: 拉格朗日乘子配置 ==========
+  phase4:
+    lagrangian_multiplier_init: 0.1  # 初始拉格朗日乘子
+    lagrangian_lr: 0.01  # λ学习率
+    adaptive_penalty: true  # 自适应惩罚
+
+# =============================================================================
+# 评估配置
+# =============================================================================
+evaluation:
+  eval_freq: 10000  # 每10000步评估一次
+  n_eval_episodes: 10  # 评估episodes数
+
+  # 评估指标
+  metrics:
+    - avg_speed  # 平均速度
+    - throughput  # 通过量
+    - intervention_rate  # 干预率
+    - safety_score  # 安全评分
+    - total_reward  # 总奖励
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  tensorboard: true  # 启用TensorBoard
+  wandb: false  # 启用Weights & Biases
+  log_interval: 100  # 日志记录间隔
+
+  # 要记录的指标
+  metrics:
+    - episode_reward
+    - episode_length
+    - avg_speed
+    - intervention_rate
+    - curriculum_level
+    - replay_buffer_size
+    - failure_cases_count
+
+# =============================================================================
+# 高级配置（可选）
+# =============================================================================
+advanced:
+  # 混合精度训练
+  mixed_precision: false
+
+  # 梯度检查点（节省显存）
+  gradient_checkpointing: false
+
+  # 模型并行
+  model_parallel: false
+
+  # 自动混合精度（AMP）
+  amp: false
