@@ -646,7 +646,6 @@ class Phase2PPOTrainer:
         vec_env_wrapper = create_parallel_envs(
             config=env_config,
             num_envs=self.num_envs,
-            base_port=8813,
             seed=self.config.get('seed', 42)
         )
 
@@ -781,7 +780,6 @@ class Phase3ConstrainedOptimizer:
         vec_env_wrapper = create_parallel_envs(
             config=env_config,
             num_envs=self.num_envs,
-            base_port=9013,
             seed=self.config.get('seed', 42)
         )
 
@@ -875,11 +873,8 @@ def _collect_worker(worker_id: int, num_episodes: int, env_config: Dict, max_ste
     observations = []
     next_observations = []
 
-    base_port = 8813 + worker_id * 10
-
     for ep in range(num_episodes):
-        port = base_port + ep
-        env = CompetitionSumoEnv(env_config, port=port, use_gui=False)
+        env = CompetitionSumoEnv(env_config, use_gui=False)
 
         try:
             obs = env.reset()

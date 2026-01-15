@@ -84,13 +84,13 @@ model:
     top_k: 5           # 每步选择Top-5最具影响力的ICV车辆
     dropout: 0.2
 
-  # 双模式安全屏障（Safety Shield）
+  # 双模式安全屏障（Safety Shield）- 符合比赛车辆物理能力
   safety:
     ttc_threshold: 2.0      # 碰撞时间阈值（秒）- 2.0秒平衡安全和效率
     thw_threshold: 1.5      # 头车时间间隔阈值（秒）
-    max_accel: 2.0          # 最大加速度（m/s²）
-    max_decel: -3.0         # 最大减速度（m/s²）
-    emergency_decel: -5.0   # 紧急减速度（m/s²）
+    max_accel: 0.8          # 最大加速度（m/s²）- 匹配CV车辆accel=0.8
+    max_decel: -4.5         # 最大减速度（m/s²）- 匹配CV车辆decel=4.5
+    emergency_decel: -4.5   # 紧急减速度（m/s²）- 匹配CV车辆decel=4.5
 
   # 动态图构建
   graph:

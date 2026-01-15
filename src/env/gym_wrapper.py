@@ -40,7 +40,6 @@ class GymSumoEnv(gym.Env):
     def __init__(
         self,
         config: Dict[str, Any],
-        port: int = 8813,
         seed: Optional[int] = None,
         device: str = 'cuda'
     ):
@@ -49,23 +48,20 @@ class GymSumoEnv(gym.Env):
 
         Args:
             config: SUMO配置字典
-            port: SUMO端口（每个环境应使用不同端口）
             seed: 随机种子
             device: GPU设备 ('cuda' or 'cpu')
         """
         super().__init__()
 
-        # 创建底层SUMO环境（GPU加速版）
+        # 创建底层SUMO环境（GPU加速版，SUMO自动分配端口）
         self.sumo_env = SumoEnvironment(
             config=config,
             use_gui=False,
-            port=port,
-            device=device  # 传递设备参数
+            device=device
         )
 
         # 配置
         self.config = config
-        self.port = port
         self.device = device  # 保存设备信息
         self.max_steps = config.get('max_steps', DEFAULT_MAX_STEPS)
         self.step_length = config.get('step_length', DEFAULT_STEP_LENGTH)
@@ -257,7 +253,6 @@ class GymSumoEnv(gym.Env):
 
 def make_gym_env(
     config: Dict[str, Any],
-    port: int = 8813,
     seed: Optional[int] = None,
     device: str = 'cuda'
 ) -> GymSumoEnv:
@@ -268,11 +263,10 @@ def make_gym_env(
 
     Args:
         config: SUMO配置
-        port: SUMO端口
         seed: 随机种子
         device: GPU设备 ('cuda' or 'cpu')
 
     Returns:
         GymSumoEnv实例
     """
-    return GymSumoEnv(config=config, port=port, seed=seed, device=device)
+    return GymSumoEnv(config=config, seed=seed, device=device)

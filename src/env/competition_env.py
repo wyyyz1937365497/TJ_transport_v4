@@ -38,11 +38,9 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self,
         config: Dict[str, Any],
         use_gui: bool = False,
-        port: Optional[int] = None,
-        disable_port_retry: bool = False,
         device: str = 'cuda'
     ):
-        super().__init__(config, use_gui=use_gui, port=port, device=device)
+        super().__init__(config, use_gui=use_gui, device=device)
 
         # 读取比赛配置中的奖励权重
         competition_config = config.get('competition', {})

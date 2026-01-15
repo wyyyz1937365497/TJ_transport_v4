@@ -59,12 +59,10 @@ class GPUSumoEnvironment:
         self,
         config: Dict[str, Any],
         use_gui: bool = False,
-        port: Optional[int] = None,
         device: str = 'cuda'
     ):
         self.config = config
         self.use_gui = use_gui
-        self.port = port if port is not None else config.get('port', 8813)
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
         # SUMO配置
@@ -139,7 +137,7 @@ class GPUSumoEnvironment:
             return
 
         try:
-            traci.start(self.sumo_cmd, port=self.port)
+            traci.start(self.sumo_cmd)  # 不指定port，让SUMO自动分配
             self.is_connected = True
             self.current_step = 0
 
@@ -147,7 +145,7 @@ class GPUSumoEnvironment:
             for _ in range(10):
                 traci.simulationStep()
 
-            print(f"[OK] SUMO已启动 (Port: {self.port}, Device: {self.device})")
+            print(f"[OK] SUMO已启动 (Device: {self.device})")
 
         except Exception as e:
             raise RuntimeError(f"SUMO启动失败: {e}")
@@ -581,7 +579,7 @@ class GPUSumoEnvironment:
         # 获取仿真参数（在JIT编译函数之外）
         current_step = float(self.current_step)
         step_length = float(self.step_length)
-        max_steps = float(self.config.get('max_steps', 36000))
+        max_steps = float(self.config.get('max_steps', 3600))  # 修正：比赛规定1小时=3600秒
 
         # 调用JIT编译的函数
         return self._compute_global_stats_gpu_impl_jit(
@@ -741,7 +739,7 @@ class GPUSumoEnvironment:
 
     def _is_done(self) -> bool:
         """检查是否结束"""
-        if self.current_step >= self.config.get('max_steps', 36000):
+        if self.current_step >= self.config.get('max_steps', 3600):  # 修正：比赛规定1小时=3600秒
             return True
 
         try:
@@ -798,7 +796,6 @@ class GPUSumoEnvironment:
 def create_optimized_sumo_env(
     config: Dict[str, Any],
     use_gui: bool = False,
-    port: Optional[int] = None,
     device: str = 'cuda'
 ) -> GPUSumoEnvironment:
     """
@@ -807,7 +804,6 @@ def create_optimized_sumo_env(
     Args:
         config: 环境配置
         use_gui: 是否使用GUI
-        port: 端口
         device: 设备 ('cuda' or 'cpu')
 
     Returns:
@@ -816,6 +812,5 @@ def create_optimized_sumo_env(
     return GPUSumoEnvironment(
         config=config,
         use_gui=use_gui,
-        port=port,
         device=device
     )
