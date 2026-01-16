@@ -119,7 +119,7 @@ training:
     total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
     num_envs: 24  # 并行环境数（28 → 16，为大batch腾显存空间）
     learning_rate: 3e-4
-    n_steps: 16384  # 每次rollout的步数
+    n_steps: 2048  # 每次rollout的步数（16384 → 2048，避免过度超出目标）
     batch_size: 32768  # 批量大小（16384 → 32768，2倍提升，充分利用单GPU）
     update_epochs: 5  # 每次更新epoch数
     gamma: 0.99  # 折扣因子

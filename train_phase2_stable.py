@@ -107,7 +107,7 @@ CURRICULUM_LEVELS = [
 
 
 class EnhancedTrainingCallback(BaseCallback):
-    """增强训练回调 - 进度跟踪和时间统计"""
+    """增强训练回调 - 进度跟踪、时间统计和指标显示"""
 
     def __init__(self, enhanced_manager, total_timesteps, verbose=1):
         super().__init__(verbose)
@@ -116,48 +116,161 @@ class EnhancedTrainingCallback(BaseCallback):
         self.start_time = None
         self.last_print_time = None
         self.print_interval = 60  # 每60秒打印一次
+        self.last_log_len = 0  # 用于覆盖同一行输出
 
     def _on_training_start(self):
         """训练开始时记录时间"""
         self.start_time = time.time()
         self.last_print_time = self.start_time
         print(f"\n[TRAIN] Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[INFO] Monitoring {self.total_timesteps:,} timesteps...")
+        print()
 
     def _on_step(self):
         """每步调用"""
         if self.verbose == 0:
             return True
 
-        # 定期打印进度
+        # 强制停止逻辑：达到目标步数时立即停止
+        if self.num_timesteps >= self.total_timesteps:
+            print(f"\n[STOP] Target timesteps reached: {self.num_timesteps:,}/{self.total_timesteps:,}")
+            print(f"[INFO] Force stopping training to prevent overshoot...")
+            return False  # 返回False停止训练
+
+        # 定期打印进度和指标
         current_time = time.time()
         if current_time - self.last_print_time >= self.print_interval:
-            elapsed = current_time - self.start_time
-            progress = self.num_timesteps / self.total_timesteps * 100
-
-            # 计算ETA
-            if progress > 0:
-                remaining_time = elapsed * (100 - progress) / progress
-            else:
-                remaining_time = 0
-
-            # 格式化时间
-            elapsed_str = self._format_time(elapsed)
-            remaining_str = self._format_time(remaining_time)
-
-            # 打印进度
-            print(f"[PROGRESS] {self.num_timesteps:,}/{self.total_timesteps:,} steps ({progress:.1f}%) | "
-                  f"Elapsed: {elapsed_str} | ETA: {remaining_str}", flush=True)
-
+            self._print_training_metrics()
             self.last_print_time = current_time
 
         return True
 
+    def _print_training_metrics(self):
+        """打印训练指标"""
+        # 计算进度
+        progress = self.num_timesteps / self.total_timesteps * 100
+        elapsed = time.time() - self.start_time
+
+        # 计算ETA
+        if progress > 0:
+            remaining_time = elapsed * (100 - progress) / progress
+        else:
+            remaining_time = 0
+
+        # 格式化时间
+        elapsed_str = self._format_time(elapsed)
+        remaining_str = self._format_time(remaining_time)
+
+        # 打印进度条和基本信息
+        print()
+        print("=" * 80)
+        print(f"[PROGRESS] {self.num_timesteps:,}/{self.total_timesteps:,} steps ({progress:.1f}%)")
+        print(f"[TIME] Elapsed: {elapsed_str} | ETA: {remaining_str}")
+
+        # 获取并打印训练指标
+        if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
+            logs = self.model.logger.name_to_value
+
+            # 奖励相关指标
+            if 'rollout/ep_rew_mean' in logs:
+                ep_rew = logs['rollout/ep_rew_mean']
+                print(f"\n📊 REWARD METRICS:")
+                print(f"   • Mean Episode Reward: {ep_rew:.2f}")
+
+            if 'rollout/ep_len_mean' in logs:
+                ep_len = logs['rollout/ep_len_mean']
+                print(f"   • Mean Episode Length: {ep_len:.1f} steps")
+
+            # 损失相关指标
+            loss_metrics = ['train/value_loss', 'train/policy_gradient_loss', 'train/entropy_loss']
+            available_losses = [m for m in loss_metrics if m in logs]
+
+            if available_losses:
+                print(f"\n📉 LOSS METRICS:")
+                for metric in available_losses:
+                    value = logs[metric]
+                    metric_name = metric.split('/')[-1].replace('_', ' ').title()
+                    print(f"   • {metric_name}: {value:.6f}")
+
+            # 其他重要指标
+            other_metrics = {
+                'train/learning_rate': ('Learning Rate', '{:.2e}'),
+                'train/clip_fraction': ('Clip Fraction', '{:.3f}'),
+                'train/clip_range': ('Clip Range', '{:.4f}'),
+                'train/exploration_transition_progress': ('Exploration Progress', '{:.1%}'),
+                'train/entropy_loss': ('Entropy', '{:.4f}'),
+            }
+
+            available_other = [(k, v[0], v[1]) for k, v in other_metrics.items() if k in logs]
+
+            if available_other:
+                print(f"\n⚙️  TRAINING METRICS:")
+                for metric, name, fmt in available_other:
+                    value = logs[metric]
+                    print(f"   • {name}: {fmt.format(value)}")
+
+            # 性能指标
+            perf_metrics = {
+                'train/n_updates': ('Policy Updates', '{:d}'),
+                'train/n_episodes': ('Episodes', '{:d}'),
+            }
+
+            available_perf = [(k, v[0], v[1]) for k, v in perf_metrics.items() if k in logs]
+
+            if available_perf:
+                print(f"\n📈 PERFORMANCE METRICS:")
+                for metric, name, fmt in available_perf:
+                    value = logs[metric]
+                    print(f"   • {name}: {fmt.format(int(value))}")
+
+            # 训练速度
+            if elapsed > 0:
+                steps_per_sec = self.num_timesteps / elapsed
+                steps_per_hour = steps_per_sec * 3600
+                print(f"\n⚡ SPEED:")
+                print(f"   • {steps_per_sec:.1f} steps/sec")
+                print(f"   • {steps_per_hour:,.0f} steps/hour")
+
+        print("=" * 80)
+        print()
+
     def _on_training_end(self):
         """训练结束时处理"""
-        print()  # 换行
-        print(f"\n[DONE] Training completed at step {self.num_timesteps:,}")
+        print()
+        print("=" * 80)
+        print("[DONE] Training completed!")
+        print("=" * 80)
+
+        # 打印最终统计
+        print(f"\n📊 FINAL STATISTICS:")
+        print(f"   • Total Steps: {self.num_timesteps:,}")
+        print(f"   • Target Steps: {self.total_timesteps:,}")
+
         elapsed = time.time() - self.start_time
-        print(f"[TIME] Total training time: {self._format_time(elapsed)}")
+        print(f"   • Total Time: {self._format_time(elapsed)}")
+
+        if elapsed > 0:
+            steps_per_sec = self.num_timesteps / elapsed
+            print(f"   • Average Speed: {steps_per_sec:.1f} steps/sec")
+
+        # 打印最终指标
+        if hasattr(self.model, 'logger') and hasattr(self.model.logger, 'name_to_value'):
+            logs = self.model.logger.name_to_value
+
+            print(f"\n📈 FINAL METRICS:")
+
+            # 最终奖励
+            if 'rollout/ep_rew_mean' in logs:
+                print(f"   • Final Mean Reward: {logs['rollout/ep_rew_mean']:.2f}")
+
+            # 最终损失
+            if 'train/value_loss' in logs:
+                print(f"   • Final Value Loss: {logs['train/value_loss']:.6f}")
+
+            if 'train/policy_gradient_loss' in logs:
+                print(f"   • Final Policy Loss: {logs['train/policy_gradient_loss']:.6f}")
+
+        print()
 
     def _format_time(self, seconds):
         """格式化时间显示"""
