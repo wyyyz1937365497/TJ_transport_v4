@@ -46,6 +46,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 
 # 课程级别配置（与 CurriculumManager 中的定义一致）
+# 训练步数分配：前4个阶段各占6.3%，最后阶段（比赛环境）占剩余74.8%
 CURRICULUM_LEVELS = [
     {
         'level': 1,
@@ -55,7 +56,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 800,
         'icv_ratio': 0.3,
         'disturbance_level': 0.0,
-        'total_timesteps': 100000,  # 100k步
+        'total_timesteps': 126000,  # 6.3% = 126k步
         'checkpoint': 'checkpoints/competition/curriculum/level1/ppo.zip'
     },
     {
@@ -66,7 +67,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1200,
         'icv_ratio': 0.25,
         'disturbance_level': 0.2,
-        'total_timesteps': 200000,  # 200k步
+        'total_timesteps': 126000,  # 6.3% = 126k步
         'checkpoint': 'checkpoints/competition/curriculum/level2/ppo.zip'
     },
     {
@@ -77,7 +78,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1800,
         'icv_ratio': 0.25,
         'disturbance_level': 0.4,
-        'total_timesteps': 300000,  # 300k步
+        'total_timesteps': 126000,  # 6.3% = 126k步
         'checkpoint': 'checkpoints/competition/curriculum/level3/ppo.zip'
     },
     {
@@ -88,7 +89,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2400,
         'icv_ratio': 0.15,
         'disturbance_level': 0.7,
-        'total_timesteps': 400000,  # 400k步
+        'total_timesteps': 126000,  # 6.3% = 126k步
         'checkpoint': 'checkpoints/competition/curriculum/level4/ppo.zip'
     },
     {
@@ -99,7 +100,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2000,
         'icv_ratio': 0.25,
         'disturbance_level': 0.5,
-        'total_timesteps': 2000000,  # 2M步（比赛环境，充分训练）
+        'total_timesteps': 1496000,  # 74.8% = 1,496k步（比赛环境，充分训练）
         'checkpoint': 'checkpoints/competition/phase2/shielded_ppo.zip'  # 默认路径
     },
 ]

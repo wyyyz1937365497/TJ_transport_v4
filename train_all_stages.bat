@@ -31,7 +31,8 @@ FOR %%S IN (1 2 3 4 5) DO (
     IF %%S==1 (
         echo [INFO] Starting Stage 1 (Basic Scenario)
         python train_phase2_stable.py --stage %%S %PHASE1_CHECKPOINT%
-    ) ELSE (
+    )
+    IF NOT %%S==1 (
         echo [INFO] Starting Stage %%S, loading from previous stage
         python train_phase2_stable.py --stage %%S --prev-checkpoint !CHECKPOINT!
     )
