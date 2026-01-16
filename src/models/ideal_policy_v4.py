@@ -148,19 +148,35 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         self.config = config
         self.cfg_device = config.get('device', 'cuda')  # Store config device separately
 
+        # ========== GPU配置 ==========
+        # 检查配置文件中的device设置
+        device_config = config.get('device', 'cuda')
+        use_multi_gpu = False
+
+        # 只有明确指定multi_gpu=True时才启用多GPU
+        if isinstance(device_config, dict):
+            use_multi_gpu = device_config.get('multi_gpu', False)
+        # 字符串形式的'device: cuda'表示单GPU模式
+
         # ========== 双GPU配置 ==========
         # cuda:0 用于训练（主模型）
         # cuda:1 用于向量运算（风险特征、边构建等）
-        if torch.cuda.device_count() >= 2:
+        if use_multi_gpu and torch.cuda.device_count() >= 2:
             self.device_train = torch.device('cuda:0')  # 主训练设备
             self.device_compute = torch.device('cuda:1')  # 向量计算设备
             print(f"[GPU] 双GPU模式：训练=cuda:0, 计算=cuda:1")
         else:
-            self.device_train = self.device  # 单GPU回退
-            self.device_compute = self.device
-            if torch.cuda.device_count() == 1:
-                print(f"[GPU] 单GPU模式：所有计算使用cuda:0")
+            # 单GPU模式（默认）- 在调用super().__init__()之前创建设备
+            if torch.cuda.is_available():
+                self.device_train = torch.device('cuda:0')
+                self.device_compute = torch.device('cuda:0')
+                if torch.cuda.device_count() >= 2:
+                    print(f"[GPU] 单GPU模式：所有计算使用cuda:0（优化：避免跨设备通信）")
+                else:
+                    print(f"[GPU] 单GPU模式：所有计算使用cuda:0")
             else:
+                self.device_train = torch.device('cpu')
+                self.device_compute = torch.device('cpu')
                 print(f"[GPU] 使用CPU")
 
         # 调用父类初始化

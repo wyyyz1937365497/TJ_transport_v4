@@ -923,10 +923,15 @@ class Phase2PPOTrainer:
             current_level = self.enhanced_manager.curriculum.get_current_difficulty()
             print(f"[CURRICULUM] Level {current_level.level}: {current_level.name}")
 
+        # 明确传递device参数，确保使用GPU 0
+        device_str = str(self.device)  # 应该是 'cuda:0'
+        print(f"[ENV] Using device: {device_str} for all environments")
+
         vec_env_wrapper = create_parallel_envs(
             config=env_config,
             num_envs=self.num_envs,
-            seed=self.config.get('seed', 42)
+            seed=self.config.get('seed', 42),
+            device=device_str  # 明确传递 'cuda:0'
         )
 
         vec_env = vec_env_wrapper.vec_env
