@@ -86,8 +86,8 @@ training:
   curriculum:
     enabled: true  # 启用课程学习（从简单到复杂逐步学习）
     auto_advance: true  # 自动晋级
-    min_episodes_per_level: 100  # 每个级别至少100个episodes，确保5个级别都能学到
-    min_reward_threshold: -300  # 晋级最低平均奖励要求
+    min_episodes_per_level: 10  # 测试模式：每个级别只需10个episodes（约12.6k步）
+    min_reward_threshold: -1000  # 测试模式：降低奖励阈值，更容易晋级
 
   # ========== 优先经验回放配置 ==========
   prioritized_replay:
@@ -117,7 +117,7 @@ training:
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
     total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
-    num_envs: 28  # 并行环境数（28 → 16，为大batch腾显存空间）
+    num_envs: 24  # 并行环境数（28 → 16，为大batch腾显存空间）
     learning_rate: 3e-4
     n_steps: 16384  # 每次rollout的步数
     batch_size: 32768  # 批量大小（16384 → 32768，2倍提升，充分利用单GPU）

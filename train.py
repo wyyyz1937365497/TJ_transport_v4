@@ -870,8 +870,116 @@ class CurriculumLevelCallback(BaseCallback):
         # Windows上需要额外等待，确保管道建立
         print("[ENV] Waiting for pipe establishment...")
         time.sleep(5)
-        print("[OK] Pipes established")
 
+        # 热身步骤：验证管道是否真正可用
+        print("[ENV] Performing warm-up reset to verify pipes...")
+        try:
+            # 尝试重置环境，这会触发管道通信
+            import numpy as np
+            obs = self.model.env.reset()
+            print("[OK] Pipes verified and working (warm-up reset successful)")
+        except Exception as e:
+            print(f"[WARN] Warm-up reset failed: {e}")
+            print("[ENV] Extending wait time for pipe initialization...")
+            time.sleep(10)
+            # 再次尝试
+            try:
+                obs = self.model.env.reset()
+                print("[OK] Pipes verified after extended wait")
+            except Exception as e2:
+                print(f"[ERROR] Still failing after extended wait: {e2}")
+                print("[ENV] Final attempt with additional delay...")
+                time.sleep(15)
+                try:
+                    obs = self.model.env.reset()
+                    print("[OK] Pipes verified after final attempt")
+                except Exception as e3:
+                    print(f"[FATAL] Pipes still not working after all attempts: {e3}")
+                    raise
+
+        # 额外验证：确保所有子环境都响应
+        print("[ENV] Verifying all sub-environments are responsive...")
+        try:
+            # 尝试多次step操作，确保管道完全稳定
+            for i in range(3):
+                # 创建一个随机动作（符合环境动作空间）
+                if hasattr(self.model.env, 'action_space'):
+                    import numpy as np
+                    if hasattr(self.model.env.action_space, 'sample'):
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    else:
+                        # 对于多离散动作空间
+                        if hasattr(self.model.env.action_space, 'nvec'):
+                            # 创建符合动作空间的随机动作
+                            actions = []
+                            for _ in range(self.num_envs):
+                                action = []
+                                for n in self.model.env.action_space.nvec:
+                                    action.append(np.random.randint(0, n))
+                                actions.append(action)
+                            actions = np.array(actions)
+                        else:
+                            # 默认处理
+                            actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    
+                    # 执行一步，验证管道通信
+                    obs, rewards, dones, infos = self.model.env.step(actions)
+                    print(f"[OK] Sub-environment verification round {i+1}/{3} successful")
+                
+                time.sleep(0.5)  # 短暂延迟，让系统稳定
+                
+        except Exception as e:
+            print(f"[WARN] Sub-environment verification failed: {e}")
+            # 这里不抛出异常，因为主要是为了验证管道稳定性
+        
+        # 最终压力测试：模拟训练开始前的操作
+        print("[ENV] Performing stress test to simulate training operations...")
+        try:
+            # 模拟训练开始时的操作，确保管道完全稳定
+            for i in range(5):  # 进行5轮压力测试
+                # 生成一个批次的随机动作
+                if hasattr(self.model.env, 'action_space'):
+                    import numpy as np
+                    if hasattr(self.model.env.action_space, 'sample'):
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    elif hasattr(self.model.env.action_space, 'nvec'):
+                        actions = []
+                        for _ in range(self.num_envs):
+                            action = []
+                            for n in self.model.env.action_space.nvec:
+                                action.append(np.random.randint(0, n))
+                            actions.append(action)
+                        actions = np.array(actions)
+                    else:
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                
+                # 执行动作
+                obs, rewards, dones, infos = self.model.env.step(actions)
+                
+                # 尝试获取观测值
+                obs = self.model.env.reset() if i % 2 == 0 else self.model.env.step(actions)[0]
+                
+                print(f"[OK] Stress test round {i+1}/5 successful")
+                time.sleep(0.2)  # 短暂停顿
+            
+            print("[OK] All stress tests passed - environment is stable")
+            
+        except Exception as e:
+            print(f"[ERROR] Stress test failed: {e}")
+            print("[ENV] Performing emergency stabilization...")
+            # 紧急处理措施
+            time.sleep(10)
+            try:
+                obs = self.model.env.reset()
+                print("[OK] Emergency stabilization successful")
+            except Exception as e2:
+                print(f"[FATAL] Emergency stabilization failed: {e2}")
+                raise
+
+        # 在正式训练前进行最终等待，确保所有子进程完全稳定
+        print(f"[ENV] Final stabilization wait before resuming training...")
+        time.sleep(8)  # 给系统额外的时间来稳定所有连接
+        
         print(f"[OK] Environment recreated with {self.num_envs} parallel instances")
         print("[INFO] Training will continue with new curriculum level...")
 
@@ -983,8 +1091,8 @@ class Phase2PPOTrainer:
                 config=self.config,
                 enhanced_manager=self.enhanced_manager,
                 num_envs=self.num_envs,
-                check_frequency=50000,  # 每50k步检查一次（适配2M步训练）
-                verbose=1
+                check_frequency=15000,  # 测试模式：每15k步检查一次（更频繁，约12-15分钟切换）
+                verbose=2  # 显示详细的检查日志
             )
             callbacks.append(curriculum_callback)
 

@@ -35,19 +35,34 @@
 pip install -r requirements.txt
 ```
 
-### 训练模型
+### 训练模型（Phase 2）
+
+#### 方案A：固定环境训练（推荐，最快）
 ```bash
-# 完整训练（推荐）
+python train_phase2_stable.py
+```
+- **时间**：8小时完成
+- **特点**：直接在比赛环境训练
+
+#### 方案B：多阶段训练（最稳定）
+```bash
+train_all_stages.bat
+```
+- **时间**：30小时完成
+- **特点**：渐进式学习（Level 1 → Level 5）
+
+#### 完整训练流程（Phase 1 + 2 + 3）
+```bash
+# 完整训练
 python train.py
+
+# 单独训练某个阶段
+python train.py --phase 1  # 世界模型训练
+python train.py --phase 2  # PPO训练（不推荐，会BrokenPipeError）
+python train.py --phase 3  # 约束优化
 
 # 指定配置文件
 python train.py --config configs/competition.yaml
-
-# 单独训练某个阶段
-python train.py --phase 2
-
-# 禁用增强功能
-python train.py --no-enhancements
 ```
 
 ### 查看训练进度
@@ -55,6 +70,11 @@ python train.py --no-enhancements
 tensorboard --logdir logs/
 # 访问 http://localhost:6006
 ```
+
+### 📖 详细文档
+- **[QUICKSTART.md](QUICKSTART.md)** - 快速开始指南
+- **[TRAINING_GUIDE.md](TRAINING_GUIDE.md)** - 完整训练指南
+- **[PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)** - 项目结构说明
 
 ## ⚡ 性能优化详解
 
@@ -99,9 +119,18 @@ all_results = traci.vehicle.getAllSubscriptionResults()  # 一次获取所有
 
 ```
 TJ_transport_v4/
-├── train.py                      # 唯一训练入口
+├── README.md                     # 项目说明（本文档）
+├── QUICKSTART.md                 # 快速开始指南
+├── TRAINING_GUIDE.md             # 完整训练指南
+├── PROJECT_STRUCTURE.md          # 项目结构说明
+│
+├── train_phase2_stable.py        # Phase 2 主训练脚本 ⭐
+├── train.py                      # 完整训练流程（Phase 1+2+3）
+├── train_all_stages.bat          # 自动运行所有5个阶段
+│
 ├── configs/
 │   └── competition.yaml          # 默认配置（增强功能已启用）
+│
 ├── src/
 │   ├── models/
 │   │   ├── v4_architecture.py    # v4.0架构核心模块
@@ -111,15 +140,37 @@ TJ_transport_v4/
 │   │   └── __init__.py
 │   ├── env/
 │   │   ├── gpu_sumo_env.py       # GPU加速SUMO环境（Libsumo）
+│   │   ├── gpu_sumo_env_optimized.py  # 优化版GPU环境
 │   │   ├── competition_env.py    # SUMO竞赛环境（继承GPU环境）
 │   │   ├── gym_wrapper.py        # Gym包装器
 │   │   └── vec_env.py            # 并行环境
 │   └── utils/
 │       └── helpers.py            # 辅助函数
+│
 ├── checkpoints/                  # 模型检查点
+│   └── competition/
+│       ├── phase1/               # Phase 1 世界模型
+│       ├── phase2/               # Phase 2 PPO模型（固定环境）
+│       └── curriculum/           # 多阶段训练检查点
+│
 ├── logs/                         # TensorBoard日志
 └── 赛题.md                       # 赛题说明
 ```
+
+### 训练脚本说明
+
+| 脚本 | 用途 | 推荐度 |
+|------|------|--------|
+| **train_phase2_stable.py** | Phase 2 主训练脚本（固定环境 + 多阶段） | ⭐⭐⭐⭐⭐ |
+| **train.py** | 完整训练流程（Phase 1 + 2 + 3） | ⭐⭐⭐ |
+| **train_all_stages.bat** | 自动运行所有5个阶段 | ⭐⭐⭐⭐ |
+
+### 已删除的冗余脚本
+
+为保持项目可维护性，以下脚本已被删除：
+- ❌ `train_phase2.py` - 功能已被 `train_phase2_stable.py` 替代
+- ❌ `train_curriculum_stages.py` - 功能已被 `train_phase2_stable.py` 替代
+- ❌ `train_all_curriculum_stages.bat` - 已被 `train_all_stages.bat` 替代
 
 ## 🔧 配置说明
 

@@ -33,7 +33,11 @@
       "Bash(powershell:*)",
       "Bash(wmic:*)",
       "Bash(tasklist:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(if:*)",
+      "Bash(then cat README.md)",
+      "Bash(else echo \"FILE_NOT_EXIST\")",
+      "Bash(fi:*)"
     ]
   }
 }
