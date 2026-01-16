@@ -14,7 +14,7 @@ from typing import Dict, List, Set, Any, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
 
-from .gpu_sumo_env import GPUSumoEnvironment
+from .gpu_sumo_env_optimized import GPUSumoEnvironmentOptimized as GPUSumoEnvironment
 
 # 导入优化的Frenet工具
 import sys

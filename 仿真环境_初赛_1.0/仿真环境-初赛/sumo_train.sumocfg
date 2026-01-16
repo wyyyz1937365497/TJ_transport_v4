@@ -25,9 +25,6 @@ SUMO训练优化配置 - 仅优化性能参数，不改变物理行为
         <collision.stoptime value="5"/>
         <collision.check-junctions value="true"/>
         <collision.mingap-factor value="0"/>
-
-        <!-- 仅优化：禁用动态路由（routes.xml已固定，无需动态路由） -->
-        <disable-dynamic-rerouting value="true"/>
     </processing>
 
     <report>

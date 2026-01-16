@@ -29,7 +29,19 @@ class MultiGPUManager:
         self.config = config or {}
         self.use_cuda = torch.cuda.is_available()
         self.num_gpus = torch.cuda.device_count() if self.use_cuda else 0
-        self.multi_gpu = self.num_gpus > 1
+
+        # 检查配置文件中的device设置
+        device_config = self.config.get('device', 'cuda')
+        if isinstance(device_config, str):
+            # 如果是字符串（如'cuda'），使用单GPU
+            self.multi_gpu = False
+        elif isinstance(device_config, dict) and device_config.get('multi_gpu', False):
+            # 只有明确指定multi_gpu=True时才启用
+            self.multi_gpu = True
+        else:
+            # 默认使用单GPU
+            self.multi_gpu = False
+
         self.device = torch.device('cuda:0' if self.use_cuda else 'cpu')
 
         # 打印GPU信息
@@ -52,6 +64,10 @@ class MultiGPUManager:
                 print(f"  GPU {i}: {props.name}")
                 print(f"    Memory: {props.total_memory / 1024**3:.2f} GB")
                 print(f"    Compute Capability: {props.major}.{props.minor}")
+
+            if not self.multi_gpu and self.num_gpus > 1:
+                print(f"\n[INFO] Using single GPU mode (cuda:0) despite {self.num_gpus} GPUs available")
+                print(f"[INFO] This optimizes for speed by avoiding cross-GPU communication")
         print("="*60 + "\n")
 
     def wrap_model(self, model: nn.Module) -> nn.Module:

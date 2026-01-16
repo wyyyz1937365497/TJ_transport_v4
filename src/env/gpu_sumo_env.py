@@ -63,7 +63,15 @@ class GPUSumoEnvironment:
     ):
         self.config = config
         self.use_gui = use_gui
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+        # 确保使用单GPU（cuda:0）以避免多GPU通信开销
+        if torch.cuda.is_available():
+            if device == 'cuda':
+                self.device = torch.device('cuda:0')
+            else:
+                self.device = torch.device(device)
+        else:
+            self.device = torch.device('cpu')
 
         # SUMO配置
         self.sumo_cfg = config.get('sumo_config', config.get('sumo_cfg', ''))

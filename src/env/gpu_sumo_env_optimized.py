@@ -70,7 +70,16 @@ class GPUSumoEnvironmentOptimized:
     ):
         self.config = config
         self.use_gui = use_gui
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+        # 确保使用单GPU（cuda:0）以避免多GPU通信开销
+        if torch.cuda.is_available():
+            if device == 'cuda':
+                self.device = torch.device('cuda:0')
+            else:
+                self.device = torch.device(device)
+        else:
+            self.device = torch.device('cpu')
+
         self.use_subscription = use_subscription and LIBSUMO_AVAILABLE
 
         # SUMO配置
@@ -107,9 +116,11 @@ class GPUSumoEnvironmentOptimized:
     def _build_sumo_command(self):
         """构建SUMO命令"""
         if self.use_gui:
+            # GUI模式：使用sumo-gui
             sumo_binary = "sumo-gui"
         else:
-            sumo_binary = "sumo-gui" if LIBSUMO_AVAILABLE else "sumo"
+            # 非GUI模式：libsumo直接调用或使用sumo命令行
+            sumo_binary = "sumo"  # libsumo会自动处理
 
         cmd = [
             sumo_binary,
@@ -207,7 +218,13 @@ class GPUSumoEnvironmentOptimized:
             'ended_vehicles': set()
         }
 
-        return self._get_observation_optimized()
+        # 优先使用子类的_get_observation()（如果被覆盖），否则使用优化版本
+        if hasattr(self, '_get_observation') and '_get_observation' in type(self).__dict__:
+            # 子类覆盖了_get_observation()，使用它
+            return self._get_observation()
+        else:
+            # 使用订阅优化版本
+            return self._get_observation_optimized()
 
     def step(self, actions: Optional[Dict[str, torch.Tensor]] = None) -> tuple:
         """
@@ -243,8 +260,13 @@ class GPUSumoEnvironmentOptimized:
         except Exception:
             pass
 
-        # 获取观测（使用订阅优化）
-        observation = self._get_observation_optimized()
+        # 获取观测（优先使用子类覆盖的方法，否则使用订阅优化）
+        if hasattr(self, '_get_observation') and '_get_observation' in type(self).__dict__:
+            # 子类覆盖了_get_observation()，使用它
+            observation = self._get_observation()
+        else:
+            # 使用订阅优化版本
+            observation = self._get_observation_optimized()
 
         # 计算奖励
         reward = self._compute_reward_gpu(observation)
@@ -324,47 +346,21 @@ class GPUSumoEnvironmentOptimized:
             return self._create_empty_observation()
 
     def _convert_to_gpu_tensors(self, vehicle_states: Dict[str, Dict]) -> Dict[str, Any]:
-        """将车辆状态转换为GPU tensors"""
+        """
+        将车辆状态转换为GPU tensors
+
+        为了保持与CompetitionSumoEnv的兼容性，返回dict格式的vehicle_states，
+        而不是单一的GPU tensor。这样子类可以正常覆盖_get_observation()。
+        """
         if not vehicle_states:
             return self._create_empty_observation()
 
-        vehicle_ids = list(vehicle_states.keys())
-
-        # 批量构建tensor（优化：预分配内存）
-        num_vehicles = len(vehicle_ids)
-        states_tensor = torch.zeros((num_vehicles, 13), device=self.device)
-
-        for i, veh_id in enumerate(vehicle_ids):
-            state = vehicle_states[veh_id]
-
-            # 位置 (2)
-            pos = state.get('position', (0, 0))
-            states_tensor[i, 0] = pos[0]
-            states_tensor[i, 1] = pos[1]
-
-            # 速度 (3)
-            speed = state.get('speed', 0.0)
-            states_tensor[i, 2] = speed
-            angle = state.get('angle', 0.0)
-            angle_rad = np.radians(angle)
-            states_tensor[i, 3] = speed * np.cos(angle_rad)
-            states_tensor[i, 4] = speed * np.sin(angle_rad)
-
-            # 车道信息 (3)
-            states_tensor[i, 5] = state.get('lane_index', 0)
-            states_tensor[i, 6] = state.get('lane_position', 0.0)
-
-            # 加速度 (1)
-            states_tensor[i, 7] = state.get('acceleration', 0.0)
-
-            # 预留空间 (5)
-            # 可以用于：前车位置、速度等
-
+        # 保持原始dict格式，不转换为tensor
+        # 这样CompetitionSumoEnv可以正常覆盖处理
         return {
-            'vehicle_ids': vehicle_ids,
-            'num_vehicles': num_vehicles,
-            'vehicle_states': states_tensor,
-            'device': self.device
+            'vehicle_states': vehicle_states,  # 保持dict格式
+            'vehicle_ids': list(vehicle_states.keys()),
+            'num_vehicles': len(vehicle_states),
         }
 
     def _create_empty_observation(self) -> Dict[str, Any]:
@@ -372,8 +368,7 @@ class GPUSumoEnvironmentOptimized:
         return {
             'vehicle_ids': [],
             'num_vehicles': 0,
-            'vehicle_states': torch.zeros((0, 13), device=self.device),
-            'device': self.device
+            'vehicle_states': {}  # 保持dict格式
         }
 
     def _apply_actions_gpu(self, actions: Dict[str, torch.Tensor]):
@@ -438,11 +433,18 @@ class GPUSumoEnvironmentOptimized:
         if num_vehicles == 0:
             return 0.0
 
-        states = observation.get('vehicle_states', torch.zeros((0, 13), device=self.device))
+        vehicle_states = observation.get('vehicle_states', {})
 
-        # 平均速度（索引2）
-        avg_speed = states[:, 2].mean().item() if num_vehicles > 0 else 0.0
+        # 计算平均速度（从dict中提取）
+        total_speed = 0.0
+        count = 0
+        for state in vehicle_states.values():
+            if isinstance(state, dict):
+                speed = state.get('speed', 0.0)
+                total_speed += speed
+                count += 1
 
+        avg_speed = total_speed / count if count > 0 else 0.0
         return avg_speed
 
     def _is_done(self) -> bool:

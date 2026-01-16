@@ -4,7 +4,7 @@
 # =============================================================================
 # 基础配置
 # =============================================================================
-device: cuda  # 或 cpu
+device: cuda  # 单GPU训练（cuda:0），速度更快
 seed: 42
 
 # 路径配置
@@ -18,9 +18,8 @@ paths:
 # =============================================================================
 environment:
   # SUMO配置
-  # 训练时使用优化版本（sumo_fast.sumocfg）以加速训练
-  # 评估时切换回官方版本（sumo.sumocfg）以确保合规
-  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg  # 默认使用官方配置
+  # 使用优化后的训练配置（sumo_train.sumocfg）
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
   net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
   route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
 
@@ -87,7 +86,7 @@ training:
   curriculum:
     enabled: true  # 启用课程学习（从简单到复杂逐步学习）
     auto_advance: true  # 自动晋级
-    min_episodes_per_level: 5  # 每个级别最少训练rollouts
+    min_episodes_per_level: 100  # 每个级别至少100个episodes，确保5个级别都能学到
     min_reward_threshold: -300  # 晋级最低平均奖励要求
 
   # ========== 优先经验回放配置 ==========
@@ -111,18 +110,18 @@ training:
     epochs: 30  # 训练轮数
     batch_size: 256
     learning_rate: 1e-4
-    num_parallel_workers: 24
+    num_parallel_workers: 16
     use_cache: true  # 使用数据缓存
     use_curriculum: true  # 启用课程学习（从Level 1逐步晋级到Level 5）
 
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
-    total_timesteps: 200000  # 总训练步数
-    num_envs: 64  # 并行环境数（优化：32 → 64，最大化吞吐量）
+    total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
+    num_envs: 28  # 并行环境数（28 → 16，为大batch腾显存空间）
     learning_rate: 3e-4
-    n_steps: 16384  # 增大步数（8192 → 16384），每次收集更多数据
-    batch_size: 4096  # 启用AMP后增大batch（2048 → 4096），更好利用GPU
-    update_epochs: 5  # 减少更新epoch数（10 → 5），加快训练速度
+    n_steps: 16384  # 每次rollout的步数
+    batch_size: 32768  # 批量大小（16384 → 32768，2倍提升，充分利用单GPU）
+    update_epochs: 5  # 每次更新epoch数
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数
     clip_epsilon: 0.2  # PPO裁剪参数
@@ -131,7 +130,7 @@ training:
     max_grad_norm: 0.5  # 梯度裁剪
 
     # 增强功能集成
-    use_curriculum: true  # 启用课程学习（从Level 1逐步晋级到Level 5）
+    use_curriculum: true  # 启用课程学习（确保5个级别都能学到，Level 5充分学习）
     use_per: true  # 使用优先经验回放
     use_failure_bank: true  # 使用失败案例库
 

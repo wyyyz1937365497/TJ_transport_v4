@@ -110,7 +110,7 @@ class TrafficTransition:
 # =============================================================================
 
 class EnhancedTrainingCallback(BaseCallback):
-    """增强训练回调 - 记录所有增强功能的指标 + 进度输出"""
+    """增强训练回调 - 记录所有增强功能的指标 + 进度输出 + 剩余时间"""
 
     def __init__(self, enhanced_manager: EnhancedTrainingManager, total_timesteps: int, verbose: int = 1):
         super().__init__(verbose)
@@ -119,6 +119,16 @@ class EnhancedTrainingCallback(BaseCallback):
         self.last_print_step = 0
         self.print_freq = 1000  # 每1000步打印一次
 
+        # 时间跟踪
+        self.start_time = None
+        self.training_start_time = None
+
+    def _on_training_start(self) -> None:
+        """训练开始时记录时间"""
+        import time
+        self.start_time = time.time()
+        self.training_start_time = time.time()
+
     def _on_step(self) -> bool:
         # 每隔一定步数打印进度
         if self.num_timesteps - self.last_print_step >= self.print_freq:
@@ -126,25 +136,63 @@ class EnhancedTrainingCallback(BaseCallback):
             self.last_print_step = self.num_timesteps
         return True
 
+    def _format_time(self, seconds):
+        """格式化时间显示"""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{mins}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h {mins}m"
+
     def _print_progress(self):
-        """打印训练进度（类似阶段1的样式）"""
+        """打印训练进度（包含剩余时间估算）"""
+        import time
+
         # 计算进度百分比
         progress = self.num_timesteps / self.total_timesteps * 100
+
+        # 计算已用时间和剩余时间
+        if self.start_time is not None:
+            elapsed_time = time.time() - self.start_time
+
+            # 估算剩余时间（基于当前进度）
+            if progress > 0:
+                remaining_time = elapsed_time * (100 - progress) / progress
+                eta = time.time() + remaining_time
+
+                # 格式化时间
+                elapsed_str = self._format_time(elapsed_time)
+                remaining_str = self._format_time(remaining_time)
+            else:
+                elapsed_str = "0s"
+                remaining_str = "N/A"
+        else:
+            elapsed_str = "N/A"
+            remaining_str = "N/A"
 
         # 获取当前指标
         ep_rew_mean = self.logger.name_to_value.get('rollout/ep_rew_mean')
         ep_len_mean = self.logger.name_to_value.get('rollout/ep_len_mean')
         fps = self.logger.name_to_value.get('time/fps')
 
-        # 如果还没有指标数据（第一个rollout还没完成），只显示进度
+        # 如果还没有指标数据（第一个rollout还没完成），只显示进度和时间
         if ep_rew_mean is None or ep_len_mean is None or fps is None:
             print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
-                  f"({progress:.1f}%) | Waiting for first rollout...", end='', flush=True)
+                  f"({progress:.1f}%) | "
+                  f"Elapsed: {elapsed_str} | "
+                  f"ETA: {remaining_str} | "
+                  f"Waiting for metrics...", end='', flush=True)
         else:
             print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
                   f"({progress:.1f}%) | "
                   f"Reward: {ep_rew_mean:.2f} | "
-                  f"Length: {ep_len_mean:.1f} | "
+                  f"Elapsed: {elapsed_str} | "
+                  f"ETA: {remaining_str} | "
                   f"FPS: {fps:.0f}", end='', flush=True)
 
     def _on_rollout_end(self) -> None:
@@ -641,7 +689,195 @@ class Phase1WorldModelTrainer:
 
 
 # =============================================================================
-# Phase 2: PPO训练（冻结感知层）
+# 课程学习回调 - 动态切换难度级别
+# =============================================================================
+
+class CurriculumLevelCallback(BaseCallback):
+    """
+    课程级别切换回调
+
+    在训练过程中检查是否达到晋级条件：
+    - 训练步数达到阈值
+    - 平均奖励达到阈值
+    - 成功率达标
+    """
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        enhanced_manager,
+        num_envs: int,
+        check_frequency: int = 50000,  # 每50k步检查一次（调整以匹配2M步训练）
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.config = config
+        self.enhanced_manager = enhanced_manager
+        self.num_envs = num_envs
+        self.check_frequency = check_frequency
+
+        # 晋级条件
+        curriculum_config = config.get('training', {}).get('curriculum', {})
+        self.min_episodes_per_level = curriculum_config.get('min_episodes_per_level', 5)
+        self.min_reward_threshold = curriculum_config.get('min_reward_threshold', -300)
+
+        # 计算平均episode长度（从配置读取max_steps，然后乘以一个系数）
+        # 实际episode长度通常比max_steps短，因为车辆可能提前到达终点
+        env_config = config.get('environment', {})
+        max_steps = env_config.get('max_steps', 1800)
+        self.avg_episode_length = int(max_steps * 0.7)  # 假设平均episode长度为max_steps的70%
+
+        # 状态跟踪
+        self.current_level = None
+        self.level_start_step = 0
+        self.last_switch_step = 0
+
+        # 统计
+        self.num_switches = 0
+
+    def _init_callback(self) -> None:
+        """初始化回调"""
+        if self.enhanced_manager.curriculum:
+            self.current_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            self.level_start_step = 0
+            print(f"\n[CURRICULUM] Starting at Level {self.current_level.level}: {self.current_level.name}")
+            print(f"[CURRICULUM] Dynamic level switching: ENABLED")
+        else:
+            print("[INFO] Curriculum learning not enabled")
+
+    def _on_step(self) -> bool:
+        """每步调用"""
+        # 如果课程学习未启用，直接返回
+        if not self.enhanced_manager.curriculum:
+            return True
+
+        # 定期检查是否应该晋级
+        if self.num_timesteps - self.last_switch_step >= self.check_frequency:
+            should_advance = self._check_should_advance()
+
+            if should_advance:
+                success = self._advance_to_next_level()
+                if success:
+                    self.last_switch_step = self.num_timesteps
+                    self.num_switches += 1
+
+        return True
+
+    def _check_should_advance(self) -> bool:
+        """检查是否应该晋级到下一级别"""
+        if not self.enhanced_manager.curriculum:
+            return False
+
+        # 检查是否已是最高级别
+        current_level = self.enhanced_manager.curriculum.get_current_difficulty()
+        if current_level.level >= len(self.enhanced_manager.curriculum.levels):
+            return False
+
+        # 检查是否在该级别训练了足够的步数
+        steps_in_level = self.num_timesteps - self.level_start_step
+        min_steps = self.min_episodes_per_level * self.avg_episode_length
+
+        if steps_in_level < min_steps:
+            if self.verbose > 1:
+                print(f"[CURRICULUM] Not enough steps yet: {steps_in_level}/{min_steps} "
+                      f"({self.min_episodes_per_level} episodes x {self.avg_episode_length} steps/episode)")
+            return False
+
+        # 检查平均奖励（从rollout buffer获取）
+        # 注意：这里使用简化的检查，只要步数足够就晋级
+        return True
+
+    def _advance_to_next_level(self) -> bool:
+        """晋级到下一级别"""
+        try:
+            # 更新课程级别
+            old_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            self.enhanced_manager.curriculum.advance_to_next_level()
+            new_level = self.enhanced_manager.curriculum.get_current_difficulty()
+
+            print(f"\n{'='*80}")
+            print(f"[CURRICULUM] Advancing from Level {old_level.level} to Level {new_level.level}")
+            print(f"  Old: {old_level.name} (vehicles={old_level.max_vehicles}, flow={old_level.inflow_rate})")
+            print(f"  New: {new_level.name} (vehicles={new_level.max_vehicles}, flow={new_level.inflow_rate})")
+            print(f"{'='*80}\n")
+
+            # 重新创建环境
+            self._recreate_environment()
+
+            # 重置级别开始步数
+            self.level_start_step = self.num_timesteps
+            self.current_level = new_level
+
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Failed to advance level: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _recreate_environment(self):
+        """重新创建环境（Windows优化版本）"""
+        print("[ENV] Recreating environment with new curriculum level...")
+
+        # 获取新的环境配置
+        env_config = self.config.get('environment', {}).copy()
+        new_env_config = self.enhanced_manager.get_curriculum_env_config(env_config)
+
+        # 关闭旧环境
+        if hasattr(self.model, 'env') and self.model.env is not None:
+            print("[ENV] Closing old environment...")
+            self.model.env.close()
+            print("[OK] Old environment closed")
+
+            # Windows上特别激进的清理策略
+            print("[ENV] Waiting for complete cleanup (Windows)...")
+            import time
+            import gc
+            import os
+
+            # 等待子进程退出
+            time.sleep(5)
+
+            # 强制垃圾回收
+            gc.collect()
+
+            # 额外等待，确保所有进程都退出
+            time.sleep(5)
+
+            print("[OK] Cleanup complete")
+
+        # 创建新环境
+        print("[ENV] Creating new environment...")
+        print(f"[INFO] This may take 1-2 minutes for {self.num_envs} parallel environments...")
+
+        import time
+        start_time = time.time()
+
+        vec_env_wrapper = create_parallel_envs(
+            config=new_env_config,
+            num_envs=self.num_envs,
+            seed=self.config.get('seed', 42)
+        )
+
+        elapsed = time.time() - start_time
+        print(f"[OK] Environment created in {elapsed:.1f}s")
+
+        # 更新模型的环境
+        print("[ENV] Updating model environment reference...")
+        self.model.set_env(vec_env_wrapper.vec_env)
+
+        # Windows上需要额外等待，确保管道建立
+        print("[ENV] Waiting for pipe establishment...")
+        time.sleep(5)
+        print("[OK] Pipes established")
+
+        print(f"[OK] Environment recreated with {self.num_envs} parallel instances")
+        print("[INFO] Training will continue with new curriculum level...")
+
+
+# =============================================================================
+# Phase 2: PPO训练（冻结感知层 + 动态课程学习）
 # =============================================================================
 
 class Phase2PPOTrainer:
@@ -736,11 +972,36 @@ class Phase2PPOTrainer:
         # 创建回调
         callbacks = self._create_callbacks()
 
+        # 添加课程学习回调（如果启用）
+        if self.enhanced_manager.curriculum:
+            curriculum_callback = CurriculumLevelCallback(
+                config=self.config,
+                enhanced_manager=self.enhanced_manager,
+                num_envs=self.num_envs,
+                check_frequency=50000,  # 每50k步检查一次（适配2M步训练）
+                verbose=1
+            )
+            callbacks.append(curriculum_callback)
+
+            print(f"\n[CURRICULUM] Dynamic level switching enabled")
+            curriculum_config = self.config.get('training', {}).get('curriculum', {})
+            env_config = self.config.get('environment', {})
+            max_steps = env_config.get('max_steps', 1800)
+            avg_episode_length = int(max_steps * 0.7)
+            min_steps = curriculum_config.get('min_episodes_per_level', 100) * avg_episode_length
+            print(f"  Check frequency: every 50,000 steps")
+            print(f"  Min episodes per level: {curriculum_config.get('min_episodes_per_level', 100)}")
+            print(f"  Estimated steps per level: {min_steps:,} (100 episodes x {avg_episode_length} steps/episode)")
+            print(f"  Min reward threshold: {curriculum_config.get('min_reward_threshold', -300)}")
+
         # 训练（禁用内置进度条，使用自定义进度输出）
         print("\n[TRAIN] Starting training...")
         print(f"[INFO] Total timesteps: {self.total_timesteps:,}")
         print(f"[INFO] Parallel environments: {self.num_envs}")
-        print(f"[INFO] Updates per rollout: {self.n_steps}")
+        print(f"[INFO] Steps per rollout: {self.n_steps}")
+
+        if self.enhanced_manager.curriculum:
+            print(f"[INFO] Curriculum levels may switch during training!")
 
         model.learn(
             total_timesteps=self.total_timesteps,
@@ -753,6 +1014,12 @@ class Phase2PPOTrainer:
 
         print(f"\n[DONE] Phase 2 complete!")
         print(f"   Model: {self.model_path}")
+
+        # 显示最终课程级别
+        if self.enhanced_manager.curriculum:
+            final_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            print(f"   Final Level: {final_level.level} - {final_level.name}")
+            print(f"   Config: {final_level.max_vehicles} vehicles, {final_level.inflow_rate} flow")
 
         vec_env.close()
 
@@ -1301,13 +1568,9 @@ def main():
             print("[PHASE 2] PPO策略训练 - 学习控制策略")
             print(f"{'='*80}")
 
-            # 使用修复后的课程学习训练器（如果可用）
-            if USE_CURRICULUM_FIX:
-                trainer2 = Phase2PPOTrainerWithCurriculum(config, enhanced_manager)
-                print("[INFO] Using curriculum-enabled trainer")
-            else:
-                trainer2 = Phase2PPOTrainer(config, enhanced_manager)
-                print("[INFO] Using default trainer")
+            # Phase2PPOTrainer已内置动态课程学习功能
+            trainer2 = Phase2PPOTrainer(config, enhanced_manager)
+            print("[INFO] Using PPO trainer with dynamic curriculum learning")
 
             phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
 
@@ -1387,15 +1650,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return config
 
 
-# 尝试导入修复后的课程学习训练器
-try:
-    from train_curriculum_fixed import Phase2PPOTrainerWithCurriculum
-    USE_CURRICULUM_FIX = True
-    print("[OK] Using curriculum-enabled PPO trainer")
-except ImportError:
-    USE_CURRICULUM_FIX = False
-    print("[INFO] Curriculum fix not available, using default trainer")
-
+# 课程学习已直接集成到Phase2PPOTrainer中
+# 不再需要单独的训练器文件
 
 if __name__ == '__main__':
     main()

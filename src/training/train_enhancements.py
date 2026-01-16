@@ -207,7 +207,7 @@ class CurriculumManager:
         return False
 
     def _advance_to_next_level(self):
-        """晋级到下一级别"""
+        """晋级到下一级别（内部方法）"""
         if self.current_level_idx < len(self.levels) - 1:
             self.current_level_idx += 1
             self.episodes_in_current_level = 0
@@ -215,10 +215,22 @@ class CurriculumManager:
             self.episode_rewards.clear()
 
             new_level = self.levels[self.current_level_idx]
-            print(f"\n[CURRICULUM] 🎓 晋升到 Level {new_level.level}: {new_level.name}")
-            print(f"   描述: {new_level.description}")
-            print(f"   参数: 最大车辆={new_level.max_vehicles}, "
-                  f"流量={new_level.inflow_rate}, ICV比率={new_level.icv_ratio}")
+            print(f"\n[CURRICULUM] Advancing to Level {new_level.level}: {new_level.name}")
+            print(f"   Description: {new_level.description}")
+            print(f"   Parameters: max_vehicles={new_level.max_vehicles}, "
+                  f"inflow_rate={new_level.inflow_rate}, icv_ratio={new_level.icv_ratio}")
+
+    def advance_to_next_level(self):
+        """
+        晋级到下一级别（公共接口）
+
+        用于从外部（如回调）触发级别升级。
+        这个方法会绕过自动晋级检查，直接升级。
+        """
+        if self.current_level_idx < len(self.levels) - 1:
+            self._advance_to_next_level()
+            return True
+        return False
 
     def get_env_config_for_current_level(self, base_config: Dict) -> Dict:
         """
