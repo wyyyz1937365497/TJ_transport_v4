@@ -224,8 +224,14 @@ class Phase1WorldModelTrainer:
         print(f"  Learning Rate: {self.learning_rate}")
         print(f"  Parallel Workers: {self.num_workers}")
         print(f"  Effective Batch Size: {self.gpu_manager.get_effective_batch_size(self.batch_size)}")
-        print(f"  [OK] Curriculum Learning: ENABLED (default)")
-        print(f"     Levels: {len(enhanced_manager.curriculum.levels)}")
+
+        # 显示课程学习状态
+        if enhanced_manager.curriculum is not None:
+            print(f"  [OK] Curriculum Learning: ENABLED")
+            print(f"     Levels: {len(enhanced_manager.curriculum.levels)}")
+        else:
+            print(f"  [INFO] Curriculum Learning: DISABLED")
+            print(f"     Using competition config directly")
 
     def train(self) -> str:
         """训练世界模型"""
@@ -1217,7 +1223,12 @@ def main():
     print(f"  Device: {args.device}")
 
     print("\n[ENHANCEMENTS]")
-    print(f"  [OK] Curriculum Learning: ENABLED (default)")
+    # 检查课程学习是否启用
+    curriculum_enabled = config.get('training', {}).get('curriculum', {}).get('enabled', True)
+    if curriculum_enabled:
+        print(f"  [OK] Curriculum Learning: ENABLED")
+    else:
+        print(f"  [INFO] Curriculum Learning: DISABLED")
     print(f"  [OK] Prioritized Replay: ENABLED (default)")
     print(f"  [OK] Failure Bank: ENABLED (default)")
 
@@ -1290,7 +1301,14 @@ def main():
             print("[PHASE 2] PPO策略训练 - 学习控制策略")
             print(f"{'='*80}")
 
-            trainer2 = Phase2PPOTrainer(config, enhanced_manager)
+            # 使用修复后的课程学习训练器（如果可用）
+            if USE_CURRICULUM_FIX:
+                trainer2 = Phase2PPOTrainerWithCurriculum(config, enhanced_manager)
+                print("[INFO] Using curriculum-enabled trainer")
+            else:
+                trainer2 = Phase2PPOTrainer(config, enhanced_manager)
+                print("[INFO] Using default trainer")
+
             phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
 
             # 自动保存Phase 2权重
@@ -1367,6 +1385,16 @@ def load_config(config_path: str) -> Dict[str, Any]:
         config['device'] = 'cpu'
 
     return config
+
+
+# 尝试导入修复后的课程学习训练器
+try:
+    from train_curriculum_fixed import Phase2PPOTrainerWithCurriculum
+    USE_CURRICULUM_FIX = True
+    print("[OK] Using curriculum-enabled PPO trainer")
+except ImportError:
+    USE_CURRICULUM_FIX = False
+    print("[INFO] Curriculum fix not available, using default trainer")
 
 
 if __name__ == '__main__':

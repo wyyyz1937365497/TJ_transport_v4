@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SUMO训练优化配置 - 仅优化性能参数，不改变物理行为
+
+合规说明：
+- 不修改net.xml和routes.xml
+- 不改变物理模型、车辆行为
+- 仅禁用日志输出，不影响仿真结果
+- 可用于训练加速，评测时切回sumo.sumocfg
+-->
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="net.xml"/>
+        <route-files value="routes.xml"/>
+    </input>
+
+    <processing>
+        <!-- 保持与官方配置完全一致 -->
+        <time-to-teleport value="600"/>
+        <ignore-route-errors value="true"/>
+
+        <!-- 碰撞检测：保持官方设置 -->
+        <collision.action value="warn"/>
+        <collision.stoptime value="5"/>
+        <collision.check-junctions value="true"/>
+        <collision.mingap-factor value="0"/>
+
+        <!-- 仅优化：禁用动态路由（routes.xml已固定，无需动态路由） -->
+        <disable-dynamic-rerouting value="true"/>
+    </processing>
+
+    <report>
+        <!-- 仅优化：减少日志输出，不影响仿真结果 -->
+        <no-warnings value="true"/>
+        <no-step-log value="true"/>
+        <verbose value="false"/>
+    </report>
+
+    <!-- 仿真时间步长：保持官方设置 -->
+    <time>
+        <step-length value="0.1"/>
+        <begin value="0"/>
+    </time>
+
+</sumoConfiguration>

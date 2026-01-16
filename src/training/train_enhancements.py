@@ -827,9 +827,12 @@ class EnhancedTrainingManager:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
 
-        # 1. 课程学习（始终启用）
+        # 1. 课程学习（根据配置决定是否启用）
         curriculum_config = config.get('training', {}).get('curriculum', {})
-        self.curriculum = CurriculumManager(config)
+        if curriculum_config.get('enabled', True):
+            self.curriculum = CurriculumManager(config)
+        else:
+            self.curriculum = None
 
         # 2. 优先经验回放（始终启用）
         per_config = config.get('training', {}).get('prioritized_replay', {})
@@ -848,11 +851,15 @@ class EnhancedTrainingManager:
 
     def get_curriculum_env_config(self, base_config: Dict) -> Dict:
         """获取当前课程学习级别的环境配置"""
+        if self.curriculum is None:
+            # 课程学习未启用，返回原始配置
+            return base_config
         return self.curriculum.get_env_config_for_current_level(base_config)
 
     def update_curriculum_progress(self, reward: float, success: bool):
         """更新课程学习进度"""
-        self.curriculum.update_progress(reward, success)
+        if self.curriculum is not None:
+            self.curriculum.update_progress(reward, success)
 
     def detect_failure(
         self,
@@ -888,7 +895,11 @@ class EnhancedTrainingManager:
         """获取所有增强功能的统计信息"""
         stats = {}
 
-        stats['curriculum'] = self.curriculum.get_stats()
+        if self.curriculum is not None:
+            stats['curriculum'] = self.curriculum.get_stats()
+        else:
+            stats['curriculum'] = {'enabled': False}
+
         stats['replay_buffer'] = {
             'size': len(self.replay_buffer),
             'frame': self.replay_buffer.frame

@@ -18,7 +18,9 @@ paths:
 # =============================================================================
 environment:
   # SUMO配置
-  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
+  # 训练时使用优化版本（sumo_fast.sumocfg）以加速训练
+  # 评估时切换回官方版本（sumo.sumocfg）以确保合规
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg  # 默认使用官方配置
   net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
   route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
 
@@ -26,8 +28,8 @@ environment:
   max_vehicles: 32
   inflow_rate: 2000
   icv_ratio: 0.25  # 智能车渗透率（25%，符合赛题）
-  max_steps: 3600
-  warmup_steps: 300
+  max_steps: 1800  # 缩短episode长度（3600 → 1800），加快训练
+  warmup_steps: 150  # 减少预热时间（300 → 150）
 
   # 奖励配置
   rewards:
@@ -83,9 +85,10 @@ model:
 training:
   # ========== 课程学习配置 ==========
   curriculum:
-    enabled: true  # 启用课程学习
+    enabled: true  # 启用课程学习（从简单到复杂逐步学习）
     auto_advance: true  # 自动晋级
-    min_episodes_per_level: 50  # 每个级别最少训练episodes
+    min_episodes_per_level: 5  # 每个级别最少训练rollouts
+    min_reward_threshold: -300  # 晋级最低平均奖励要求
 
   # ========== 优先经验回放配置 ==========
   prioritized_replay:
@@ -108,17 +111,18 @@ training:
     epochs: 30  # 训练轮数
     batch_size: 256
     learning_rate: 1e-4
-    num_parallel_workers: 4
+    num_parallel_workers: 24
     use_cache: true  # 使用数据缓存
+    use_curriculum: true  # 启用课程学习（从Level 1逐步晋级到Level 5）
 
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
     total_timesteps: 200000  # 总训练步数
-    num_envs: 16  # 并行环境数（优化：8 → 16）
+    num_envs: 64  # 并行环境数（优化：32 → 64，最大化吞吐量）
     learning_rate: 3e-4
-    n_steps: 4096  # 每次更新收集的步数（优化：2048 → 4096）
-    batch_size: 1024  # PPO batch大小（优化：512 → 1024）
-    update_epochs: 10  # 每次更新的epoch数
+    n_steps: 16384  # 增大步数（8192 → 16384），每次收集更多数据
+    batch_size: 4096  # 启用AMP后增大batch（2048 → 4096），更好利用GPU
+    update_epochs: 5  # 减少更新epoch数（10 → 5），加快训练速度
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数
     clip_epsilon: 0.2  # PPO裁剪参数
@@ -127,7 +131,7 @@ training:
     max_grad_norm: 0.5  # 梯度裁剪
 
     # 增强功能集成
-    use_curriculum: true  # 使用课程学习
+    use_curriculum: true  # 启用课程学习（从Level 1逐步晋级到Level 5）
     use_per: true  # 使用优先经验回放
     use_failure_bank: true  # 使用失败案例库
 
@@ -140,6 +144,7 @@ training:
     batch_size: 64
     update_epochs: 10
     cost_limit: 0.1  # 成本约束（干预率不超过10%）
+    use_curriculum: true  # 启用课程学习
 
   # ========== Phase 4: 拉格朗日乘子配置 ==========
   phase4:
@@ -168,7 +173,7 @@ evaluation:
 logging:
   tensorboard: true  # 启用TensorBoard
   wandb: false  # 启用Weights & Biases
-  log_interval: 100  # 日志记录间隔
+  log_interval: 500  # 减少日志频率（100 → 500），降低I/O开销
 
   # 要记录的指标
   metrics:
@@ -185,7 +190,7 @@ logging:
 # =============================================================================
 advanced:
   # 混合精度训练
-  mixed_precision: false
+  mixed_precision: true  # 启用以加速训练并减少显存占用
 
   # 梯度检查点（节省显存）
   gradient_checkpointing: false
@@ -194,4 +199,4 @@ advanced:
   model_parallel: false
 
   # 自动混合精度（AMP）
-  amp: false
+  amp: true  # 启用PyTorch AMP

@@ -29,7 +29,11 @@
       "Bash(if not exist:*)",
       "Bash(ls:*)",
       "Bash(git checkout:*)",
-      "mcp__zread__get_repo_structure"
+      "mcp__zread__get_repo_structure",
+      "Bash(powershell:*)",
+      "Bash(wmic:*)",
+      "Bash(tasklist:*)",
+      "WebSearch"
     ]
   }
 }
