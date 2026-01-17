@@ -37,7 +37,12 @@
       "Bash(if:*)",
       "Bash(then cat README.md)",
       "Bash(else echo \"FILE_NOT_EXIST\")",
-      "Bash(fi:*)"
+      "Bash(fi:*)",
+      "Bash(export PYTHONDONTWRITEBYTECODE=1:*)",
+      "Bash(taskkill:*)",
+      "Bash(.\\\\train_all_stages:*)",
+      "Bash(echo:*)",
+      "Bash(conda activate:*)"
     ]
   }
 }

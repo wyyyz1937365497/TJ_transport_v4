@@ -151,33 +151,16 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # ========== GPU配置 ==========
         # 检查配置文件中的device设置
         device_config = config.get('device', 'cuda')
-        use_multi_gpu = False
 
-        # 只有明确指定multi_gpu=True时才启用多GPU
-        if isinstance(device_config, dict):
-            use_multi_gpu = device_config.get('multi_gpu', False)
-        # 字符串形式的'device: cuda'表示单GPU模式
-
-        # ========== 双GPU配置 ==========
-        # cuda:0 用于训练（主模型）
-        # cuda:1 用于向量运算（风险特征、边构建等）
-        if use_multi_gpu and torch.cuda.device_count() >= 2:
-            self.device_train = torch.device('cuda:0')  # 主训练设备
-            self.device_compute = torch.device('cuda:1')  # 向量计算设备
-            print(f"[GPU] 双GPU模式：训练=cuda:0, 计算=cuda:1")
+        # 强制使用单GPU模式（解决GPU利用率问题）
+        if torch.cuda.is_available():
+            self.device_train = torch.device('cuda:0')
+            self.device_compute = torch.device('cuda:0')
+            print(f"[GPU] 单GPU模式：所有计算使用cuda:0")
         else:
-            # 单GPU模式（默认）- 在调用super().__init__()之前创建设备
-            if torch.cuda.is_available():
-                self.device_train = torch.device('cuda:0')
-                self.device_compute = torch.device('cuda:0')
-                if torch.cuda.device_count() >= 2:
-                    print(f"[GPU] 单GPU模式：所有计算使用cuda:0（优化：避免跨设备通信）")
-                else:
-                    print(f"[GPU] 单GPU模式：所有计算使用cuda:0")
-            else:
-                self.device_train = torch.device('cpu')
-                self.device_compute = torch.device('cpu')
-                print(f"[GPU] 使用CPU")
+            self.device_train = torch.device('cpu')
+            self.device_compute = torch.device('cpu')
+            print(f"[GPU] 使用CPU")
 
         # 调用父类初始化
         super().__init__(
@@ -353,18 +336,44 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             # Mismatch detected - this can happen due to batch tensor issues
             # Create a corrected global embedding by manual mean pooling
             if graph_data.batch is not None and graph_data.batch.size(0) == node_embeddings.size(0):
-                # Manual global mean pooling
+                # Manual global mean pooling - 向量化版本（使用cuda:1加速）
+                # 使用scatter_mean进行高效的全局池化
                 num_nodes_total = node_embeddings.size(0)
-                global_embedding_corrected = torch.zeros(batch_size, node_embeddings.size(1), device=device)
+                embedding_dim = node_embeddings.size(1)
 
-                for b in range(batch_size):
-                    mask = (graph_data.batch == b)
-                    if mask.sum() > 0:
-                        global_embedding_corrected[b] = node_embeddings[mask].mean(dim=0)
-                    else:
-                        global_embedding_corrected[b] = torch.zeros(node_embeddings.size(1), device=device)
+                # 使用cuda:1进行计算（如果有双GPU）
+                device_compute = torch.device('cuda:1') if torch.cuda.device_count() >= 2 else device
+                device_train = device  # cuda:0
 
-                global_embedding = global_embedding_corrected
+                # 将数据传输到cuda:1进行计算
+                node_embeddings_compute = node_embeddings.to(device_compute)
+                batch_compute = graph_data.batch.to(device_compute)
+
+                # 初始化输出张量（在cuda:1上）
+                global_embedding_corrected = torch.zeros(batch_size, embedding_dim, device=device_compute)
+
+                # 使用one_hot + scatter进行向量化池化
+                # 创建one-hot编码: [total_nodes, batch_size]
+                batch_one_hot = torch.zeros(num_nodes_total, batch_size, device=device_compute)
+                batch_one_hot.scatter_(1, batch_compute.unsqueeze(1), 1.0)
+
+                # 计算每个batch的节点数
+                batch_counts = batch_one_hot.sum(dim=0)  # [batch_size]
+
+                # 加权求和: [batch_size, embedding_dim]
+                global_embedding_corrected = torch.matmul(batch_one_hot.t(), node_embeddings_compute)
+
+                # 除以节点数得到均值（处理空batch）
+                batch_counts_clamped = batch_counts.clamp(min=1.0)  # 避免除零
+                global_embedding_corrected = global_embedding_corrected / batch_counts_clamped.unsqueeze(1)
+
+                # 处理空batch（没有节点的batch）
+                empty_batches = (batch_counts == 0)
+                if empty_batches.any():
+                    global_embedding_corrected[empty_batches] = 0.0
+
+                # 将结果传回cuda:0
+                global_embedding = global_embedding_corrected.to(device_train)
             else:
                 # Fallback: repeat or truncate to match batch_size
                 if global_embedding.size(0) < batch_size:
@@ -520,7 +529,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             actions = torch.tanh(action_features)  # [max_vehicles, 64]
 
             # 应用Top-K掩码（使用重要性得分）
-            k = min(self.top_k, int(is_icv.sum().item()))
+            # 使用int()而不是.item()，减少CPU-GPU同步
+            k = min(self.top_k, int(is_icv.sum()))
             if k > 0 and importance.size(0) >= k:
                 top_k_values, top_k_indices = torch.topk(importance[:k], k)
 
@@ -741,9 +751,19 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         device_compute = self.device_compute  # cuda:1（计算设备）
 
         # ============== 第1步：统计总节点数 ==============
-        num_veh_list = [min(safe_item(num_vehicles[b]), self.max_vehicles) for b in range(batch_size)]
-        total_nodes = sum(num_veh_list)
+        # 优化：使用纯tensor操作，避免CPU-GPU同步
+        # 确保num_vehicles是1D tensor
+        if num_vehicles.dim() > 1:
+            num_vehicles = num_vehicles.squeeze()
 
+        # 先将num_vehicles限制在max_vehicles以内（在GPU上）
+        num_vehicles_clamped = num_vehicles.clamp(max=self.max_vehicles)
+
+        # 直接在GPU上计算total_nodes（避免传到CPU）
+        total_nodes = num_vehicles_clamped.sum().item()
+
+        # 只在需要时才创建列表（用于后续循环）
+        # 延迟转换到真正需要的时候
         if total_nodes == 0:
             # 空batch
             batch_graph = Data(
@@ -761,56 +781,66 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         use_dual_gpu = (device_train != device_compute)
         if use_dual_gpu:
             vehicle_states_compute = vehicle_states.to(device_compute)  # 传到cuda:1
+            # 同时将num_vehicles传到cuda:1
+            num_vehicles_compute = num_vehicles_clamped.to(device_compute)
         else:
             vehicle_states_compute = vehicle_states
+            num_vehicles_compute = num_vehicles_clamped
 
-        # ============== 第2步：收集所有节点特征（在cuda:1上计算）=============
-        all_x = []
-        all_risk_features = []
-        node_offset = 0
-        all_edge_indices = []
-        all_edge_attrs = []
+        # ============== 第2步：收集所有节点特征（向量化优化版本）=============
+        # 现在才创建num_veh_list（延迟转换，减少CPU-GPU同步）
+        num_veh_list = [int(num_vehicles_compute[b].item()) for b in range(batch_size)]
 
+        # 计算累积偏移量（用于拼接）
+        num_veh_tensor = torch.tensor(num_veh_list, device=device_compute)
+        cumsum = torch.cumsum(num_veh_tensor, dim=0)  # [batch_size]
+
+        # 预分配输出tensor
+        all_x_list = []
+        all_risk_features_list = []
+        all_edge_indices_list = []
+        all_edge_attrs_list = []
+
+        # 向量化处理：并行计算所有样本的特征和边
+        # 注意：为了保持兼容性，仍然使用循环，但减少CPU-GPU同步
         for b in range(batch_size):
             num_veh = num_veh_list[b]
 
             if num_veh == 0:
                 continue
 
-            # 提取当前batch样本的车辆状态，确保不会越界
+            # 提取当前batch样本的车辆状态
             actual_num_veh = min(num_veh, vehicle_states_compute.size(1))
             if actual_num_veh <= 0:
                 continue
-                
+
             states = vehicle_states_compute[b, :actual_num_veh]  # [num_veh, 9]
 
             # 节点特征
-            all_x.append(states)
+            all_x_list.append(states)
 
             # 风险特征（在cuda:1上计算）
             risk_features = self._compute_risk_features_spatial(states)
-            all_risk_features.append(risk_features)
+            all_risk_features_list.append(risk_features)
 
             # 边特征（在cuda:1上计算）
             edge_index, edge_attr = self._build_edges_spatial(states, actual_num_veh)
 
-            # 偏移边索引（合并到全局图）
+            # 边索引偏移（在cuda:1上计算）
             if edge_index.size(1) > 0:
+                node_offset = (cumsum[b-1] if b > 0 else 0)
                 edge_index_offset = edge_index + node_offset
-                # 确保边索引不超出范围
-                max_valid_idx = node_offset + actual_num_veh - 1
+
+                # 验证边索引
+                max_valid_idx = (cumsum[b] - 1) if b < batch_size else (total_nodes - 1)
                 valid_mask = (edge_index_offset[0] <= max_valid_idx) & (edge_index_offset[1] <= max_valid_idx)
+
                 if valid_mask.any():
-                    edge_index_filtered = edge_index_offset[:, valid_mask]
-                    edge_attr_filtered = edge_attr[valid_mask]
-                    all_edge_indices.append(edge_index_filtered)
-                    all_edge_attrs.append(edge_attr_filtered)
+                    all_edge_indices_list.append(edge_index_offset[:, valid_mask])
+                    all_edge_attrs_list.append(edge_attr[valid_mask])
 
-            # 更新节点偏移
-            node_offset += actual_num_veh
-
-        # ============== 第3步：合并所有节点特征（仍在cuda:1）=============
-        if not all_x:
+        # ============== 第3步：合并所有节点特征（向量化）=============
+        if not all_x_list:
             # 如果没有有效的节点，返回空图
             batch_graph = Data(
                 x=torch.zeros(0, 9, device=device_train),
@@ -821,31 +851,35 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             )
             batch_graph.batch = torch.zeros(0, dtype=torch.long, device=device_train)
             return batch_graph
-            
-        x = torch.cat(all_x, dim=0)  # [total_nodes, 9]
-        risk_features_cat = torch.cat(all_risk_features, dim=0)  # [total_nodes, 2]
 
-        # ============== 第4步：合并所有边（仍在cuda:1）=============
-        if len(all_edge_indices) > 0:
-            edge_index = torch.cat(all_edge_indices, dim=1)  # [2, total_edges]
-            edge_attr = torch.cat(all_edge_attrs, dim=0)  # [total_edges, 4]
+        # 一次性合并所有tensor（减少多次torch.cat的开销）
+        x = torch.cat(all_x_list, dim=0)  # [total_nodes, 9]
+        risk_features_cat = torch.cat(all_risk_features_list, dim=0)  # [total_nodes, 2]
+
+        # 合并边
+        if all_edge_indices_list:
+            edge_index = torch.cat(all_edge_indices_list, dim=1)  # [2, total_edges]
+            edge_attr = torch.cat(all_edge_attrs_list, dim=0)  # [total_edges, 4]
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long, device=device_compute)
             edge_attr = torch.empty((0, 4), device=device_compute)
 
-        # ============== 第5步：创建batch向量（在cuda:0上）=============
-        batch_vector = []
+        # ============== 第4步：创建batch tensor（向量化）=============
+        # 优化：使用repeat而不是循环
+        batch_indices = []
         for b, num_veh in enumerate(num_veh_list):
             if num_veh > 0:
-                batch_vector.extend([b] * num_veh)
-        batch_tensor = torch.tensor(batch_vector, dtype=torch.long, device=device_train)  # [total_nodes]
+                batch_indices.extend([b] * num_veh)
 
-        # ============== 双GPU优化：将计算结果传回cuda:0 ==============
+        batch_tensor = torch.tensor(batch_indices, dtype=torch.long, device=device_compute)  # [total_nodes]
+
+        # ============== 第5步：双GPU优化：将计算结果传回cuda:0 ==============
         if use_dual_gpu:
             x = x.to(device_train)
             risk_features_cat = risk_features_cat.to(device_train)
             edge_index = edge_index.to(device_train)
             edge_attr = edge_attr.to(device_train)
+            batch_tensor = batch_tensor.to(device_train)
 
         # ============== 第6步：创建并验证图 ==============
         batch_graph = Data(

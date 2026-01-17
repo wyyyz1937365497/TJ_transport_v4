@@ -1,75 +1,70 @@
 @echo off
-REM Multi-Stage Training Automation Script
-REM 使用 train_phase2_stable.py 依次训练所有5个阶段
-
-SETLOCAL EnableDelayedExpansion
+setlocal enabledelayedexpansion
 
 echo ================================================================================
-echo Multi-Stage Curriculum Training
+echo Complete Training Pipeline - Phase 1 + Phase 2 (All 5 Curriculum Levels)
 echo ================================================================================
 echo.
-echo This script will train all 5 curriculum stages sequentially.
-echo Each stage is independent and will load weights from the previous stage.
-echo.
-echo Press Ctrl+C to stop at any time.
-echo.
 
-REM 配置
-SET PHASE1_CHECKPOINT=
-SET CHECKPOINT=
-SET TOTAL_STAGES=5
+set CONFIG=configs/competition.yaml
+set PHASE1_CHECKPOINT=checkpoints/competition/phase1/world_model_final.pth
 
-REM 可选：使用 Phase 1 权重初始化阶段1
-SET PHASE1_CHECKPOINT=--phase1-checkpoint checkpoints/competition/phase1/world_model_final.pth
-
-FOR %%S IN (1 2 3 4 5) DO (
-    echo ================================================================================
-    echo Stage %%S of %TOTAL_STAGES%
-    echo ================================================================================
-    echo.
-
-    IF %%S==1 (
-        echo [INFO] Starting Stage 1 (Basic Scenario)
-        python train_phase2_stable.py --stage %%S %PHASE1_CHECKPOINT%
-    )
-    IF NOT %%S==1 (
-        echo [INFO] Starting Stage %%S, loading from previous stage
-        python train_phase2_stable.py --stage %%S --prev-checkpoint !CHECKPOINT!
-    )
-
-    IF ERRORLEVEL 1 (
-        echo.
-        echo [ERROR] Stage %%S failed with exit code !ERRORLEVEL!
-        echo [INFO] Please check the error messages above.
-        echo.
-        pause
-        EXIT /B !ERRORLEVEL!
-    )
-
-    REM 更新检查点路径
-    IF %%S==1 SET CHECKPOINT=checkpoints/competition/curriculum/level1/ppo.zip
-    IF %%S==2 SET CHECKPOINT=checkpoints/competition/curriculum/level2/ppo.zip
-    IF %%S==3 SET CHECKPOINT=checkpoints/competition/curriculum/level3/ppo.zip
-    IF %%S==4 SET CHECKPOINT=checkpoints/competition/curriculum/level4/ppo.zip
-    IF %%S==5 SET CHECKPOINT=checkpoints/competition/phase2/shielded_ppo.zip
-
-    echo.
-    echo [OK] Stage %%S completed successfully!
-    echo [INFO] Checkpoint: !CHECKPOINT!
-    echo.
-    echo [INFO] Waiting 3 seconds before next stage...
-    timeout /t 3 /nobreak >nul
-    echo.
+REM Phase 1
+echo [Phase 1] World Model Training...
+conda activate sumo && python train_phase1.py
+if errorlevel 1 (
+    echo [ERROR] Phase 1 failed!
+    pause
+    exit /b 1
 )
 
-echo ================================================================================
-echo All Stages Completed!
-echo ================================================================================
-echo.
-echo [INFO] All 5 curriculum stages have been trained successfully.
-echo [INFO] Final model: checkpoints/competition/phase2/shielded_ppo.zip
-echo.
-echo You can now use the final model for evaluation or submission.
-echo.
+REM Stage 1
+echo [Stage 1] Basic Scenario...
+conda activate sumo && python train_phase2.py --stage 1 --phase1-checkpoint %PHASE1_CHECKPOINT% --config %CONFIG%
+if errorlevel 1 (
+    echo [ERROR] Stage 1 failed!
+    pause
+    exit /b 1
+)
 
+REM Stage 2
+set STAGE1=checkpoints/competition/curriculum/level1/custom_ppo.zip
+conda activate sumo && python train_phase2.py --stage 2 --prev-checkpoint %STAGE1% --config %CONFIG%
+if errorlevel 1 (
+    echo [ERROR] Stage 2 failed!
+    pause
+    exit /b 1
+)
+
+REM Stage 3
+set STAGE2=checkpoints/competition/curriculum/level2/custom_ppo.zip
+conda activate sumo && python train_phase2.py --stage 3 --prev-checkpoint %STAGE2% --config %CONFIG%
+if errorlevel 1 (
+    echo [ERROR] Stage 3 failed!
+    pause
+    exit /b 1
+)
+
+REM Stage 4
+set STAGE3=checkpoints/competition/curriculum/level3/custom_ppo.zip
+conda activate sumo && python train_phase2.py --stage 4 --prev-checkpoint %STAGE3% --config %CONFIG%
+if errorlevel 1 (
+    echo [ERROR] Stage 4 failed!
+    pause
+    exit /b 1
+)
+
+REM Stage 5
+set STAGE4=checkpoints/competition/curriculum/level4/custom_ppo.zip
+conda activate sumo && python train_phase2.py --stage 5 --prev-checkpoint %STAGE4% --config %CONFIG%
+if errorlevel 1 (
+    echo [ERROR] Stage 5 failed!
+    pause
+    exit /b 1
+)
+
+echo.
+echo [SUCCESS] All stages completed!
+echo Final model: checkpoints/competition/curriculum/level5/custom_ppo.zip
+echo.
 pause
