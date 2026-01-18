@@ -850,9 +850,9 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         # ============== 第1步：统计总节点数 ==============
         # 优化：使用纯tensor操作，避免CPU-GPU同步
-        # 确保num_vehicles是1D tensor
+        # 确保num_vehicles是1D tensor - 只squeeze最后一维，保持batch维度
         if num_vehicles.dim() > 1:
-            num_vehicles = num_vehicles.squeeze()
+            num_vehicles = num_vehicles.squeeze(-1)
 
         # 先将num_vehicles限制在max_vehicles以内（在GPU上）
         num_vehicles_clamped = num_vehicles.clamp(max=self.max_vehicles)

@@ -162,22 +162,24 @@ def train_stage(
     policy = policy.to(device)
 
     # ⚡ 性能优化：使用torch.compile()加速模型（PyTorch 2.0+）
-    try:
-        import torch._dynamo as dynamo
-        print("[OPTIMIZE] Applying torch.compile() for maximum performance...")
-        # 使用max-autotune模式获得最佳性能（需要Triton，已安装）
-        # 这是速度最快的模式，预期提升20-30%
-        policy = torch.compile(policy, mode="max-autotune", fullgraph=False)
-        print("[OK] Model compiled successfully (max-autotune mode)")
-    except Exception as e:
-        print(f"[WARN] torch.compile() failed: {e}")
-        print(f"[INFO] Falling back to reduce-overhead mode...")
-        try:
-            policy = torch.compile(policy, mode="reduce-overhead", fullgraph=False)
-            print("[OK] Model compiled successfully (reduce-overhead mode)")
-        except Exception as e2:
-            print(f"[WARN] All compilation modes failed: {e2}")
-            print(f"[INFO] Continuing without compilation")
+    # 已禁用：torch.compile导致动态shape问题，在ideal_policy_v4.py:891处报错
+    # try:
+    #     import torch._dynamo as dynamo
+    #     print("[OPTIMIZE] Applying torch.compile() for maximum performance...")
+    #     # 使用max-autotune模式获得最佳性能（需要Triton，已安装）
+    #     # 这是速度最快的模式，预期提升20-30%
+    #     policy = torch.compile(policy, mode="max-autotune", fullgraph=False)
+    #     print("[OK] Model compiled successfully (max-autotune mode)")
+    # except Exception as e:
+    #     print(f"[WARN] torch.compile() failed: {e}")
+    #     print(f"[INFO] Falling back to reduce-overhead mode...")
+    #     try:
+    #         policy = torch.compile(policy, mode="reduce-overhead", fullgraph=False)
+    #         print("[OK] Model compiled successfully (reduce-overhead mode)")
+    #     except Exception as e2:
+    #         print(f"[WARN] All compilation modes failed: {e2}")
+    #         print(f"[INFO] Continuing without compilation")
+    print("[INFO] torch.compile() is disabled to avoid dynamic shape issues")
 
     # 加载权重
     if prev_checkpoint and os.path.exists(prev_checkpoint):
