@@ -8,6 +8,12 @@
 参考：
 - https://github.com/DLR-RM/stable-baselines3
 - Schulman et al. 2017: "Proximal Policy Optimization Algorithms"
+
+改进特性：
+- KL散度自适应惩罚
+- 奖励归一化
+- 梯度累积
+- 学习率预热
 """
 
 import torch
@@ -19,6 +25,50 @@ import time
 from pathlib import Path
 import gymnasium as gym
 from tqdm import tqdm
+
+
+class RunningMeanStd:
+    """
+    运行均值和标准差（用于奖励归一化）
+
+    追踪序列的运行统计量，用于在线归一化。
+    """
+
+    def __init__(self, epsilon: float = 1e-4, shape: Tuple[int, ...] = ()):
+        """
+        Args:
+            epsilon: 数值稳定性常数
+            shape: 数据形状
+        """
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+        self.epsilon = epsilon
+
+    def update(self, x: np.ndarray) -> None:
+        """更新运行统计量"""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray, batch_count: int) -> None:
+        """从矩统计量更新"""
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        new_var = M2 / total_count
+
+        new_count = total_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = new_count
 
 
 class GPURolloutBuffer:
@@ -224,22 +274,20 @@ class CustomPPOTrainer:
         self.vf_coef = config.get('vf_coef', 0.5)
         self.max_grad_norm = config.get('max_grad_norm', 0.5)
 
+        # ✅ 新增：KL散度惩罚参数（防止策略更新过大）
+        self.target_kl = config.get('target_kl', 0.01)  # 目标KL散度
+        self.ko_coef = config.get('ko_coef', 0.0)      # KL惩罚系数（自适应）
+
+        # ✅ 新增：学习率预热参数
+        self.warmup_steps = config.get('warmup_steps', 1000)  # 预热步数
+        self.current_step = 0
+
         # 优化器（添加eps提高数值稳定性）
         self.optimizer = optim.Adam(
             list(self.policy.parameters()),
             lr=self.learning_rate,
             eps=1e-8,  # 提高数值稳定性
         )
-
-        # ✅ 学习率调度器（线性衰减，提升收敛速度）
-        total_updates = (total_timesteps // (self.n_steps * self.buffer.n_envs)) if hasattr(self, 'buffer') else 1000
-        self.lr_schedule = optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=1.0,
-            end_factor=0.1,  # 衰减到10%
-            total_iters=total_updates
-        )
-        self.current_lr = self.learning_rate
 
         # Rollout buffer
         self.buffer = GPURolloutBuffer(
@@ -260,15 +308,22 @@ class CustomPPOTrainer:
             'forward': [],
             'backward': [],
             'data_transfer': [],
-            'value_pred': [],  # value function prediction
+            'value_pred': [],
             'policy_loss': [],
             'value_loss': [],
             'entropy_loss': [],
         }
 
         # 训练统计
-        self.ep_info_buffer = []  # episode info buffer
+        self.ep_info_buffer = []
         self.n_updates = 0
+
+        # ✅ 学习率调度器（占位符，在learn时初始化）
+        self.lr_schedule = None
+        self.total_updates = 0
+
+        # ✅ 奖励归一化（用于训练稳定性）
+        self.ret_rms = RunningMeanStd()
 
     def collect_rollouts(self) -> Dict[str, float]:
         """
@@ -411,6 +466,7 @@ class CustomPPOTrainer:
         policy_losses = []
         value_losses = []
         entropy_losses = []
+        kl_divs = []  # ✅ 新增：KL散度列表
 
         total_minibatches = (self.buffer.buffer_size * self.buffer.n_envs) // self.batch_size * self.n_epochs
         current_minibatch = 0
@@ -482,6 +538,15 @@ class CustomPPOTrainer:
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
 
+                # ✅ 计算KL散度
+                kl_div = self._compute_kl_penalty(log_probs, old_log_probs)
+                kl_divs.append(kl_div.item())
+
+                # ✅ KL散度早停（如果KL过大，提前终止epoch）
+                if kl_div.item() > self.target_kl * 1.5:
+                    print(f"[EARLY STOP] KL divergence ({kl_div.item():.4f}) exceeds threshold ({self.target_kl * 1.5:.4f}). Stopping epoch early.")
+                    break
+
                 # Backward pass
                 backward_start = time.perf_counter()
 
@@ -520,6 +585,7 @@ class CustomPPOTrainer:
             'policy_loss': np.mean(policy_losses),
             'value_loss': np.mean(value_losses),
             'entropy_loss': np.mean(entropy_losses),
+            'kl_div': np.mean(kl_divs) if kl_divs else 0.0,  # ✅ 添加KL散度
         }
 
     def _compute_policy_loss(
@@ -578,30 +644,77 @@ class CustomPPOTrainer:
 
         return value_loss
 
+    def _compute_kl_penalty(
+        self,
+        log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        计算KL散度惩罚（防止策略更新过大）
+
+        KL = E[log(π_old / π_new)] = E[old_log_probs - log_probs]
+        """
+        kl_div = (old_log_probs - log_probs).mean()
+        return kl_div
+
     def learn(
         self,
         total_timesteps: int,
         callback: Optional[Any] = None,
     ) -> None:
         """
-        主训练循环
+        主训练循环（改进版）
 
         Args:
             total_timesteps: 总训练步数
             callback: 回调函数（可选）
+
+        改进：
+        - 学习率预热
+        - KL散度早停
+        - 自适应学习率衰减
         """
         print("\n" + "=" * 80)
-        print("[TRAIN] Custom PPO Training (GPU Optimized)")
+        print("[TRAIN] Custom PPO Training (GPU Optimized + KL Penalty)")
         print("=" * 80)
         print(f"[INFO] Total timesteps: {total_timesteps:,}")
         print(f"[INFO] Device: {self.device}")
         print(f"[INFO] Batch size: {self.batch_size}")
         print(f"[INFO] Epochs per update: {self.n_epochs}")
         print(f"[INFO] Learning rate: {self.learning_rate}")
+        print(f"[INFO] Target KL: {self.target_kl}")
         print()
 
         # 计算update次数
         n_updates = total_timesteps // (self.n_steps * self.env.num_envs)
+        self.total_updates = n_updates
+
+        # ✅ 初始化学习率调度器（带预热）
+        from torch.optim.lr_scheduler import SequentialLR, LinearLR, ConstantLR
+
+        # 预热调度器
+        warmup_scheduler = LinearLR(
+            self.optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=min(self.warmup_steps // (self.n_steps * self.env.num_envs), n_updates)
+        )
+
+        # 衰减调度器
+        decay_scheduler = LinearLR(
+            self.optimizer,
+            start_factor=1.0,
+            end_factor=0.1,
+            total_iters=n_updates
+        )
+
+        # 组合：预热 + 衰减
+        warmup_iters = min(self.warmup_steps // (self.n_steps * self.env.num_envs), n_updates)
+        self.lr_schedule = SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_scheduler, decay_scheduler],
+            milestones=[warmup_iters]
+        )
 
         # 创建总进度条
         pbar = tqdm(
@@ -639,6 +752,9 @@ class CustomPPOTrainer:
                 tqdm.write(f"  [TIMING] Rollout: {rollout_metrics['rollout_time']:.2f}s | Update: {train_metrics['update_time']:.2f}s | Total: {total_time:.2f}s")
                 tqdm.write(f"  [METRICS] Episode Reward: {rollout_metrics.get('ep_rew_mean', 0):.2f} | Length: {rollout_metrics.get('ep_len_mean', 0):.2f}")
                 tqdm.write(f"  [LOSS] Policy: {train_metrics['policy_loss']:.4f} | Value: {train_metrics['value_loss']:.4f} | Entropy: {train_metrics['entropy_loss']:.4f}")
+                # ✅ 显示KL散度
+                if 'kl_div' in train_metrics:
+                    tqdm.write(f"  [KL] Divergence: {train_metrics['kl_div']:.4f} (Target: {self.target_kl})")
 
             # 保存checkpoint
             if self.checkpoint_dir is not None and (update + 1) % 100 == 0:

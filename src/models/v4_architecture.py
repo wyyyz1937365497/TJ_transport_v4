@@ -42,7 +42,7 @@ class RiskSensitiveGNN(nn.Module):
     """
 
     def __init__(
-        self,
+    self,
         node_dim: int = 9,
         edge_dim: int = 4,
         hidden_dim: int = 64,
@@ -77,27 +77,13 @@ class RiskSensitiveGNN(nn.Module):
         )
 
         # 多层GNN（使用PyTorch Geometric）
-        try:
-            from torch_geometric.nn import GATConv
-            self.gnn_layers = nn.ModuleList([
-                GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
-                        edge_dim=hidden_dim, dropout=dropout, concat=True)
-                for _ in range(num_layers)
-            ])
-            self.use_pyg = True
-        except ImportError:
-            # Fallback: 手动实现注意力GNN
-            print("[WARNING] PyTorch Geometric not installed, using simplified GNN")
-            self.gnn_layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(hidden_dim * 2, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout)
-                )
-                for _ in range(num_layers)
-            ])
-            self.use_pyg = False
+        from torch_geometric.nn import GATConv
+        self.gnn_layers = nn.ModuleList([
+            GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
+                    edge_dim=hidden_dim, dropout=dropout, concat=True)
+            for _ in range(num_layers)
+        ])
+        self.use_pyg = True
 
         # 风险感知注意力偏置
         self.risk_bias = nn.Sequential(
@@ -146,24 +132,10 @@ class RiskSensitiveGNN(nn.Module):
         risk_bias = self.risk_bias(risk_features)  # [N, 1]
 
         # 3. GNN层传播
-        if self.use_pyg:
-            for gnn_layer in self.gnn_layers:
-                # PyG版本
-                h = gnn_layer(h, edge_index, e)
-                h = F.relu(h)
-        else:
-            # 简化版本
-            for layer in self.gnn_layers:
-                # 聚合邻居特征
-                row, col = edge_index
-                neighbor_features = h[col]  # [E, hidden_dim]
-
-                # 拼接当前节点和邻居
-                combined = torch.cat([h[row], neighbor_features], dim=-1)
-                h_new = layer(combined)
-
-                # 更新
-                h = h_new + h  # 残差连接
+        for gnn_layer in self.gnn_layers:
+            # PyG版本
+            h = gnn_layer(h, edge_index, e)
+            h = F.relu(h)
 
         # 4. 应用风险偏置
         h = h + risk_bias  # 广播风险偏置

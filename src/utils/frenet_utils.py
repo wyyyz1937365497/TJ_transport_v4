@@ -175,14 +175,115 @@ class FrenetCoordinateSystem:
                 self.edge_to_lanes[edge_id].append(lane_id)
 
     def _infer_lane_shape(self, edge, lane) -> List[Tuple[float, float]]:
-        """推断车道shape(当net.xml中没有明确shape时)"""
-        # 简化处理: 使用from和to junction的坐标
-        from_junction = edge.get('from')
-        to_junction = edge.get('to')
+        """
+        推断车道shape(当net.xml中没有明确shape时)
 
-        # 这里需要解析junction坐标,暂时返回简化直线
-        # 实际实现中需要遍历junction元素获取坐标
-        return [(0.0, 0.0), (100.0, 0.0)]  # 占位符
+        完整实现：使用from和to junction的坐标构建车道几何
+
+        Args:
+            edge: edge元素（ET.Element）
+            lane: lane元素（ET.Element）
+
+        Returns:
+            List[Tuple[float, float]]: 车道shape坐标点列表
+        """
+        from_junction_id = edge.get('from')
+        to_junction_id = edge.get('to')
+
+        # 解析junction坐标（从已缓存的junction字典或重新解析）
+        if not hasattr(self, '_junction_coords'):
+            self._junction_coords = self._parse_junction_coordinates()
+
+        from_coords = self._junction_coords.get(from_junction_id)
+        to_coords = self._junction_coords.get(to_junction_id)
+
+        if from_coords is None or to_coords is None:
+            # 如果junction坐标缺失，回退到长度+角度估算
+            length = float(lane.get('length', 100.0))
+            # 默认水平向右
+            return [(0.0, 0.0), (length, 0.0)]
+
+        # 计算车道偏移
+        # SUMO中lane索引从0开始（右侧车道）
+        lane_index = int(lane.get('index', 0))
+
+        # 获取edge的方向（起点→终点的向量）
+        dx = to_coords[0] - from_coords[0]
+        dy = to_coords[1] - from_coords[1]
+        length = (dx ** 2 + dy ** 2) ** 0.5
+
+        if length < 0.1:
+            # 长度过短，直接返回两点
+            return [from_coords, to_coords]
+
+        # 归一化方向向量
+        dir_x = dx / length
+        dir_y = dy / length
+
+        # 计算垂直向量（用于车道偏移）
+        # 在SUMO中，lane索引增加向左侧偏移
+        perp_x = -dir_y  # 逆时针旋转90度
+        perp_y = dir_x
+
+        # 标准车道宽度（SUMO默认为3.2m，可配置）
+        lane_width = float(lane.get('width', 3.2))
+
+        # 计算lane的偏移量（从右侧向左数）
+        offset = lane_index * lane_width
+
+        # 起点和终点坐标（考虑车道偏移）
+        start_x = from_coords[0] + perp_x * offset
+        start_y = from_coords[1] + perp_y * offset
+
+        end_x = to_coords[0] + perp_x * offset
+        end_y = to_coords[1] + perp_y * offset
+
+        # 对于曲线道路（有junction形状信息），插值生成中间点
+        # 这里简化为直线连接（因为shape缺失）
+        shape = [(start_x, start_y), (end_x, end_y)]
+
+        return shape
+
+    def _parse_junction_coordinates(self) -> Dict[str, Tuple[float, float]]:
+        """
+        解析所有junction的坐标
+
+        Returns:
+            Dict[str, Tuple[float, float]]: junction_id -> (x, y)
+        """
+        tree = ET.parse(self.net_xml_path)
+        root = tree.getroot()
+
+        junction_coords = {}
+
+        # 方法1：从junction元素获取（如果有明确的x,y属性）
+        for junction in root.findall('junction'):
+            junction_id = junction.get('id')
+            x = junction.get('x')
+            y = junction.get('y')
+
+            if x is not None and y is not None:
+                junction_coords[junction_id] = (float(x), float(y))
+
+        # 方法2：对于没有坐标的junction，从连接的lane shape推断
+        for junction in root.findall('junction'):
+            junction_id = junction.get('id')
+            if junction_id in junction_coords:
+                continue
+
+            # 从该junction连接的lane推断位置
+            # 简化：使用第一个incoming lane的终点
+            for inc_lane in junction.findall('incLane'):
+                lane_id = inc_lane.get('id')
+                # 从已解析的lanes中查找
+                if lane_id in self.lanes:
+                    lane_shape = self.lanes[lane_id].shape
+                    if lane_shape:
+                        # 使用lane的终点作为junction位置
+                        junction_coords[junction_id] = lane_shape[-1]
+                        break
+
+        return junction_coords
 
     def _identify_bottlenecks(self):
         """识别瓶颈区域(基于路网拓扑)"""

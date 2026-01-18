@@ -313,7 +313,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
     def _compute_competition_global_stats(self, vehicle_states: Dict[str, Dict]) -> np.ndarray:
         """
-        计算比赛需要的全局统计特征
+        计算比赛需要的全局统计特征（向量化优化版本）
 
         返回32维向量：
         [0-15]: 原有统计
@@ -324,24 +324,22 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             return np.zeros(32)
 
         stats = np.zeros(32)
+        num_vehicles = len(vehicle_states)
 
         # [0-15]: 原有统计（使用父类的GPU统计方法）
         try:
-            # 转换为GPU tensor格式
-            vehicle_data = []
-            for vid in vehicle_states.keys():
-                state = vehicle_states[vid]
-                vehicle_data.append([
-                    state.get('s', 0.0),
-                    state.get('d', 0.0),
-                    state.get('vs', 0.0),
-                    state.get('vd', 0.0),
-                    state.get('speed', 0.0),
-                    state.get('acceleration', 0.0),
-                    state.get('lane_index', 0.0),
-                    state.get('angle', 0.0),
-                    1.0 if vid in self.icv_ids else 0.0
-                ])
+            # 向量化提取数据
+            vehicle_data = [[
+                state.get('s', 0.0),
+                state.get('d', 0.0),
+                state.get('vs', 0.0),
+                state.get('vd', 0.0),
+                state.get('speed', 0.0),
+                state.get('acceleration', 0.0),
+                state.get('lane_index', 0.0),
+                state.get('angle', 0.0),
+                1.0 if vid in self.icv_ids else 0.0
+            ] for vid, state in vehicle_states.items()]
 
             if vehicle_data:
                 states_tensor = torch.tensor(vehicle_data, dtype=torch.float32, device=self.device)
@@ -353,34 +351,35 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             # 如果GPU统计失败，使用零向量
             stats[:16] = 0.0
 
-        speeds = [v['speed'] for v in vehicle_states.values()]
-        accelerations = [v['acceleration'] for v in vehicle_states.values()]
+        # 向量化提取所有速度和加速度
+        speeds = np.array([v['speed'] for v in vehicle_states.values()])
+        accelerations = np.array([v['acceleration'] for v in vehicle_states.values()])
+        d_values = np.array([abs(v['d']) for v in vehicle_states.values()])
 
-        # [16-19]: 效率指标
-        stats[16] = len(speeds) / max(self.current_step, 1)  # 吞吐量（车辆数/时间）
-        stats[17] = np.mean(speeds) if speeds else 0.0        # 平均速度
-        stats[18] = sum(1 for s in speeds if s > 5.0) / max(len(speeds), 1)  # 高速车辆比例
-        stats[19] = np.percentile(speeds, 50) if speeds else 0.0  # 速度中位数
+        # [16-19]: 效率指标（向量化计算）
+        stats[16] = num_vehicles / max(self.current_step, 1)  # 吞吐量
+        stats[17] = np.mean(speeds)  # 平均速度
+        stats[18] = np.mean(speeds > 5.0)  # 高速车辆比例
+        stats[19] = np.median(speeds)  # 速度中位数
 
-        # [20-23]: 拥堵指标
-        stats[20] = sum(1 for s in speeds if s < 1.0) / max(len(speeds), 1)  # 慢速车辆比例（拥堵）
-        stats[21] = np.std(speeds) if len(speeds) > 1 else 0.0  # 速度标准差
-        stats[22] = sum(1 for a in accelerations if a < -2.0) / max(len(accelerations), 1)  # 急减速比例
-        stats[23] = sum(1 for s in speeds if s < 0.1) / max(len(speeds), 1)  # 停车比例
+        # [20-23]: 拥堵指标（向量化计算）
+        stats[20] = np.mean(speeds < 1.0)  # 慢速车辆比例
+        stats[21] = np.std(speeds) if num_vehicles > 1 else 0.0  # 速度标准差
+        stats[22] = np.mean(accelerations < -2.0)  # 急减速比例
+        stats[23] = np.mean(speeds < 0.1)  # 停车比例
 
-        # [24-27]: 车道利用率
-        lane_counts = defaultdict(int)
-        for v in vehicle_states.values():
-            lane_counts[v['lane_index']] += 1
+        # [24-27]: 车道利用率（向量化计算）
+        lane_indices = np.array([v['lane_index'] for v in vehicle_states.values()])
+        unique_lanes, lane_counts = np.unique(lane_indices, return_counts=True)
 
-        if lane_counts:
-            stats[24] = max(lane_counts.values()) / len(vehicle_states)  # 最拥挤车道占有率
-            stats[25] = len(lane_counts)  # 使用车道数
-            stats[26] = np.std(list(lane_counts.values()))  # 车道分布标准差
+        if len(unique_lanes) > 0:
+            stats[24] = np.max(lane_counts) / num_vehicles  # 最拥挤车道占有率
+            stats[25] = len(unique_lanes)  # 使用车道数
+            stats[26] = np.std(lane_counts) if len(unique_lanes) > 1 else 0.0  # 车道分布标准差
         else:
             stats[24:27] = 0.0
 
-        stats[27] = sum(1 for v in vehicle_states.values() if abs(v['d']) > 1.0) / max(len(vehicle_states), 1)  # 偏离车道中心的比例
+        stats[27] = np.mean(d_values > 1.0)  # 偏离车道中心的比例
 
         # [28-31]: 预留空间（可添加更多指标）
         stats[28:32] = 0.0
@@ -430,42 +429,45 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self.intervention_stats['controlled_vehicles'] = len(actions)
 
     def _update_performance_metrics(self, observation: Dict[str, Any]):
-        """更新性能指标"""
+        """更新性能指标（向量化优化版本）"""
         vehicle_states = observation.get('vehicle_states', {})
 
         if not vehicle_states:
             return
 
-        speeds = [v['speed'] for v in vehicle_states.values()]
+        # 向量化提取速度
+        speeds = np.array([v['speed'] for v in vehicle_states.values()])
+        num_vehicles = len(speeds)
 
         # 更新速度统计
-        self.performance_metrics['avg_speed'] = np.mean(speeds) if speeds else 0.0
-        self.performance_metrics['speed_std'] = np.std(speeds) if len(speeds) > 1 else 0.0
+        self.performance_metrics['avg_speed'] = np.mean(speeds)
+        self.performance_metrics['speed_std'] = np.std(speeds) if num_vehicles > 1 else 0.0
 
-        # 更新停车比例
-        stopped = sum(1 for s in speeds if s < 0.1)
-        self.performance_metrics['stopped_ratio'] = stopped / len(speeds) if speeds else 0.0
+        # 更新停车比例（向量化）
+        self.performance_metrics['stopped_ratio'] = np.mean(speeds < 0.1)
 
         # 更新吞吐量
         current_time = self.current_step * self.config.get('step_length', 0.1)
         self.performance_metrics['throughput'] = len(self.stats.get('arrived_vehicles', [])) / max(current_time, 1.0)
 
-        # 更新拥堵水平（速度<1m/s的车辆比例）
-        self.performance_metrics['congestion_level'] = sum(1 for s in speeds if s < 1.0) / len(speeds) if speeds else 0.0
+        # 更新拥堵水平（向量化）
+        self.performance_metrics['congestion_level'] = np.mean(speeds < 1.0)
 
-        # 更新旅行时间
-        for veh_id in self.stats.get('arrived_vehicles', []):
-            if veh_id in self.vehicle_departure_times:
-                departure_step = self.vehicle_departure_times.pop(veh_id, self.current_step)
-                travel_time = self.current_step - departure_step
-                self.vehicle_travel_times[veh_id] = travel_time
+        # 更新旅行时间（向量化处理）
+        arrived_vehicles = self.stats.get('arrived_vehicles', [])
+        if arrived_vehicles:
+            # 批量处理到达车辆的旅行时间
+            for veh_id in arrived_vehicles:
+                if veh_id in self.vehicle_departure_times:
+                    departure_step = self.vehicle_departure_times.pop(veh_id, self.current_step)
+                    self.vehicle_travel_times[veh_id] = self.current_step - departure_step
 
         if self.vehicle_travel_times:
             self.performance_metrics['avg_travel_time'] = np.mean(list(self.vehicle_travel_times.values()))
 
     def _compute_competition_reward(self, observation: Dict[str, Any]) -> float:
         """
-        计算比赛标准奖励
+        计算比赛标准奖励（向量化优化版本）
 
         奖励 = 效率得分 + 稳定性得分 - 干预成本惩罚
 
@@ -476,11 +478,13 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         if not vehicle_states:
             return 0.0
 
-        speeds = [v['speed'] for v in vehicle_states.values()]
+        # 向量化提取速度
+        speeds = np.array([v['speed'] for v in vehicle_states.values()])
+        num_vehicles = len(speeds)
 
         # ========== 1. 效率得分 Sefficiency ==========
         # 1.1 速度得分（鼓励高速）
-        avg_speed = np.mean(speeds) if speeds else 0.0
+        avg_speed = np.mean(speeds)
         speed_score = avg_speed * self.speed_norm_factor  # 使用配置的归一化因子
 
         # 1.2 吞吐量得分（鼓励高到达率）
@@ -502,18 +506,18 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         # ========== 2. 稳定性得分 Sstability ==========
         # 2.1 速度方差惩罚
-        if len(speeds) > 1:
+        if num_vehicles > 1:
             speed_std = np.std(speeds)
             stability_score = -self.stability_weight * (speed_std / 10.0)  # 使用配置的权重
         else:
             stability_score = 0.0
 
-        # 2.2 拥堵惩罚（使用配置的权重）
-        congestion_ratio = sum(1 for s in speeds if s < 1.0) / len(speeds) if speeds else 0.0
+        # 2.2 拥堵惩罚（向量化）
+        congestion_ratio = np.mean(speeds < 1.0)
         congestion_penalty = -self.congestion_penalty_weight * congestion_ratio
 
-        # 2.3 停车惩罚（使用配置的权重）
-        stopped_ratio = sum(1 for s in speeds if s < 0.1) / len(speeds) if speeds else 0.0
+        # 2.3 停车惩罚（向量化）
+        stopped_ratio = np.mean(speeds < 0.1)
         stopped_penalty = -self.stopped_penalty_weight * stopped_ratio
 
         # 综合稳定性得分
@@ -522,11 +526,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         # ========== 3. 干预成本惩罚 Pint ==========
         # 3.1 受控车辆数量惩罚（初赛中ICV比例固定为25%，这里只惩罚控制幅度）
         control_magnitude = self.intervention_stats.get('control_magnitude', 0.0)
-        magnitude_penalty = 0.01 * control_magnitude / max(len(speeds), 1)
+        magnitude_penalty = 0.01 * control_magnitude / max(num_vehicles, 1)
 
         # 3.2 换道惩罚（换道是高风险操作）
         lane_changes = self.intervention_stats.get('total_lane_changes', 0)
-        lane_change_penalty = 0.1 * lane_changes / max(len(speeds), 1)
+        lane_change_penalty = 0.1 * lane_changes / max(num_vehicles, 1)
 
         # 干预成本惩罚因子（范围：0-1，越小惩罚越大）
         intervention_cost = magnitude_penalty + lane_change_penalty

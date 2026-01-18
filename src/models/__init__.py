@@ -1,61 +1,44 @@
 """
-神经网络模型模块
+神经网络模型模块（已移除SB3依赖）
+
+主要组件：
+- v4_architecture.py: 核心架构模块（GNN、RSSM、控制器等）
+- ideal_policy_v4.py: 独立PPO策略网络（无SB3依赖）
 """
 
-# 可选导入 - 避免在缺少依赖时失败
-try:
-    from .gnn import RiskSensitiveGNN, GraphBuilder
-    _gnn_available = True
-except ImportError:
-    _gnn_available = False
+from .v4_architecture import (
+    RiskSensitiveGNN,
+    MultiScaleRSSM,
+    EnhancedDynamicWeightGating,
+    EnhancedInfluenceBasedController,
+    LagrangianOptimizer,
+    IdealTrafficControllerV4
+)
 
-try:
-    from .world_model import ProgressiveWorldModel, WorldModelLoss
-    _world_model_available = True
-except ImportError:
-    _world_model_available = False
+from .ideal_policy_v4 import (
+    IdealTrafficPolicyV4,
+    DiagonalGaussianDistribution,
+    compute_risk_features_jit,
+    safe_item,
+    create_policy_v4,
+    create_ideal_traffic_policy_v4  # 兼容工厂函数（返回类）
+)
 
-try:
-    from .controller import InfluenceDrivenController, ValueNetwork, CostNetwork
-    _controller_available = True
-except ImportError:
-    _controller_available = False
+# 导出所有模块
+__all__ = [
+    # 核心架构
+    'RiskSensitiveGNN',
+    'MultiScaleRSSM',
+    'EnhancedDynamicWeightGating',
+    'EnhancedInfluenceBasedController',
+    'LagrangianOptimizer',
+    'IdealTrafficControllerV4',
 
-try:
-    from .safety import DualModeSafetyShield, SafetyMonitor
-    _safety_available = True
-except ImportError:
-    _safety_available = False
-
-try:
-    from .traffic_controller import TrafficController, create_model_from_config
-    _traffic_controller_available = True
-except ImportError:
-    _traffic_controller_available = False
-
-try:
-    from .sb3_full_policy import FullTrafficController, FullTrafficActorCriticPolicy, create_full_traffic_policy
-    _sb3_full_policy_available = True
-except ImportError:
-    _sb3_full_policy_available = False
-
-# 导出可用的模块
-__all__ = []
-
-if _gnn_available:
-    __all__.extend(['RiskSensitiveGNN', 'GraphBuilder'])
-
-if _world_model_available:
-    __all__.extend(['ProgressiveWorldModel', 'WorldModelLoss'])
-
-if _controller_available:
-    __all__.extend(['InfluenceDrivenController', 'ValueNetwork', 'CostNetwork'])
-
-if _safety_available:
-    __all__.extend(['DualModeSafetyShield', 'SafetyMonitor'])
-
-if _traffic_controller_available:
-    __all__.extend(['TrafficController', 'create_model_from_config'])
-
-if _sb3_full_policy_available:
-    __all__.extend(['FullTrafficController', 'FullTrafficActorCriticPolicy', 'create_full_traffic_policy'])
+    # PPO策略网络
+    'IdealTrafficPolicyV4',
+    'DiagonalGaussianDistribution',
+    'compute_risk_features_jit',
+    'safe_item',
+    'create_policy_v4',
+    'create_ideal_traffic_policy_v4',  # 兼容性别名
+]

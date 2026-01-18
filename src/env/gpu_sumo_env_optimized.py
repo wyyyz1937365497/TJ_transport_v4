@@ -412,40 +412,116 @@ class GPUSumoEnvironmentOptimized:
                 logger.debug(f"车辆 {veh_id} 控制失败: {e}")
 
     def _safe_change_lane(self, veh_id: str):
-        """安全换道（简化版）"""
+        """
+        安全换道（改进版）
+
+        考虑安全性：
+        1. 检查目标车道是否有足够空间
+        2. 检查后车距离是否安全
+        3. 优先向右换道（慢车靠右规则）
+        """
         try:
             current_lane = traci.vehicle.getLaneIndex(veh_id)
             road_id = traci.vehicle.getRoadID(veh_id)
             lane_count = traci.edge.getLaneNumber(road_id)
+            current_pos = traci.vehicle.getLanePosition(veh_id)
+            current_speed = traci.vehicle.getSpeed(veh_id)
 
-            # 简单策略：优先向右换道
+            # 安全距离参数（基于当前速度）
+            safe_gap_front = max(10.0, current_speed * 2.0)  # 前车最小安全距离
+            safe_gap_rear = max(5.0, current_speed * 1.0)    # 后车最小安全距离
+
+            # 尝试向右换道（优先）
             if current_lane < lane_count - 1:
-                traci.vehicle.changeLane(veh_id, current_lane + 1, 5.0)
-            elif current_lane > 0:
-                traci.vehicle.changeLane(veh_id, current_lane - 1, 5.0)
+                target_lane = current_lane + 1
+                if self._is_lane_change_safe(veh_id, target_lane, current_pos, safe_gap_front, safe_gap_rear):
+                    traci.vehicle.changeLane(veh_id, target_lane, 5.0)
+                    return
+
+            # 尝试向左换道（备选）
+            if current_lane > 0:
+                target_lane = current_lane - 1
+                if self._is_lane_change_safe(veh_id, target_lane, current_pos, safe_gap_front, safe_gap_rear):
+                    traci.vehicle.changeLane(veh_id, target_lane, 5.0)
+                    return
 
         except Exception as e:
             logger.debug(f"车辆 {veh_id} 换道失败: {e}")
 
+    def _is_lane_change_safe(
+        self,
+        veh_id: str,
+        target_lane: int,
+        current_pos: float,
+        safe_gap_front: float,
+        safe_gap_rear: float
+    ) -> bool:
+        """检查换道是否安全"""
+        try:
+            # 获取目标车道上的所有车辆
+            road_id = traci.vehicle.getRoadID(veh_id)
+            target_lane_id = f"{road_id}_{target_lane}"
+
+            # 遍历同车道的所有车辆
+            vehicles_on_target_lane = []
+            for v in traci.vehicle.getIDList():
+                try:
+                    if traci.vehicle.getLaneID(v) == target_lane_id:
+                        v_pos = traci.vehicle.getLanePosition(v)
+                        vehicles_on_target_lane.append((v, v_pos))
+                except:
+                    continue
+
+            # 检查前后车距离
+            for v, v_pos in vehicles_on_target_lane:
+                distance = v_pos - current_pos
+                # 前车距离检查
+                if distance > 0 and distance < safe_gap_front:
+                    return False
+                # 后车距离检查
+                if distance < 0 and abs(distance) < safe_gap_rear:
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"安全检查失败: {e}")
+            return False
+
     def _compute_reward_gpu(self, observation: Dict[str, Any]) -> float:
-        """计算奖励（简化版）"""
+        """
+        计算奖励（改进版，向量化）
+
+        综合考虑：
+        1. 平均速度（效率）
+        2. 速度方差（稳定性）
+        3. 慢速车比例（拥堵）
+        """
         num_vehicles = observation.get('num_vehicles', 0)
         if num_vehicles == 0:
             return 0.0
 
         vehicle_states = observation.get('vehicle_states', {})
 
-        # 计算平均速度（从dict中提取）
-        total_speed = 0.0
-        count = 0
-        for state in vehicle_states.values():
-            if isinstance(state, dict):
-                speed = state.get('speed', 0.0)
-                total_speed += speed
-                count += 1
+        # 向量化提取所有速度
+        speeds = np.array([
+            state.get('speed', 0.0)
+            for state in vehicle_states.values()
+            if isinstance(state, dict)
+        ])
 
-        avg_speed = total_speed / count if count > 0 else 0.0
-        return avg_speed
+        if len(speeds) == 0:
+            return 0.0
+
+        # 计算综合奖励
+        avg_speed = np.mean(speeds)
+        speed_std = np.std(speeds) if len(speeds) > 1 else 0.0
+        congestion_ratio = np.mean(speeds < 1.0)  # 慢速车比例（<1m/s）
+
+        # 奖励 = 平均速度 - 速度方差惩罚 - 拥堵惩罚
+        reward = avg_speed - 0.1 * speed_std - 2.0 * congestion_ratio
+
+        return float(reward)
 
     def _is_done(self) -> bool:
         """检查episode是否结束"""
