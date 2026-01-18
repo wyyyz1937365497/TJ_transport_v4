@@ -67,19 +67,35 @@ class WorldModelDataset(torch.utils.data.Dataset):
         env = CompetitionSumoEnv(config=self.env_config)
 
         for episode in tqdm(range(self.num_episodes), desc="Collecting data"):
-            obs, _ = env.reset(seed=self.seed + episode)
+            # 设置随机种子（如果环境支持）
+            if hasattr(env, 'seed'):
+                env.seed(self.seed + episode)
+
+            obs = env.reset()
 
             for step in range(self.steps_per_episode):
-                # 随机动作
-                action = env.action_space.sample()
+                # 生成随机动作字典 {vehicle_id: [acceleration, lane_change]}
+                actions = {}
+                if 'vehicles' in obs and 'id' in obs['vehicles']:
+                    vehicle_ids = obs['vehicles']['id']
+                    for i, veh_id in enumerate(vehicle_ids):
+                        # 随机加速度 [-3, 2] m/s²
+                        accel = np.random.uniform(-3.0, 2.0)
+                        # 随机换道概率 [0, 1]
+                        lane_change = np.random.uniform(0, 1)
+                        actions[str(veh_id)] = np.array([accel, lane_change])
 
-                next_obs, reward, done, truncated, info = env.step(action)
+                # 如果没有车辆，跳过这个step
+                if not actions:
+                    continue
+
+                next_obs, reward, done, info = env.step(actions)
 
                 # 存储数据
                 self.observations.append(obs)
                 self.next_observations.append(next_obs)
 
-                if done or truncated:
+                if done:
                     break
 
                 obs = next_obs

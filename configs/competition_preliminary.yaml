@@ -108,7 +108,7 @@ training:
     num_episodes: 100       # 数据收集episodes
     epochs: 50              # 训练轮数
     batch_size: 256
-    learning_rate: 1e-4
+    learning_rate: 0.0001   # 1e-4
     num_parallel_workers: 16
     use_cache: true
     use_curriculum: true    # 使用课程学习
@@ -124,7 +124,7 @@ training:
     update_epochs: 5       # 减少epoch避免过拟合
 
     # 学习率
-    learning_rate: 3e-4
+    learning_rate: 0.0003   # 3e-4
 
     # PPO超参数
     gamma: 0.99            # 折扣因子

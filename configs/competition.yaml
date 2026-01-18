@@ -109,7 +109,7 @@ training:
     num_episodes: 50  # 数据收集episodes
     epochs: 30  # 训练轮数
     batch_size: 256
-    learning_rate: 1e-4
+    learning_rate: 0.0001  # 1e-4
     num_parallel_workers: 16
     use_cache: true  # 使用数据缓存
     use_curriculum: true  # 启用课程学习（从Level 1逐步晋级到Level 5）
@@ -125,7 +125,7 @@ training:
     update_epochs: 5  # ✅ 减少epoch避免过拟合（10 → 5）
 
     # 学习率
-    learning_rate: 3e-4
+    learning_rate: 0.0003  # 3e-4
 
     # PPO超参数
     gamma: 0.99  # 折扣因子
@@ -144,7 +144,7 @@ training:
   phase3:
     total_timesteps: 100000
     num_envs: 4
-    learning_rate: 1e-4
+    learning_rate: 0.0001  # 1e-4
     n_steps: 2048
     batch_size: 64
     update_epochs: 10
