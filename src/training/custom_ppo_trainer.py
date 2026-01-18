@@ -91,12 +91,13 @@ class GPURolloutBuffer:
         episode_starts_tensor = torch.as_tensor(episode_starts, dtype=torch.float32, device=self.device)
 
         # 存储到GPU buffer
+        # 关键：使用detach()断开计算图，避免在update时重复backward
         self.observations[self.pos] = obs_tensor
         self.actions[self.pos] = actions_tensor
         self.rewards[self.pos] = rewards_tensor
         self.episode_starts[self.pos] = episode_starts_tensor
-        self.values[self.pos] = values.flatten()
-        self.log_probs[self.pos] = log_probs.flatten()
+        self.values[self.pos] = values.detach().flatten()      # ✅ 断开计算图
+        self.log_probs[self.pos] = log_probs.detach().flatten()  # ✅ 断开计算图
 
         self.pos += 1
         if self.pos >= self.buffer_size:
@@ -222,10 +223,11 @@ class CustomPPOTrainer:
         self.vf_coef = config.get('vf_coef', 0.5)
         self.max_grad_norm = config.get('max_grad_norm', 0.5)
 
-        # 优化器
+        # 优化器（添加eps提高数值稳定性）
         self.optimizer = optim.Adam(
             list(self.policy.parameters()),
             lr=self.learning_rate,
+            eps=1e-8,  # 提高数值稳定性
         )
 
         # 学习率调度器（可选）
@@ -327,6 +329,12 @@ class CustomPPOTrainer:
 
             obs = next_obs
 
+            # 每256步打印一次进度
+            if (step + 1) % 256 == 0:
+                elapsed = time.perf_counter() - start_time
+                progress = (step + 1) / self.n_steps * 100
+                print(f"[ROLLOUT] {step+1}/{self.n_steps} steps ({progress:.1f}%) | Elapsed: {elapsed:.1f}s")
+
         # 最后的value估计（用于GAE）
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -405,6 +413,9 @@ class CustomPPOTrainer:
         value_losses = []
         entropy_losses = []
 
+        total_minibatches = (self.buffer.buffer_size * self.buffer.n_envs) // self.batch_size * self.n_epochs
+        current_minibatch = 0
+
         for epoch in range(self.n_epochs):
             epoch_start = time.perf_counter()
 
@@ -412,6 +423,12 @@ class CustomPPOTrainer:
             minibatches = self.buffer.get(self.batch_size)
 
             for minibatch in minibatches:
+                current_minibatch += 1
+
+                # 每32个minibatch打印一次进度
+                if current_minibatch % 32 == 0:
+                    progress = current_minibatch / total_minibatches * 100
+                    print(f"[UPDATE] Epoch {epoch+1}/{self.n_epochs} | Minibatch {current_minibatch}/{total_minibatches} ({progress:.1f}%)")
                 forward_start = time.perf_counter()
 
                 # 准备数据
@@ -430,23 +447,36 @@ class CustomPPOTrainer:
                 values = values.flatten()
                 log_probs = log_probs.flatten()
 
+                # 数值稳定性：清理NaN/Inf
+                log_probs = torch.nan_to_num(log_probs, nan=0.0, posinf=10.0, neginf=-10.0)
+                old_log_probs = torch.nan_to_num(old_log_probs, nan=0.0, posinf=10.0, neginf=-10.0)
+
                 forward_time = time.perf_counter() - forward_start
                 self.timings['forward'].append(forward_time)
 
-                # 计算ratio
-                ratio = torch.exp(log_probs - old_log_probs)
+                # 计算ratio（带数值稳定性保护）
+                log_ratio = log_probs - old_log_probs
+                # 限制log_ratio范围，防止exp爆炸
+                log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+                ratio = torch.exp(log_ratio)
 
                 # PPO clip loss
                 policy_loss = self._compute_policy_loss(ratio, advantages_mb)
                 value_loss = self._compute_value_loss(values, returns_mb, old_values)
                 entropy_loss = -entropy.mean()
 
-                # Total loss
+                # Total loss（带数值稳定性检查）
                 loss = (
                     policy_loss
                     + self.vf_coef * value_loss
                     + self.ent_coef * entropy_loss
                 )
+
+                # 检查loss是否为NaN或Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[WARNING] Loss is NaN or Inf! Skipping this minibatch update.")
+                    print(f"  policy_loss: {policy_loss.item()}, value_loss: {value_loss.item()}, entropy_loss: {entropy_loss.item()}")
+                    continue  # 跳过这个minibatch
 
                 # 记录损失
                 policy_losses.append(policy_loss.item())
@@ -458,7 +488,14 @@ class CustomPPOTrainer:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+                # 检查梯度是否异常
+                total_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                if torch.isnan(total_norm) or torch.isinf(total_norm):
+                    print(f"[WARNING] Gradient norm is NaN or Inf! Skipping optimizer step.")
+                    print(f"  Total norm: {total_norm.item()}")
+                    continue  # 跳过优化器步骤
+
                 self.optimizer.step()
 
                 backward_time = time.perf_counter() - backward_start
@@ -495,7 +532,14 @@ class CustomPPOTrainer:
         计算PPO policy loss（clipped surrogate objective）
 
         L^CLIP = E[min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)]
+
+        数值稳定性：清理NaN/Inf
         """
+        # 清理ratio中的异常值
+        ratio = torch.nan_to_num(ratio, nan=1.0, posinf=10.0, neginf=0.0)
+        # 清理advantages中的异常值
+        advantages = torch.nan_to_num(advantages, nan=0.0, posinf=10.0, neginf=-10.0)
+
         # Clipped surrogate objective
         policy_loss = -torch.min(
             ratio * advantages,
@@ -513,12 +557,16 @@ class CustomPPOTrainer:
         """
         计算value function loss
 
-        可以选择使用clipped value loss（更稳定）
+        数值稳定性：清理NaN/Inf
         """
+        # 清理values和returns中的异常值
+        values = torch.nan_to_num(values, nan=0.0, posinf=10.0, neginf=-10.0)
+        returns = torch.nan_to_num(returns, nan=0.0, posinf=10.0, neginf=-10.0)
+
         # 标准MSE loss
         value_loss = nn.functional.mse_loss(values, returns)
 
-        # 可选：使用clipped value loss（类似PPO clip）
+        # 可选：使用clipped value loss（更稳定）
         # value_pred_clipped = old_values + torch.clamp(
         #     values - old_values,
         #     -self.clip_range,

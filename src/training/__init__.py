@@ -1,35 +1,16 @@
 """
-训练增强模块包
+训练模块包
 
 包含：
-1. 课程学习（Curriculum Learning）
-2. 优先经验回放（Prioritized Experience Replay）
-3. 失败案例库（Failure Case Bank）
-4. 集成训练管理器
+1. CustomPPOTrainer - GPU优化的PPO训练器
+2. PhaseCheckpointManager - 阶段检查点管理器
 """
 
-from .train_enhancements import (
-    CurriculumManager,
-    PrioritizedReplayBuffer,
-    FailureCaseBank,
-    EnhancedTrainingManager,
-    DifficultyLevel,
-    Transition,
-    FailureCase,
-    create_enhanced_training_manager,
-    save_failure_cases,
-    load_failure_cases
-)
+from .custom_ppo_trainer import CustomPPOTrainer, GPURolloutBuffer
+from .checkpoint_manager import PhaseCheckpointManager
 
 __all__ = [
-    'CurriculumManager',
-    'PrioritizedReplayBuffer',
-    'FailureCaseBank',
-    'EnhancedTrainingManager',
-    'DifficultyLevel',
-    'Transition',
-    'FailureCase',
-    'create_enhanced_training_manager',
-    'save_failure_cases',
-    'load_failure_cases'
+    'CustomPPOTrainer',
+    'GPURolloutBuffer',
+    'PhaseCheckpointManager',
 ]

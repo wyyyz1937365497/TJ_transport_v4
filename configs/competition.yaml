@@ -117,7 +117,7 @@ training:
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
     total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
-    num_envs: 4  # 并行环境数优化（8 → 4）减少CPU-GPU传输瓶颈，提升GPU利用率
+    num_envs: 2  # 并行环境数优化（8 → 4）减少CPU-GPU传输瓶颈，提升GPU利用率
     learning_rate: 3e-4
     n_steps: 2048  # 每次rollout的步数
     batch_size: 64  # mini-batch大小（PPO更新时使用）

@@ -255,6 +255,16 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         )
 
         # ============================================================
+        # 5.6. 动作投影层（用于生成动作均值）
+        # ============================================================
+        # 输入：融合特征 [node_emb + z_flow + z_risk]
+        # 输出：动作均值 [action_dim]
+        self.action_projection = nn.Linear(
+            gnn_config.get('output_dim', 256) + wm_config.get('latent_dim', 64) * 2,
+            64
+        )
+
+        # ============================================================
         # 6. 拉格朗日优化器（动态约束优化）
         # ============================================================
         self.lagrangian_optimizer = LagrangianOptimizer(
@@ -336,25 +346,20 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             # Mismatch detected - this can happen due to batch tensor issues
             # Create a corrected global embedding by manual mean pooling
             if graph_data.batch is not None and graph_data.batch.size(0) == node_embeddings.size(0):
-                # Manual global mean pooling - 向量化版本（使用cuda:1加速）
-                # 使用scatter_mean进行高效的全局池化
+                # Manual global mean pooling - 单GPU版本（避免GPU间传输）
                 num_nodes_total = node_embeddings.size(0)
                 embedding_dim = node_embeddings.size(1)
 
-                # 使用cuda:1进行计算（如果有双GPU）
-                device_compute = torch.device('cuda:1') if torch.cuda.device_count() >= 2 else device
-                device_train = device  # cuda:0
+                # 所有计算在同一个设备上（避免传输）
+                node_embeddings_compute = node_embeddings
+                batch_compute = graph_data.batch
 
-                # 将数据传输到cuda:1进行计算
-                node_embeddings_compute = node_embeddings.to(device_compute)
-                batch_compute = graph_data.batch.to(device_compute)
-
-                # 初始化输出张量（在cuda:1上）
-                global_embedding_corrected = torch.zeros(batch_size, embedding_dim, device=device_compute)
+                # 初始化输出张量
+                global_embedding_corrected = torch.zeros(batch_size, embedding_dim, device=device)
 
                 # 使用one_hot + scatter进行向量化池化
                 # 创建one-hot编码: [total_nodes, batch_size]
-                batch_one_hot = torch.zeros(num_nodes_total, batch_size, device=device_compute)
+                batch_one_hot = torch.zeros(num_nodes_total, batch_size, device=device)
                 batch_one_hot.scatter_(1, batch_compute.unsqueeze(1), 1.0)
 
                 # 计算每个batch的节点数
@@ -372,8 +377,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
                 if empty_batches.any():
                     global_embedding_corrected[empty_batches] = 0.0
 
-                # 将结果传回cuda:0
-                global_embedding = global_embedding_corrected.to(device_train)
+                # 直接使用结果（无设备传输）
+                global_embedding = global_embedding_corrected
             else:
                 # Fallback: repeat or truncate to match batch_size
                 if global_embedding.size(0) < batch_size:
@@ -515,12 +520,11 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # 检查是否全为零（没有车辆或无效数据）
         if fused.abs().sum() < 1e-6:
             # 返回零动作
-            actions = torch.zeros(batch_size, 64, device=device)
+            action_mean = torch.zeros(batch_size, 64, device=device)
         else:
             # 动作生成头 - 生成64维动作（匹配action_space）
-            # 使用简单线性投影到64维
-            action_projection = nn.Linear(fused.size(-1), 64).to(device)
-            action_features = action_projection(fused)  # [max_vehicles, 64]
+            # 使用在__init__中初始化的action_projection
+            action_features = self.action_projection(fused)  # [max_vehicles, 64]
 
             # 检查投影后的NaN
             action_features = torch.nan_to_num(action_features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -543,15 +547,14 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
             # 取平均或最大池化到单个动作向量
             # 对于SB3，我们只需要一个64维的动作向量
-            actions = actions.mean(dim=0, keepdim=True)  # [1, 64]
+            action_mean = actions.mean(dim=0, keepdim=True)  # [1, 64]
 
             # 如果是batch，扩展到batch大小
             if batch_size > 1:
-                actions = actions.expand(batch_size, -1)  # [batch_size, 64]
+                action_mean = action_mean.expand(batch_size, -1)  # [batch_size, 64]
 
         # 动作分布
-        action_mean = actions
-        action_std = torch.ones_like(actions) * 0.1
+        action_std = torch.ones_like(action_mean) * 0.1
         distribution = self.action_dist.proba_distribution(action_mean, action_std)
 
         if deterministic:
@@ -563,6 +566,66 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
 
         return actions_out, values, log_prob
 
+    def _get_action_mean(
+        self,
+        observations: torch.Tensor,
+        features_dict: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        生成动作均值（复用forward中的逻辑）
+
+        Returns:
+            action_mean: [batch_size, action_dim]
+        """
+        batch_size = observations.size(0)
+        device = observations.device
+
+        node_embeddings = features_dict['node_embeddings']
+        z_flow = features_dict['z_flow']
+        z_risk = features_dict['z_risk']
+        importance = features_dict['importance_scores']
+
+        # 检查是否有有效数据
+        if node_embeddings.size(0) == 0:
+            return torch.zeros(batch_size, 64, device=device)
+
+        # 融合特征用于动作生成
+        fused = torch.cat([
+            node_embeddings[:self.max_vehicles],
+            z_flow[:self.max_vehicles],
+            z_risk[:self.max_vehicles]
+        ], dim=-1)
+
+        # 清理NaN/Inf
+        fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 检查是否全为零
+        if fused.abs().sum() < 1e-6:
+            return torch.zeros(batch_size, 64, device=device)
+
+        # 动作生成头 - 生成64维动作
+        # 使用在__init__中初始化的action_projection（与forward共用）
+        action_features = self.action_projection(fused)  # [max_vehicles, 64]
+        action_features = torch.nan_to_num(action_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 使用tanh确保动作在[-1, 1]范围内
+        actions = torch.tanh(action_features)  # [max_vehicles, 64]
+
+        # 应用Top-K掩码（简化版本：使用重要性得分）
+        num_veh = min(self.max_vehicles, node_embeddings.size(0))
+        if batch_size > 1:
+            importance_batch = importance[:num_veh].squeeze(-1)
+        else:
+            importance_batch = importance[:num_veh].squeeze(-1)
+
+        # 取mean池化到单个动作向量
+        actions_mean = actions.mean(dim=0, keepdim=True)  # [1, 64]
+
+        # 扩展到batch大小
+        action_mean = actions_mean.expand(batch_size, -1)  # [batch_size, 64]
+
+        return action_mean
+
     def evaluate_actions(
         self,
         observations: torch.Tensor,
@@ -570,24 +633,59 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         评估动作（SB3 PPO训练时调用）
+
+        重新计算给定observations下actions的log_prob和entropy
+
+        重要：避免使用LSTM隐藏状态，防止计算图冲突
         """
-        # 提取特征
-        features_dict = self.extract_features(observations)
+        batch_size = observations.size(0)
+        device = observations.device
 
-        # 价值估计
-        global_features = features_dict['global_embedding']
-        values = self.critic(global_features)
+        # 保存当前的LSTM隐藏状态（如果有）
+        saved_hidden = getattr(self, '_rssm_hidden', None)
 
-        # 重新生成动作分布
-        # 简化：直接使用输入动作的均值
-        action_mean = actions
-        action_std = torch.ones_like(actions) * 0.1
-        distribution = self.action_dist.proba_distribution(action_mean, action_std)
+        # 清除LSTM隐藏状态，避免多次backward时计算图冲突
+        # 每次evaluate_actions都从头计算，不依赖历史状态
+        self._rssm_hidden = None
 
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
+        try:
+            # 1. 提取特征
+            features_dict = self.extract_features(observations)
 
-        return values, log_prob, entropy
+            # 2. 价值估计
+            global_features = features_dict['global_embedding']
+            global_features = torch.nan_to_num(global_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # 处理global_features形状
+            if global_features.dim() == 1:
+                global_features = global_features.unsqueeze(0)
+            if global_features.size(0) != batch_size:
+                if global_features.size(0) < batch_size:
+                    last_feature = global_features[-1:].unsqueeze(0)
+                    global_features = torch.cat([global_features, last_feature.repeat(batch_size - global_features.size(0), 1)], dim=0)
+                else:
+                    global_features = global_features[:batch_size]
+
+            values = self.critic(global_features)
+
+            # 3. 生成动作均值（使用模型输出，不是输入actions）
+            action_mean = self._get_action_mean(observations, features_dict)
+
+            # 4. 创建动作分布
+            action_std = torch.ones_like(action_mean) * 0.1
+            distribution = self.action_dist.proba_distribution(action_mean, action_std)
+
+            # 5. 计算log_prob和entropy
+            log_prob = distribution.log_prob(actions)
+            entropy = distribution.entropy()
+
+            return values, log_prob, entropy
+
+        finally:
+            # 恢复LSTM隐藏状态（或者保持为None，取决于需求）
+            # 注意：这里不恢复saved_hidden，因为在evaluate阶段我们不应该依赖历史状态
+            # 这样每次evaluate都是独立的，避免计算图冲突
+            pass
 
     def predict(
         self,
@@ -788,8 +886,9 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             num_vehicles_compute = num_vehicles_clamped
 
         # ============== 第2步：收集所有节点特征（向量化优化版本）=============
-        # 现在才创建num_veh_list（延迟转换，减少CPU-GPU同步）
-        num_veh_list = [int(num_vehicles_compute[b].item()) for b in range(batch_size)]
+        # 修复：一次性将tensor转为CPU，避免循环中的CPU-GPU同步
+        num_veh_cpu = num_vehicles_compute.cpu()
+        num_veh_list = [int(num_veh_cpu[b]) for b in range(batch_size)]
 
         # 计算累积偏移量（用于拼接）
         num_veh_tensor = torch.tensor(num_veh_list, device=device_compute)

@@ -128,11 +128,11 @@ def train_stage(
     # Phase 2配置
     phase2_config = config.get('training', {}).get('phase2', {})
 
-    num_envs = phase2_config.get('num_envs', 4)
-    n_steps = phase2_config.get('n_steps', 2048)
-    batch_size = phase2_config.get('batch_size', 64)
-    n_epochs = phase2_config.get('update_epochs', 10)
-    learning_rate = phase2_config.get('learning_rate', 3e-4)
+    num_envs = int(phase2_config.get('num_envs', 4))
+    n_steps = int(phase2_config.get('n_steps', 2048))
+    batch_size = int(phase2_config.get('batch_size', 64))
+    n_epochs = int(phase2_config.get('update_epochs', 10))
+    learning_rate = float(phase2_config.get('learning_rate', 3e-4))
 
     print(f"\n[TRAINING] Parallel envs: {num_envs}, Steps: {n_steps}, Batch: {batch_size}, Epochs: {n_epochs}")
 
@@ -149,20 +149,42 @@ def train_stage(
 
     # 创建策略
     print("\n[MODEL] Creating policy network...")
-    policy = create_ideal_traffic_policy_v4(config)
+    PolicyClass = create_ideal_traffic_policy_v4(config)
+
+    # 实例化策略网络（不需要传入model配置，已通过config属性传递）
+    policy = PolicyClass(
+        observation_space=vec_env.observation_space,
+        action_space=vec_env.action_space,
+        lr_schedule=lambda _: learning_rate,
+    )
+
+    # 将策略移动到设备
+    policy = policy.to(device)
 
     # 加载权重
     if prev_checkpoint and os.path.exists(prev_checkpoint):
         print(f"\n[LOAD] Loading previous stage: {prev_checkpoint}")
-        checkpoint = torch.load(prev_checkpoint, map_location=device)
-        policy.load_state_dict(checkpoint['policy_state_dict'])
+        checkpoint = torch.load(prev_checkpoint, map_location=str(device))
+        if 'policy_state_dict' in checkpoint:
+            policy.load_state_dict(checkpoint['policy_state_dict'])
+        else:
+            print(f"[WARN] No 'policy_state_dict' found, using checkpoint directly")
+            policy.load_state_dict(checkpoint)
         print(f"[OK] Loaded")
     elif phase1_checkpoint and os.path.exists(phase1_checkpoint):
         print(f"\n[LOAD] Loading Phase 1: {phase1_checkpoint}")
-        checkpoint = torch.load(phase1_checkpoint, map_location=device)
+        checkpoint = torch.load(phase1_checkpoint, map_location=str(device))
+        print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys())}")
+
         if 'model_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        print(f"[OK] Loaded Phase 1 weights")
+            state_dict = checkpoint['model_state_dict']
+            if state_dict is not None:
+                policy.load_state_dict(state_dict, strict=False)
+                print(f"[OK] Loaded Phase 1 weights")
+            else:
+                print(f"[ERROR] 'model_state_dict' is None!")
+        else:
+            print(f"[ERROR] No 'model_state_dict' found in checkpoint!")
 
     # 冻结感知层和预测层
     print("\n[FREEZE] Freezing perception and prediction layers...")
