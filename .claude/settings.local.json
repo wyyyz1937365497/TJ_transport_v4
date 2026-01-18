@@ -42,7 +42,10 @@
       "Bash(taskkill:*)",
       "Bash(.\\\\train_all_stages:*)",
       "Bash(echo:*)",
-      "Bash(conda activate:*)"
+      "Bash(conda activate:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(TORCH_COMPILE_DISABLE=1 python train_phase2.py:*)"
     ]
   }
 }

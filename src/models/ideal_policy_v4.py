@@ -293,12 +293,15 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         """构建MLP提取器（为SB3兼容）"""
         super()._build_mlp_extractor()
 
+    @torch._dynamo.disable
     def extract_features(
         self,
         observations: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
         提取特征（完整v4.0架构）
+
+        Note: 禁用torch.compile，因为包含动态图构建操作
 
         Args:
             observations: [batch_size, 321] 扁平化观测
@@ -425,6 +428,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             'graph_data': graph_data
         }
 
+    @torch._dynamo.disable
     def forward(
         self,
         observations: torch.Tensor,
@@ -432,6 +436,8 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         前向传播（SB3调用）
+
+        Note: 禁用torch.compile，因为内部调用的方法包含动态图操作
 
         使用完整的影响力驱动控制器
         """
@@ -831,6 +837,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         cost_values = self.cost_critic(pooled)
         return cost_values
 
+    @torch._dynamo.disable
     def _build_graph_spatial(
         self,
         vehicle_states: torch.Tensor,
@@ -838,120 +845,104 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         batch_size: int
     ) -> Dict[str, torch.Tensor]:
         """
-        使用空间邻近关系构建图（向量化优化版本 + 双GPU）
+        使用空间邻近关系构建图（优化版本 - 单GPU，纯tensor操作）
+
+        Note: 禁用torch.compile，因为包含动态索引操作
 
         Returns:
             图数据字典（用于PyTorch Geometric）
         """
         from torch_geometric.data import Data
 
-        device_train = vehicle_states.device  # cuda:0（训练设备）
-        device_compute = self.device_compute  # cuda:1（计算设备）
+        device = vehicle_states.device
 
-        # ============== 第1步：统计总节点数 ==============
-        # 优化：使用纯tensor操作，避免CPU-GPU同步
-        # 确保num_vehicles是1D tensor
+        # ============== 第1步：处理num_vehicles tensor ==============
+        # 确保num_vehicles是1D tensor (保持至少1维，避免变成0-d tensor)
         if num_vehicles.dim() > 1:
             num_vehicles = num_vehicles.squeeze()
+        if num_vehicles.dim() == 0:
+            num_vehicles = num_vehicles.unsqueeze(0)
 
-        # 先将num_vehicles限制在max_vehicles以内（在GPU上）
+        # 限制在max_vehicles以内
         num_vehicles_clamped = num_vehicles.clamp(max=self.max_vehicles)
 
-        # 直接在GPU上计算total_nodes（避免传到CPU）
+        # 在GPU上计算总节点数
         total_nodes = num_vehicles_clamped.sum().item()
 
-        # 只在需要时才创建列表（用于后续循环）
-        # 延迟转换到真正需要的时候
+        # 空batch检查
         if total_nodes == 0:
-            # 空batch
-            batch_graph = Data(
-                x=torch.zeros(0, 9, device=device_train),
-                edge_index=torch.empty((2, 0), dtype=torch.long, device=device_train),
-                edge_attr=torch.empty((0, 4), device=device_train),
-                risk_features=torch.zeros(0, 2, device=device_train),
-                num_nodes=0
+            return Data(
+                x=torch.zeros(0, 9, device=device),
+                edge_index=torch.empty((2, 0), dtype=torch.long, device=device),
+                edge_attr=torch.empty((0, 4), device=device),
+                risk_features=torch.zeros(0, 2, device=device),
+                num_nodes=0,
+                batch=torch.zeros(0, dtype=torch.long, device=device)
             )
-            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=device_train)
-            return batch_graph
 
-        # ============== 双GPU优化：将数据传到cuda:1进行向量计算 ==============
-        # 仅当双GPU可用时才传输
-        use_dual_gpu = (device_train != device_compute)
-        if use_dual_gpu:
-            vehicle_states_compute = vehicle_states.to(device_compute)  # 传到cuda:1
-            # 同时将num_vehicles传到cuda:1
-            num_vehicles_compute = num_vehicles_clamped.to(device_compute)
-        else:
-            vehicle_states_compute = vehicle_states
-            num_vehicles_compute = num_vehicles_clamped
-
-        # ============== 第2步：收集所有节点特征（向量化优化版本）=============
-        # 修复：一次性将tensor转为CPU，避免循环中的CPU-GPU同步
-        num_veh_cpu = num_vehicles_compute.cpu()
-        num_veh_list = [int(num_veh_cpu[b]) for b in range(batch_size)]
-
-        # 计算累积偏移量（用于拼接）
-        num_veh_tensor = torch.tensor(num_veh_list, device=device_compute)
+        # ============== 第2步：纯GPU上的tensor操作 ==============
+        # 计算累积偏移量（纯tensor操作，无需CPU同步）
+        num_veh_tensor = num_vehicles_clamped.long()  # 确保是整数类型
         cumsum = torch.cumsum(num_veh_tensor, dim=0)  # [batch_size]
+        node_offsets = torch.cat([torch.tensor([0], device=device), cumsum[:-1]], dim=0)
 
-        # 预分配输出tensor
+        # ============== 第3步：收集所有节点特征和边（纯GPU操作）=============
+        # 将num_veh_tensor转到CPU作为列表（避免torch.compile追踪问题）
+        num_veh_list = num_veh_tensor.cpu().tolist()
+
         all_x_list = []
         all_risk_features_list = []
         all_edge_indices_list = []
         all_edge_attrs_list = []
 
-        # 向量化处理：并行计算所有样本的特征和边
-        # 注意：为了保持兼容性，仍然使用循环，但减少CPU-GPU同步
         for b in range(batch_size):
-            num_veh = num_veh_list[b]
+            num_veh = num_veh_list[b]  # Python整数
 
             if num_veh == 0:
                 continue
 
             # 提取当前batch样本的车辆状态
-            actual_num_veh = min(num_veh, vehicle_states_compute.size(1))
+            actual_num_veh = int(min(num_veh, vehicle_states.size(1)))  # 确保是Python整数
             if actual_num_veh <= 0:
                 continue
 
-            states = vehicle_states_compute[b, :actual_num_veh]  # [num_veh, 9]
+            states = vehicle_states[b, :actual_num_veh]  # [num_veh, 9]
 
             # 节点特征
             all_x_list.append(states)
 
-            # 风险特征（在cuda:1上计算）
+            # 风险特征（GPU上计算）
             risk_features = self._compute_risk_features_spatial(states)
             all_risk_features_list.append(risk_features)
 
-            # 边特征（在cuda:1上计算）
+            # 边特征（GPU上计算）
             edge_index, edge_attr = self._build_edges_spatial(states, actual_num_veh)
 
-            # 边索引偏移（在cuda:1上计算）
+            # 边索引偏移（GPU上计算）
             if edge_index.size(1) > 0:
-                node_offset = (cumsum[b-1] if b > 0 else 0)
+                node_offset = node_offsets[b]
                 edge_index_offset = edge_index + node_offset
 
-                # 验证边索引
-                max_valid_idx = (cumsum[b] - 1) if b < batch_size else (total_nodes - 1)
+                # 验证边索引（GPU上操作）
+                max_valid_idx = cumsum[b] - 1
                 valid_mask = (edge_index_offset[0] <= max_valid_idx) & (edge_index_offset[1] <= max_valid_idx)
 
                 if valid_mask.any():
                     all_edge_indices_list.append(edge_index_offset[:, valid_mask])
                     all_edge_attrs_list.append(edge_attr[valid_mask])
 
-        # ============== 第3步：合并所有节点特征（向量化）=============
+        # ============== 第4步：合并所有tensor ==============
         if not all_x_list:
-            # 如果没有有效的节点，返回空图
-            batch_graph = Data(
-                x=torch.zeros(0, 9, device=device_train),
-                edge_index=torch.empty((2, 0), dtype=torch.long, device=device_train),
-                edge_attr=torch.empty((0, 4), device=device_train),
-                risk_features=torch.zeros(0, 2, device=device_train),
-                num_nodes=0
+            return Data(
+                x=torch.zeros(0, 9, device=device),
+                edge_index=torch.empty((2, 0), dtype=torch.long, device=device),
+                edge_attr=torch.empty((0, 4), device=device),
+                risk_features=torch.zeros(0, 2, device=device),
+                num_nodes=0,
+                batch=torch.zeros(0, dtype=torch.long, device=device)
             )
-            batch_graph.batch = torch.zeros(0, dtype=torch.long, device=device_train)
-            return batch_graph
 
-        # 一次性合并所有tensor（减少多次torch.cat的开销）
+        # 合并节点特征
         x = torch.cat(all_x_list, dim=0)  # [total_nodes, 9]
         risk_features_cat = torch.cat(all_risk_features_list, dim=0)  # [total_nodes, 2]
 
@@ -960,46 +951,30 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
             edge_index = torch.cat(all_edge_indices_list, dim=1)  # [2, total_edges]
             edge_attr = torch.cat(all_edge_attrs_list, dim=0)  # [total_edges, 4]
         else:
-            edge_index = torch.empty((2, 0), dtype=torch.long, device=device_compute)
-            edge_attr = torch.empty((0, 4), device=device_compute)
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr = torch.empty((0, 4), device=device)
 
-        # ============== 第4步：创建batch tensor（向量化）=============
-        # 优化：使用repeat而不是循环
-        batch_indices = []
-        for b, num_veh in enumerate(num_veh_list):
-            if num_veh > 0:
-                batch_indices.extend([b] * num_veh)
+        # ============== 第5步：创建batch tensor（向量化，无Python循环）=============
+        # 使用repeat_interleave创建batch tensor
+        valid_mask = num_veh_tensor > 0
+        batch_tensor = torch.arange(batch_size, device=device)[valid_mask].repeat_interleave(num_veh_tensor[valid_mask])
 
-        batch_tensor = torch.tensor(batch_indices, dtype=torch.long, device=device_compute)  # [total_nodes]
+        # ============== 第6步：创建图并验证边索引 ==============
+        # 验证边索引（仅在GPU上进行一次.item()调用）
+        if edge_index.size(1) > 0 and edge_index.max().item() >= total_nodes:
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr = torch.empty((0, 4), device=device)
 
-        # ============== 第5步：双GPU优化：将计算结果传回cuda:0 ==============
-        if use_dual_gpu:
-            x = x.to(device_train)
-            risk_features_cat = risk_features_cat.to(device_train)
-            edge_index = edge_index.to(device_train)
-            edge_attr = edge_attr.to(device_train)
-            batch_tensor = batch_tensor.to(device_train)
-
-        # ============== 第6步：创建并验证图 ==============
-        batch_graph = Data(
+        return Data(
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
             risk_features=risk_features_cat,
-            num_nodes=total_nodes
+            num_nodes=total_nodes,
+            batch=batch_tensor
         )
-        batch_graph.batch = batch_tensor
 
-        # 验证边索引
-        if edge_index.size(1) > 0:
-            max_idx = edge_index.max().item()
-            if max_idx >= total_nodes:
-                # 边索引越界，重置为空边
-                batch_graph.edge_index = torch.empty((2, 0), dtype=torch.long, device=device_train)
-                batch_graph.edge_attr = torch.empty((0, 4), device=device_train)
-
-        return batch_graph
-
+    @torch._dynamo.disable
     def _compute_risk_features_spatial(
         self,
         vehicle_states: torch.Tensor
@@ -1019,6 +994,7 @@ class IdealTrafficPolicyV4(ActorCriticPolicy):
         # 使用JIT编译的版本（首次调用时编译，后续调用更快）
         return compute_risk_features_jit(vehicle_states)
 
+    @torch._dynamo.disable
     def _build_edges_spatial(
         self,
         vehicle_states: torch.Tensor,

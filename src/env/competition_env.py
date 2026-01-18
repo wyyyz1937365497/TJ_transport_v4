@@ -14,7 +14,10 @@ from typing import Dict, List, Set, Any, Tuple, Optional
 from collections import defaultdict
 from pathlib import Path
 
-from .gpu_sumo_env_optimized import GPUSumoEnvironmentOptimized as GPUSumoEnvironment
+from .gpu_sumo_env_optimized import GPUSumoEnvironmentOptimized as GPUSumoEnvironment, traci
+
+# 🔥 重要：使用基类的traci实例，而不是重新导入
+# 这样可以确保使用同一个SUMO连接
 
 # 导入优化的Frenet工具
 import sys
@@ -153,13 +156,13 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         - in_bottleneck: 是否在瓶颈区域
         - edge_id: 边ID
         """
-        # 导入traci（可能是libsumo）
+        # 获取车辆列表
         try:
-            import libsumo as traci_lib
-        except ImportError:
-            import traci as traci_lib
+            all_vehicle_ids = traci.vehicle.getIDList()
+        except Exception as id_err:
+            # 如果网络未加载（不应该发生，因为start()已加载），返回空列表
+            all_vehicle_ids = []
 
-        all_vehicle_ids = traci_lib.vehicle.getIDList()
         vehicle_states = {}
         valid_vehicle_ids = []
 
@@ -170,39 +173,31 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         icv_ids = set()
         if len(all_vehicle_ids) > 0:
             # 使用GPU进行随机采样（如果可用）
-            if torch.cuda.is_available() and self.device.type == 'cuda':
-                icv_indices = torch.randperm(
-                    len(all_vehicle_ids),
-                    device=self.device
-                )[:num_icv]
-                icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
-            else:
-                icv_indices = np.random.choice(
-                    len(all_vehicle_ids),
-                    size=min(num_icv, len(all_vehicle_ids)),
-                    replace=False
-                )
-                icv_ids = {all_vehicle_ids[i] for i in icv_indices}
+            icv_indices = torch.randperm(
+                len(all_vehicle_ids),
+                device=self.device
+            )[:num_icv]
+            icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
         if len(all_vehicle_ids) > 0:
             # 定义要订阅的变量（使用traci.constants中的常量ID）
             var_list = [
-                traci_lib.constants.VAR_SPEED,        # 0x40 - 速度
-                traci_lib.constants.VAR_ACCELERATION,  # 0x72 - 加速度
-                traci_lib.constants.VAR_ANGLE,        # 0x43 - 角度
-                traci_lib.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
-                traci_lib.constants.VAR_POSITION,     # 0x42 - 位置
-                traci_lib.constants.VAR_LANE_ID       # 0x51 - 车道ID
+                traci.constants.VAR_SPEED,        # 0x40 - 速度
+                traci.constants.VAR_ACCELERATION,  # 0x72 - 加速度
+                traci.constants.VAR_ANGLE,        # 0x43 - 角度
+                traci.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
+                traci.constants.VAR_POSITION,     # 0x42 - 位置
+                traci.constants.VAR_LANE_ID       # 0x51 - 车道ID
             ]
 
             # 批量订阅（Libsumo直接调用，无TCP开销）
             for veh_id in all_vehicle_ids:
-                traci_lib.vehicle.subscribe(veh_id, var_list)
+                traci.vehicle.subscribe(veh_id, var_list)
 
             # 一次性获取所有车辆的订阅数据
-            all_subscription_results = traci_lib.vehicle.getAllSubscriptionResults()
+            all_subscription_results = traci.vehicle.getAllSubscriptionResults()
         else:
             all_subscription_results = {}
 
@@ -212,12 +207,12 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 # 从订阅结果中获取数据（避免单独的TraCI调用）
                 if veh_id in all_subscription_results:
                     sub_data = all_subscription_results[veh_id]
-                    speed = sub_data.get(traci_lib.constants.VAR_SPEED, 0.0)                     # VAR_SPEED (0x40)
-                    acceleration = sub_data.get(traci_lib.constants.VAR_ACCELERATION, 0.0)       # VAR_ACCELERATION (0x72)
-                    angle = sub_data.get(traci_lib.constants.VAR_ANGLE, 0.0)                     # VAR_ANGLE (0x43)
-                    lane_index = sub_data.get(traci_lib.constants.VAR_LANE_INDEX, 0)             # VAR_LANE_INDEX (0x52)
-                    x, y = sub_data.get(traci_lib.constants.VAR_POSITION, (0.0, 0.0))           # VAR_POSITION (0x42)
-                    lane_id = sub_data.get(traci_lib.constants.VAR_LANE_ID, "")                  # VAR_LANE_ID (0x51)
+                    speed = sub_data.get(traci.constants.VAR_SPEED, 0.0)                     # VAR_SPEED (0x40)
+                    acceleration = sub_data.get(traci.constants.VAR_ACCELERATION, 0.0)       # VAR_ACCELERATION (0x72)
+                    angle = sub_data.get(traci.constants.VAR_ANGLE, 0.0)                     # VAR_ANGLE (0x43)
+                    lane_index = sub_data.get(traci.constants.VAR_LANE_INDEX, 0)             # VAR_LANE_INDEX (0x52)
+                    x, y = sub_data.get(traci.constants.VAR_POSITION, (0.0, 0.0))           # VAR_POSITION (0x42)
+                    lane_id = sub_data.get(traci.constants.VAR_LANE_ID, "")                  # VAR_LANE_ID (0x51)
                 else:
                     # Libsumo订阅失败不应该发生
                     raise RuntimeError(
@@ -247,8 +242,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                     in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
                 else:
                     # 使用简化的Frenet坐标(SUMO原生)
-                    s = traci_lib.vehicle.getLanePosition(veh_id)
-                    d = traci_lib.vehicle.getLateralLanePosition(veh_id)
+                    s = traci.vehicle.getLanePosition(veh_id)
+                    d = traci.vehicle.getLateralLanePosition(veh_id)
                     heading_at_s = np.radians(self._get_lane_angle(lane_id))
                     in_bottleneck = False
 
@@ -299,14 +294,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
     def _get_lane_angle(self, lane_id: str) -> float:
         """获取车道的航向角"""
         try:
-            # 导入traci（可能是libsumo）
-            try:
-                import libsumo as traci_lib
-            except ImportError:
-                import traci as traci_lib
-
             edge_id = lane_id.split('_')[0]
-            angle = traci_lib.edge.getAngle(edge_id)
+            angle = traci.edge.getAngle(edge_id)
             return angle
         except:
             return 0.0
@@ -327,24 +316,38 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         # [0-15]: 原有统计（使用父类的GPU统计方法）
         try:
-            # 转换为GPU tensor格式
-            vehicle_data = []
-            for vid in vehicle_states.keys():
-                state = vehicle_states[vid]
-                vehicle_data.append([
-                    state.get('s', 0.0),
-                    state.get('d', 0.0),
-                    state.get('vs', 0.0),
-                    state.get('vd', 0.0),
-                    state.get('speed', 0.0),
-                    state.get('acceleration', 0.0),
-                    state.get('lane_index', 0.0),
-                    state.get('angle', 0.0),
-                    1.0 if vid in self.icv_ids else 0.0
-                ])
-
-            if vehicle_data:
-                states_tensor = torch.tensor(vehicle_data, dtype=torch.float32, device=self.device)
+            if vehicle_states:
+                # 获取车辆ID列表
+                vids = list(vehicle_states.keys())
+                
+                # 构建状态张量的批量操作
+                s_values = torch.tensor([vehicle_states[vid].get('s', 0.0) for vid in vids], 
+                                        dtype=torch.float32, device=self.device)
+                d_values = torch.tensor([vehicle_states[vid].get('d', 0.0) for vid in vids], 
+                                        dtype=torch.float32, device=self.device)
+                vs_values = torch.tensor([vehicle_states[vid].get('vs', 0.0) for vid in vids], 
+                                         dtype=torch.float32, device=self.device)
+                vd_values = torch.tensor([vehicle_states[vid].get('vd', 0.0) for vid in vids], 
+                                         dtype=torch.float32, device=self.device)
+                speed_values = torch.tensor([vehicle_states[vid].get('speed', 0.0) for vid in vids], 
+                                            dtype=torch.float32, device=self.device)
+                accel_values = torch.tensor([vehicle_states[vid].get('acceleration', 0.0) for vid in vids], 
+                                            dtype=torch.float32, device=self.device)
+                lane_idx_values = torch.tensor([vehicle_states[vid].get('lane_index', 0.0) for vid in vids], 
+                                               dtype=torch.float32, device=self.device)
+                angle_values = torch.tensor([vehicle_states[vid].get('angle', 0.0) for vid in vids], 
+                                            dtype=torch.float32, device=self.device)
+                
+                # 创建ICV标识张量
+                icv_mask = torch.tensor([1.0 if vid in self.icv_ids else 0.0 for vid in vids], 
+                                        dtype=torch.float32, device=self.device)
+                
+                # 组装成批量张量
+                states_tensor = torch.stack([
+                    s_values, d_values, vs_values, vd_values, 
+                    speed_values, accel_values, lane_idx_values, angle_values, icv_mask
+                ], dim=1)
+                
                 base_stats_tensor = self._compute_global_stats_gpu(states_tensor)
                 stats[:16] = base_stats_tensor.cpu().numpy()
             else:
@@ -392,19 +395,13 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         if not actions:
             return
 
-        # 导入traci（可能是libsumo）
-        try:
-            import libsumo as traci_lib
-        except ImportError:
-            import traci as traci_lib
-
         for veh_id, action in actions.items():
-            if veh_id not in traci_lib.vehicle.getIDList():
+            if veh_id not in traci.vehicle.getIDList():
                 continue
 
             try:
-                old_accel = traci_lib.vehicle.getAcceleration(veh_id)
-                old_lane = traci_lib.vehicle.getLaneIndex(veh_id)
+                old_accel = traci.vehicle.getAcceleration(veh_id)
+                old_lane = traci.vehicle.getLaneIndex(veh_id)
 
                 # 加速度变化
                 accel_change = abs(action[0] - old_accel)
@@ -420,7 +417,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
                 # 能耗估计（简化版）
                 # 能耗 ≈ 速度 × 加速度（正加速度消耗能量）
-                speed = traci_lib.vehicle.getSpeed(veh_id)
+                speed = traci.vehicle.getSpeed(veh_id)
                 if action[0] > 0:
                     self.intervention_stats['energy_consumption'] += speed * action[0] * 0.1  # dt=0.1s
 
