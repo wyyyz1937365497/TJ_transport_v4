@@ -18,6 +18,7 @@ import numpy as np
 import time
 from pathlib import Path
 import gymnasium as gym
+from tqdm import tqdm
 
 
 class GPURolloutBuffer:
@@ -230,17 +231,15 @@ class CustomPPOTrainer:
             eps=1e-8,  # 提高数值稳定性
         )
 
-        # 学习率调度器（可选）
-        use_lr_schedule = config.get('use_lr_schedule', False)
-        if use_lr_schedule:
-            self.lr_schedule = optim.lr_scheduler.LinearLR(
-                self.optimizer,
-                start_factor=1.0,
-                end_factor=0.0,
-                total_iters=1000,  # 会在训练中更新
-            )
-        else:
-            self.lr_schedule = None
+        # ✅ 学习率调度器（线性衰减，提升收敛速度）
+        total_updates = (total_timesteps // (self.n_steps * self.buffer.n_envs)) if hasattr(self, 'buffer') else 1000
+        self.lr_schedule = optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1.0,
+            end_factor=0.1,  # 衰减到10%
+            total_iters=total_updates
+        )
+        self.current_lr = self.learning_rate
 
         # Rollout buffer
         self.buffer = GPURolloutBuffer(
@@ -555,25 +554,27 @@ class CustomPPOTrainer:
         old_values: torch.Tensor,
     ) -> torch.Tensor:
         """
-        计算value function loss
+        计算value function loss（带Clipped Value Loss）
 
         数值稳定性：清理NaN/Inf
+        使用Clipped Value Loss提升稳定性（PPO论文建议）
         """
         # 清理values和returns中的异常值
         values = torch.nan_to_num(values, nan=0.0, posinf=10.0, neginf=-10.0)
         returns = torch.nan_to_num(returns, nan=0.0, posinf=10.0, neginf=-10.0)
+        old_values = torch.nan_to_num(old_values, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # 标准MSE loss
         value_loss = nn.functional.mse_loss(values, returns)
 
-        # 可选：使用clipped value loss（更稳定）
-        # value_pred_clipped = old_values + torch.clamp(
-        #     values - old_values,
-        #     -self.clip_range,
-        #     self.clip_range
-        # )
-        # value_loss_clipped = nn.functional.mse_loss(value_pred_clipped, returns)
-        # value_loss = torch.max(value_loss, value_loss_clipped).mean()
+        # ✅ 使用Clipped Value Loss（更稳定，PPO论文建议）
+        value_pred_clipped = old_values + torch.clamp(
+            values - old_values,
+            -self.clip_range,
+            self.clip_range
+        )
+        value_loss_clipped = nn.functional.mse_loss(value_pred_clipped, returns)
+        value_loss = torch.max(value_loss, value_loss_clipped).mean()
 
         return value_loss
 
@@ -602,7 +603,16 @@ class CustomPPOTrainer:
         # 计算update次数
         n_updates = total_timesteps // (self.n_steps * self.env.num_envs)
 
-        for update in range(n_updates):
+        # 创建总进度条
+        pbar = tqdm(
+            range(n_updates),
+            desc=f"[TRAIN] Phase 2",
+            unit="update",
+            ncols=120,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        )
+
+        for update in pbar:
             update_start = time.perf_counter()
 
             # Rollout
@@ -611,20 +621,24 @@ class CustomPPOTrainer:
             # Train
             train_metrics = self.train()
 
-            # 打印统计
-            if (update + 1) % 10 == 0:
-                total_time = time.perf_counter() - update_start
-                steps = (update + 1) * self.n_steps * self.env.num_envs
+            # 更新进度条显示的指标
+            steps = (update + 1) * self.n_steps * self.env.num_envs
+            total_time = time.perf_counter() - update_start
 
-                print(f"\n[Update {update+1}/{n_updates}] Steps: {steps:,}/{total_timesteps:,}")
-                print(f"  [TIMING] Rollout: {rollout_metrics['rollout_time']:.2f}s")
-                print(f"  [TIMING] Update:  {train_metrics['update_time']:.2f}s")
-                print(f"  [TIMING] Total:   {total_time:.2f}s")
-                print(f"  [METRICS] Episode Reward: {rollout_metrics.get('ep_rew_mean', 0):.2f}")
-                print(f"  [METRICS] Episode Length: {rollout_metrics.get('ep_len_mean', 0):.2f}")
-                print(f"  [LOSS] Policy: {train_metrics['policy_loss']:.4f}")
-                print(f"  [LOSS] Value: {train_metrics['value_loss']:.4f}")
-                print(f"  [LOSS] Entropy: {train_metrics['entropy_loss']:.4f}")
+            pbar.set_postfix({
+                'Steps': f'{steps:,}',
+                'Reward': f'{rollout_metrics.get("ep_rew_mean", 0):.1f}',
+                'Len': f'{rollout_metrics.get("ep_len_mean", 0):.0f}',
+                'Loss': f'{train_metrics["policy_loss"]:.3f}',
+                'Time': f'{total_time:.1f}s'
+            })
+
+            # 详细打印（每10次update）
+            if (update + 1) % 10 == 0:
+                tqdm.write(f"\n[Update {update+1}/{n_updates}] Steps: {steps:,}/{total_timesteps:,}")
+                tqdm.write(f"  [TIMING] Rollout: {rollout_metrics['rollout_time']:.2f}s | Update: {train_metrics['update_time']:.2f}s | Total: {total_time:.2f}s")
+                tqdm.write(f"  [METRICS] Episode Reward: {rollout_metrics.get('ep_rew_mean', 0):.2f} | Length: {rollout_metrics.get('ep_len_mean', 0):.2f}")
+                tqdm.write(f"  [LOSS] Policy: {train_metrics['policy_loss']:.4f} | Value: {train_metrics['value_loss']:.4f} | Entropy: {train_metrics['entropy_loss']:.4f}")
 
             # 保存checkpoint
             if self.checkpoint_dir is not None and (update + 1) % 100 == 0:
@@ -633,6 +647,8 @@ class CustomPPOTrainer:
             # 性能分析
             if (update + 1) % 50 == 0:
                 self.print_performance_summary()
+
+        pbar.close()
 
         print("\n" + "=" * 80)
         print("[DONE] Training completed!")

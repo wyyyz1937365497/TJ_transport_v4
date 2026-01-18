@@ -303,6 +303,19 @@ python train_phase2.py --stage 2 --prev-checkpoint checkpoints/competition/curri
 2. 检查GPU显存使用率（应该是高显存、高利用率）
 3. 减少TensorBoard日志频率（`logging.log_interval: 500`）
 
+### Q: 遇到 "Cannot find a working triton installation" 错误？
+**A**:
+**方案1（推荐）**: 安装 triton-windows 以获得最佳性能
+```bash
+pip install -U "triton-windows<3.3"
+```
+- ✅ 使用 `max-autotune` 模式，性能提升 20-30%（最快）
+- ✅ 自动降级：如果失败会自动切换到 `reduce-overhead`
+
+**方案2**: 不安装 Triton
+- ✅ 自动使用 `reduce-overhead` 模式，性能提升 15-25%
+- 📖 详见 `docs/TORCH_COMPILE_FIX.md`
+
 ## 📖 技术细节
 
 ### PPO实现完整性
