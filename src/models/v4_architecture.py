@@ -77,13 +77,27 @@ class RiskSensitiveGNN(nn.Module):
         )
 
         # 多层GNN（使用PyTorch Geometric）
-        from torch_geometric.nn import GATConv
-        self.gnn_layers = nn.ModuleList([
-            GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
-                    edge_dim=hidden_dim, dropout=dropout, concat=True)
-            for _ in range(num_layers)
-        ])
-        self.use_pyg = True
+        try:
+            from torch_geometric.nn import GATConv
+            self.gnn_layers = nn.ModuleList([
+                GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
+                        edge_dim=hidden_dim, dropout=dropout, concat=True)
+                for _ in range(num_layers)
+            ])
+            self.use_pyg = True
+        except ImportError:
+            # Fallback: 手动实现注意力GNN
+            print("[WARNING] PyTorch Geometric not installed, using simplified GNN")
+            self.gnn_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout)
+                )
+                for _ in range(num_layers)
+            ])
+            self.use_pyg = False
 
         # 风险感知注意力偏置
         self.risk_bias = nn.Sequential(
@@ -137,6 +151,19 @@ class RiskSensitiveGNN(nn.Module):
                 # PyG版本
                 h = gnn_layer(h, edge_index, e)
                 h = F.relu(h)
+        else:
+            # 简化版本
+            for layer in self.gnn_layers:
+                # 聚合邻居特征
+                row, col = edge_index
+                neighbor_features = h[col]  # [E, hidden_dim]
+
+                # 拼接当前节点和邻居
+                combined = torch.cat([h[row], neighbor_features], dim=-1)
+                h_new = layer(combined)
+
+                # 更新
+                h = h_new + h  # 残差连接
 
         # 4. 应用风险偏置
         h = h + risk_bias  # 广播风险偏置
@@ -656,7 +683,6 @@ class SafetyBarrier(nn.Module):
 # 完整的v4.0架构
 # =============================================================================
 
-@torch._dynamo.disable
 class IdealTrafficControllerV4(nn.Module):
     """
     理想交通控制器 v4.0
@@ -667,9 +693,6 @@ class IdealTrafficControllerV4(nn.Module):
     3. Dynamic Weight Gating (元控制)
     4. Influence-Based Controller (决策)
     5. Safety Barrier (约束)
-
-    Note: 这个类被排除在torch.compile之外，因为它可能有状态修改问题
-    这会导致CUDA Graphs问题。子模块（GNN、RSSM等）仍会被编译。
     """
 
     def __init__(
@@ -938,7 +961,6 @@ class LagrangianOptimizer:
         }
 
 
-@torch._dynamo.disable
 class EnhancedDynamicWeightGating(nn.Module):
     """
     增强的动态权重门控网络
@@ -947,9 +969,6 @@ class EnhancedDynamicWeightGating(nn.Module):
     1. 场景识别（平峰、早高峰、晚高峰、拥堵）
     2. 多输入融合（全局状态、历史统计、预测信息）
     3. 时间平滑（避免权重突变）
-
-    Note: 这个类被排除在torch.compile之外，因为它在forward pass中修改状态（prev_weights）
-    这会导致CUDA Graphs问题
     """
 
     def __init__(
@@ -1347,7 +1366,6 @@ class EnhancedInfluenceBasedController(nn.Module):
             return self.alpha, self.beta
 
 
-@torch._dynamo.disable
 class IdealTrafficControllerV4(nn.Module):
     """
     理想交通控制器 v4.0（增强版默认启用）
@@ -1365,9 +1383,6 @@ class IdealTrafficControllerV4(nn.Module):
     - 可学习的Top-K权重（α、β参数）
     - 增强的动态权重门控（场景识别）
     - 自适应Top-K值调整
-
-    Note: 这个类被排除在torch.compile之外，因为它在forward pass中修改状态（rssm_hidden）
-    这会导致CUDA Graphs问题。子模块（GNN、RSSM等）仍会被编译。
     """
 
     def __init__(

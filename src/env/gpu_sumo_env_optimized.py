@@ -122,14 +122,9 @@ class GPUSumoEnvironmentOptimized:
             # 非GUI模式：libsumo直接调用或使用sumo命令行
             sumo_binary = "sumo"  # libsumo会自动处理
 
-        # 🔥 重要：使用绝对路径，避免工作目录问题
-        import os
-        config_abs_path = os.path.abspath(self.sumo_cfg)
-        config_dir = os.path.dirname(config_abs_path)
-
         cmd = [
             sumo_binary,
-            "-c", config_abs_path,  # 使用绝对路径
+            "-c", self.sumo_cfg,
             "--no-step-log",  # 禁用步骤日志
             "--no-warnings",   # 禁用警告
         ]
@@ -152,29 +147,6 @@ class GPUSumoEnvironmentOptimized:
             traci.start(self.sumo_cmd)
             self.is_connected = True
 
-            # 🔥 重要：执行一步仿真来加载网络和车辆
-            # 必须至少执行一次simulationStep才能构建网络
-            try:
-                # 尝试在t=0时刻执行一步（加载网络但不真正推进时间）
-                traci.simulationStep(0)
-
-                # 验证网络是否已加载
-                loaded_vehicles = traci.vehicle.getIDList()
-                if len(loaded_vehicles) > 0:
-                    print(f"[INFO] 网络加载完成，初始车辆数: {len(loaded_vehicles)}")
-                else:
-                    print(f"[INFO] 网络加载完成，暂无车辆（车辆将在后续时间步生成）")
-            except Exception as step_err:
-                # 如果0步失败，尝试小时间步
-                try:
-                    traci.simulationStep(0.1)
-                    loaded_vehicles = traci.vehicle.getIDList()
-                    print(f"[INFO] 网络加载完成(0.1s)，初始车辆数: {len(loaded_vehicles)}")
-                except Exception as e2:
-                    print(f"[WARN] simulationStep失败: {e2}, {step_err}")
-                    # 即使step失败，继续尝试
-                    pass
-
             # 启用订阅优化
             if self.use_subscription:
                 self._enable_subscriptions()
@@ -184,36 +156,37 @@ class GPUSumoEnvironmentOptimized:
             raise RuntimeError(f"SUMO启动失败: {e}")
 
     def _enable_subscriptions(self):
-        """启用批量订阅（Libsumo优化）"""
+        """启用批量订阅"""
         try:
-            # 🔥 使用Libsumo的批量车辆订阅（而不是junction订阅）
-            # 这对所有SUMO版本都兼容，并且性能更好
-
-            # 获取当前所有车辆
-            vehicle_ids = traci.vehicle.getIDList()
-
-            if not vehicle_ids:
-                # 如果当前没有车辆，订阅将在第一批车辆生成后自动生效
-                print(f"[INFO] 当前无车辆，订阅将在车辆生成后自动启用")
-                self._subscription_enabled = True
+            # 获取一个junction作为订阅锚点
+            junction_ids = traci.junction.getIDList()
+            if not junction_ids:
+                logger.warning("没有找到junction，订阅优化不可用")
                 return
 
-            # 定义要订阅的变量（使用traci.constants中的常量ID）
-            var_list = [
-                tc.VAR_SPEED,        # 0x40 - 速度
-                tc.VAR_ACCELERATION,  # 0x72 - 加速度
-                tc.VAR_ANGLE,        # 0x43 - 角度
-                tc.VAR_LANE_INDEX,   # 0x52 - 车道索引
-                tc.VAR_POSITION,     # 0x42 - 位置
-                tc.VAR_LANE_ID       # 0x51 - 车道ID
-            ]
+            # 使用第一个junction
+            self._junction_id = junction_ids[0]
 
-            # 批量订阅所有车辆
-            for veh_id in vehicle_ids:
-                traci.vehicle.subscribe(veh_id, var_list)
+            # 订阅大范围内的所有车辆（覆盖整个场景）
+            # 1000000米 = 1000km，足够覆盖整个场景
+            traci.junction.subscribeContext(
+                self._junction_id,
+                tc.CMD_GET_VEHICLE_VARIABLE,
+                1000000,  # 大范围
+                [
+                    tc.VAR_POSITION,
+                    tc.VAR_SPEED,
+                    tc.VAR_LANE_ID,
+                    tc.VAR_LANE_INDEX,
+                    tc.VAR_LANEPOSITION,
+                    tc.VAR_ROAD_ID,
+                    tc.VAR_ANGLE,
+                    tc.VAR_ACCELERATION,
+                ]
+            )
 
             self._subscription_enabled = True
-            print(f"[OK] 订阅优化已启用 (初始车辆数: {len(vehicle_ids)})")
+            print(f"[OK] 订阅优化已启用 (junction: {self._junction_id})")
 
         except Exception as e:
             logger.warning(f"订阅启用失败: {e}，将使用普通API")
@@ -274,27 +247,6 @@ class GPUSumoEnvironmentOptimized:
         traci.simulationStep()
         self.current_step += 1
 
-        # 🔥 订阅优化：自动订阅新生成的车辆
-        if self.use_subscription and self._subscription_enabled:
-            try:
-                newly_departed = traci.simulation.getDepartedIDList()
-                if newly_departed:
-                    # 定义要订阅的变量
-                    var_list = [
-                        tc.VAR_SPEED,
-                        tc.VAR_ACCELERATION,
-                        tc.VAR_ANGLE,
-                        tc.VAR_LANE_INDEX,
-                        tc.VAR_POSITION,
-                        tc.VAR_LANE_ID
-                    ]
-                    # 批量订阅新车辆
-                    for veh_id in newly_departed:
-                        traci.vehicle.subscribe(veh_id, var_list)
-                    self._subscription_call_count += len(newly_departed)
-            except Exception:
-                pass
-
         # 更新到达/出发车辆统计
         try:
             newly_arrived = traci.simulation.getArrivedIDList()
@@ -316,17 +268,8 @@ class GPUSumoEnvironmentOptimized:
             # 使用订阅优化版本
             observation = self._get_observation_optimized()
 
-        # 计算奖励（优先使用子类覆盖的方法）
-        if hasattr(self, '_compute_competition_reward') and '_compute_competition_reward' in type(self).__dict__:
-            # CompetitionSumoEnv 使用比赛奖励
-            reward = self._compute_competition_reward(observation)
-        elif hasattr(self, '_compute_reward'):
-            # 子类提供了 _compute_reward 方法
-            reward = self._compute_reward(observation)
-        else:
-            # 默认奖励：0（应该由子类覆盖）
-            reward = 0.0
-            logger.warning("使用默认奖励0.0，请确保子类实现了奖励函数")
+        # 计算奖励
+        reward = self._compute_reward_gpu(observation)
 
         # 检查是否结束
         done = self._is_done()
@@ -412,40 +355,13 @@ class GPUSumoEnvironmentOptimized:
         if not vehicle_states:
             return self._create_empty_observation()
 
-        # 获取车辆ID列表
-        vehicle_ids = list(vehicle_states.keys())
-        
-        # 使用批量操作创建张量
-        if vehicle_ids:
-            # 批量提取各种属性
-            positions = torch.tensor([vehicle_states[vid]['position'] for vid in vehicle_ids], 
-                                     dtype=torch.float32, device=self.device)
-            speeds = torch.tensor([vehicle_states[vid]['speed'] for vid in vehicle_ids], 
-                                  dtype=torch.float32, device=self.device)
-            lane_indices = torch.tensor([vehicle_states[vid]['lane_index'] for vid in vehicle_ids], 
-                                        dtype=torch.float32, device=self.device)
-            lane_positions = torch.tensor([vehicle_states[vid]['lane_position'] for vid in vehicle_ids], 
-                                          dtype=torch.float32, device=self.device)
-            angles = torch.tensor([vehicle_states[vid]['angle'] for vid in vehicle_ids], 
-                                  dtype=torch.float32, device=self.device)
-            accelerations = torch.tensor([vehicle_states[vid]['acceleration'] for vid in vehicle_ids], 
-                                         dtype=torch.float32, device=self.device)
-            
-            # 创建车辆状态张量（按行组织）
-            vehicle_features = torch.stack([
-                speeds, lane_indices, lane_positions, angles, accelerations
-            ], dim=1)  # shape: (num_vehicles, 5)
-            
-            # 保持原始字典格式，同时提供批量张量
-            return {
-                'vehicle_states': vehicle_states,  # 保持dict格式以供子类使用
-                'vehicle_ids': vehicle_ids,
-                'num_vehicles': len(vehicle_ids),
-                'vehicle_features_tensor': vehicle_features,  # 新增：批量特征张量
-                'positions_tensor': positions,  # 新增：位置张量
-            }
-        else:
-            return self._create_empty_observation()
+        # 保持原始dict格式，不转换为tensor
+        # 这样CompetitionSumoEnv可以正常覆盖处理
+        return {
+            'vehicle_states': vehicle_states,  # 保持dict格式
+            'vehicle_ids': list(vehicle_states.keys()),
+            'num_vehicles': len(vehicle_states),
+        }
 
     def _create_empty_observation(self) -> Dict[str, Any]:
         """创建空观测"""
@@ -456,15 +372,7 @@ class GPUSumoEnvironmentOptimized:
         }
 
     def _apply_actions_gpu(self, actions: Dict[str, torch.Tensor]):
-        """
-        应用控制动作（完整版本 - 带安全屏障）
-
-        包含：
-        1. 加速度限制
-        2. TTC安全检查
-        3. 速度边界检查
-        4. 智能换道决策
-        """
+        """应用控制动作"""
         if not actions:
             return
 
@@ -474,17 +382,11 @@ class GPUSumoEnvironmentOptimized:
         if not valid_ids:
             return
 
-        # 批量获取当前状态
+        # 批量获取当前速度（1次API调用）
         self._api_call_count += len(valid_ids)
         current_speeds = {vid: traci.vehicle.getSpeed(vid) for vid in valid_ids}
-        vehicle_lanes = {vid: traci.vehicle.getLaneIndex(vid) for vid in valid_ids}
 
-        # 计算TTC（如果有车辆状态）
-        observation = self._get_observation()
-        vehicle_states = observation.get('vehicle_states', {})
-        ttc_values = self._compute_ttc_values(vehicle_states)
-
-        # 应用控制（带安全屏障）
+        # 批量应用控制
         for veh_id in valid_ids:
             try:
                 action = actions[veh_id]
@@ -495,147 +397,55 @@ class GPUSumoEnvironmentOptimized:
                 acceleration = action[0]
                 lane_change = action[1]
 
+                # 计算目标速度
                 current_speed = current_speeds[veh_id]
+                target_speed = max(0, current_speed + acceleration * self.step_length)
 
-                # ========== 安全屏障 Level 1: 基本约束 ==========
-                # 限制加速度范围
-                max_accel = self.config.get('max_accel', 2.0)
-                max_decel = self.config.get('max_decel', -3.0)
-                acceleration = np.clip(acceleration, max_decel, max_accel)
-
-                # 速度边界检查
-                target_speed = current_speed + acceleration * self.step_length
-                target_speed = np.clip(target_speed, 0.0, 50.0)  # 限制在0-50m/s
-
-                # ========== 安全屏障 Level 2: TTC紧急检查 ==========
-                ttc = ttc_values.get(veh_id, float('inf'))
-                safe_ttc_threshold = self.config.get('safe_ttc_threshold', 2.0)
-
-                if ttc < safe_ttc_threshold:
-                    # TTC过小，强制制动
-                    emergency_decel = self.config.get('emergency_decel', -5.0)
-                    target_speed = max(0.0, current_speed + emergency_decel * self.step_length)
-                    self.stats['emergency_brakes'] = self.stats.get('emergency_brakes', 0) + 1
-
-                # 应用速度控制
+                # 应用加速度
                 traci.vehicle.setSpeed(veh_id, target_speed)
 
-                # ========== 智能换道决策 ==========
+                # 应用换道
                 if lane_change > 0.5:
-                    self._smart_lane_change(veh_id, vehicle_states)
+                    self._safe_change_lane(veh_id)
 
             except Exception as e:
                 logger.debug(f"车辆 {veh_id} 控制失败: {e}")
 
-    def _smart_lane_change(self, veh_id: str, vehicle_states: Dict[str, Dict]):
-        """
-        智能换道决策
-
-        考虑：
-        1. 周围车流密度
-        2. 当前车道速度
-        3. 目标车道速度
-        """
+    def _safe_change_lane(self, veh_id: str):
+        """安全换道（简化版）"""
         try:
             current_lane = traci.vehicle.getLaneIndex(veh_id)
             road_id = traci.vehicle.getRoadID(veh_id)
             lane_count = traci.edge.getLaneNumber(road_id)
 
-            if lane_count <= 1:
-                return  # 单车道，无法换道
-
-            # 获取各车道密度
-            lane_densities = {}
-            for lane_idx in range(lane_count):
-                lane_id = f"{road_id}_{lane_idx}"
-                lane_vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-                lane_densities[lane_idx] = len(lane_vehicles)
-
-            # 计算各车道平均速度
-            lane_speeds = {}
-            for lane_idx in range(lane_count):
-                lane_id = f"{road_id}_{lane_idx}"
-                lane_vehicles = traci.lane.getLastStepVehicleIDs(lane_id)
-                if lane_vehicles:
-                    speeds = [traci.vehicle.getSpeed(v) for v in lane_vehicles]
-                    lane_speeds[lane_idx] = np.mean(speeds)
-                else:
-                    lane_speeds[lane_idx] = 50.0  # 空车道假设最高速
-
-            # 决策：选择密度低且速度快的车道
-            current_density = lane_densities.get(current_lane, float('inf'))
-            current_speed = lane_speeds.get(current_lane, 0.0)
-
-            best_lane = current_lane
-            best_score = current_speed / (current_density + 1)
-
-            for lane_idx in range(lane_count):
-                if lane_idx == current_lane:
-                    continue
-                density = lane_densities.get(lane_idx, float('inf'))
-                speed = lane_speeds.get(lane_idx, 0.0)
-                score = speed / (density + 1)
-
-                if score > best_score * 1.2:  # 需要20%以上的提升才换道
-                    best_lane = lane_idx
-                    best_score = score
-
-            # 执行换道
-            if best_lane != current_lane:
-                duration = 5.0  # 换道持续时间
-                traci.vehicle.changeLane(veh_id, best_lane, duration)
-                self.stats['lane_changes'] = self.stats.get('lane_changes', 0) + 1
+            # 简单策略：优先向右换道
+            if current_lane < lane_count - 1:
+                traci.vehicle.changeLane(veh_id, current_lane + 1, 5.0)
+            elif current_lane > 0:
+                traci.vehicle.changeLane(veh_id, current_lane - 1, 5.0)
 
         except Exception as e:
-            logger.debug(f"车辆 {veh_id} 智能换道失败: {e}")
+            logger.debug(f"车辆 {veh_id} 换道失败: {e}")
 
-    def _compute_ttc_values(self, vehicle_states: Dict[str, Dict]) -> Dict[str, float]:
-        """
-        计算所有车辆的TTC (Time To Collision)
+    def _compute_reward_gpu(self, observation: Dict[str, Any]) -> float:
+        """计算奖励（简化版）"""
+        num_vehicles = observation.get('num_vehicles', 0)
+        if num_vehicles == 0:
+            return 0.0
 
-        TTC = 纵向距离 / 相对速度（仅当追随时）
-        """
-        ttc_values = {}
+        vehicle_states = observation.get('vehicle_states', {})
 
-        for veh_id, state in vehicle_states.items():
-            try:
-                s = state.get('s', 0.0)
-                vs = state.get('vs', 0.0)
+        # 计算平均速度（从dict中提取）
+        total_speed = 0.0
+        count = 0
+        for state in vehicle_states.values():
+            if isinstance(state, dict):
                 speed = state.get('speed', 0.0)
+                total_speed += speed
+                count += 1
 
-                # 简化TTC计算：假设前方有障碍
-                # 实际应该检查前车位置
-                min_ttc = float('inf')
-
-                # 检查同车道前车
-                lane_index = state.get('lane_index', 0)
-                edge_id = state.get('edge_id', '')
-
-                for other_id, other_state in vehicle_states.items():
-                    if veh_id == other_id:
-                        continue
-
-                    if (other_state.get('lane_index') == lane_index and
-                        other_state.get('edge_id') == edge_id):
-
-                        other_s = other_state.get('s', 0.0)
-
-                        # 前车条件：other_s > s 且距离较近
-                        if other_s > s and (other_s - s) < 50.0:
-                            distance = other_s - s
-                            relative_speed = vs - other_state.get('vs', 0.0)
-
-                            # 追随时（relative_speed > 0）
-                            if relative_speed > 0:
-                                ttc = distance / relative_speed
-                                min_ttc = min(min_ttc, ttc)
-
-                ttc_values[veh_id] = min_ttc if min_ttc != float('inf') else 10.0
-
-            except Exception as e:
-                ttc_values[veh_id] = 10.0  # 默认安全值
-
-        return ttc_values
+        avg_speed = total_speed / count if count > 0 else 0.0
+        return avg_speed
 
     def _is_done(self) -> bool:
         """检查episode是否结束"""

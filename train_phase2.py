@@ -35,8 +35,6 @@ from src.training.custom_ppo_trainer import CustomPPOTrainer
 
 
 # 课程级别配置（从配置文件读取）
-# 优化：增加训练步数以充分利用8个并行环境
-# 每个rollout: 8 envs × 2048 steps = 16,384 transitions
 CURRICULUM_LEVELS = [
     {
         'level': 1,
@@ -45,7 +43,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 800,
         'icv_ratio': 0.3,
         'disturbance_level': 0.0,
-        'total_timesteps': 327680,  # 20 updates × 16384 = 327,680
+        'total_timesteps': 126000,
     },
     {
         'level': 2,
@@ -54,7 +52,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1200,
         'icv_ratio': 0.25,
         'disturbance_level': 0.2,
-        'total_timesteps': 327680,  # 20 updates × 16384 = 327,680
+        'total_timesteps': 126000,
     },
     {
         'level': 3,
@@ -63,7 +61,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1800,
         'icv_ratio': 0.25,
         'disturbance_level': 0.4,
-        'total_timesteps': 491520,  # 30 updates × 16384 = 491,520
+        'total_timesteps': 126000,
     },
     {
         'level': 4,
@@ -72,7 +70,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2400,
         'icv_ratio': 0.15,
         'disturbance_level': 0.7,
-        'total_timesteps': 655360,  # 40 updates × 16384 = 655,360
+        'total_timesteps': 126000,
     },
     {
         'level': 5,
@@ -81,7 +79,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2000,
         'icv_ratio': 0.2,
         'disturbance_level': 0.5,
-        'total_timesteps': 1966080,  # 120 updates × 16384 = 1,966,080
+        'total_timesteps': 1494000,
     },
 ]
 
@@ -163,23 +161,23 @@ def train_stage(
     # 将策略移动到设备
     policy = policy.to(device)
 
-    # # ⚡ 性能优化：使用torch.compile()加速模型（PyTorch 2.0+）
-    # try:
-    #     import torch._dynamo as dynamo
-    #     print("[OPTIMIZE] Applying torch.compile() for maximum performance...")
-    #     # 使用max-autotune模式获得最佳性能（需要Triton，已安装）
-    #     # 这是速度最快的模式，预期提升20-30%
-    #     policy = torch.compile(policy, mode="max-autotune", fullgraph=False)
-    #     print("[OK] Model compiled successfully (max-autotune mode)")
-    # except Exception as e:
-    #     print(f"[WARN] torch.compile() failed: {e}")
-    #     print(f"[INFO] Falling back to reduce-overhead mode...")
-    #     try:
-    #         policy = torch.compile(policy, mode="reduce-overhead", fullgraph=False)
-    #         print("[OK] Model compiled successfully (reduce-overhead mode)")
-    #     except Exception as e2:
-    #         print(f"[WARN] All compilation modes failed: {e2}")
-    #         print(f"[INFO] Continuing without compilation")
+    # ⚡ 性能优化：使用torch.compile()加速模型（PyTorch 2.0+）
+    try:
+        import torch._dynamo as dynamo
+        print("[OPTIMIZE] Applying torch.compile() for maximum performance...")
+        # 使用max-autotune模式获得最佳性能（需要Triton，已安装）
+        # 这是速度最快的模式，预期提升20-30%
+        policy = torch.compile(policy, mode="max-autotune", fullgraph=False)
+        print("[OK] Model compiled successfully (max-autotune mode)")
+    except Exception as e:
+        print(f"[WARN] torch.compile() failed: {e}")
+        print(f"[INFO] Falling back to reduce-overhead mode...")
+        try:
+            policy = torch.compile(policy, mode="reduce-overhead", fullgraph=False)
+            print("[OK] Model compiled successfully (reduce-overhead mode)")
+        except Exception as e2:
+            print(f"[WARN] All compilation modes failed: {e2}")
+            print(f"[INFO] Continuing without compilation")
 
     # 加载权重
     if prev_checkpoint and os.path.exists(prev_checkpoint):
@@ -194,6 +192,7 @@ def train_stage(
     elif phase1_checkpoint and os.path.exists(phase1_checkpoint):
         print(f"\n[LOAD] Loading Phase 1: {phase1_checkpoint}")
         checkpoint = torch.load(phase1_checkpoint, map_location=str(device))
+        print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys())}")
 
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
