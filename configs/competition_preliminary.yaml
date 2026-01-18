@@ -1,0 +1,275 @@
+# =============================================================================
+# 初赛专用配置文件 - 以粒控流
+# =============================================================================
+# 核心特点：
+# 1. 仅控制25%智能车辆，不控制路侧设施
+# 2. 以效率为主要评分指标
+# 3. 简化训练流程（Phase 1 + Phase 2）
+# =============================================================================
+
+# 基础配置
+device: cuda:0
+seed: 42
+
+# 路径配置
+paths:
+  checkpoint_dir: checkpoints/competition/preliminary
+  log_dir: logs/preliminary
+  tensorboard_dir: runs/preliminary
+
+# =============================================================================
+# 环境配置 - 初赛场景
+# =============================================================================
+environment:
+  # SUMO配置
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
+
+  # 初赛场景参数（会被课程学习覆盖）
+  max_vehicles: 32      # 最大车辆数
+  inflow_rate: 2000     # 流量（辆/小时）
+  icv_ratio: 0.25       # ⭐ 智能车渗透率25%（初赛要求）
+  max_steps: 1800       # Episode长度（30分钟）
+  warmup_steps: 150     # 预热步数
+
+  # ⭐ 初赛奖励配置 - 侧重效率
+  rewards:
+    # 速度奖励（核心）
+    speed_weight: 2.0           # 提高速度权重
+    efficiency_weight: 3.0      # 效率权重（吞吐量）
+    safety_weight: 1.0          # 降低安全权重（次要参考）
+    intervention_cost_weight: 0.5  # 降低成本权重（次要参考）
+
+    # 细节奖励
+    avg_speed_bonus: 1.0
+    throughput_bonus: 1.5
+    stopped_penalty: 0.5
+    congestion_penalty: 1.0
+
+  # 扰动级别（课程学习中会逐步增加）
+  disturbance_level: 0.0
+
+# =============================================================================
+# 模型配置 - 针对初赛优化
+# =============================================================================
+model:
+  # GNN配置
+  gnn:
+    node_dim: 9
+    edge_dim: 4
+    hidden_dim: 64
+    output_dim: 256
+    num_layers: 3
+    heads: 4
+    dropout: 0.1
+
+  # 世界模型配置
+  world_model:
+    hidden_dim: 128
+    latent_dim: 64
+    future_steps: 5
+    num_layers: 2
+    dropout: 0.1
+
+  # ⭐ 控制器配置 - 初赛专用
+  controller:
+    global_dim: 32
+    hidden_dim: 128
+    action_dim: 2           # [加速度, 变道概率]
+    top_k: 8                # ⭐ 控制Top-K车辆（32辆中选8辆，约25%）
+    dropout: 0.2
+
+    # 影响力评分权重（可学习）
+    alpha_init: 0.6         # GNN重要性初始权重
+    beta_init: 0.4          # 预测影响力初始权重
+
+  # 图构建配置
+  graph:
+    interaction_radius: 100.0  # 米
+    max_neighbors: 8
+
+  # 历史统计维度
+  history_dim: 32
+
+# =============================================================================
+# 训练配置 - 初赛简化流程
+# =============================================================================
+training:
+  # ========== 课程学习配置 ==========
+  curriculum:
+    enabled: true           # ⭐ 启用课程学习
+    auto_advance: true      # 自动晋级
+    min_episodes_per_level: 20  # 每个级别最少训练20个episodes
+    min_reward_threshold: -500  # 降低晋级门槛
+
+  # ========== Phase 1: 世界模型预训练 ==========
+  phase1:
+    num_episodes: 100       # 数据收集episodes
+    epochs: 50              # 训练轮数
+    batch_size: 256
+    learning_rate: 1e-4
+    num_parallel_workers: 16
+    use_cache: true
+    use_curriculum: true    # 使用课程学习
+
+  # ========== Phase 2: PPO训练（初赛优化）==========
+  phase2:
+    total_timesteps: 1500000  # 150万步（5个级别）
+
+    # 性能优化配置
+    num_envs: 1            # 单环境（SUMO CPU密集）
+    n_steps: 4096          # Rollout步数
+    batch_size: 256        # 大batch提高GPU利用率
+    update_epochs: 5       # 减少epoch避免过拟合
+
+    # 学习率
+    learning_rate: 3e-4
+
+    # PPO超参数
+    gamma: 0.99            # 折扣因子
+    gae_lambda: 0.95       # GAE参数
+    clip_epsilon: 0.2      # PPO裁剪参数
+    entropy_coef: 0.01     # 熵系数（鼓励探索）
+    value_loss_coef: 0.5   # 价值损失系数
+    max_grad_norm: 0.5     # 梯度裁剪
+
+    # ⭐ 初赛专用增强功能
+    use_curriculum: true      # 课程学习
+    use_per: true             # 优先经验回放
+    use_failure_bank: false   # 关闭失败案例库（初赛不需要）
+
+    # KL散度控制
+    target_kl: 0.01           # KL散度目标值
+
+# =============================================================================
+# 课程学习级别 - 初赛5级渐进
+# =============================================================================
+curriculum_levels:
+  - level: 1
+    name: "基础场景"
+    description: "少量车辆，低流量"
+    max_vehicles: 10
+    inflow_rate: 800
+    icv_ratio: 0.3
+    disturbance_level: 0.0
+    total_timesteps: 126000
+
+  - level: 2
+    name: "中等流量"
+    description: "中等车辆数和流量"
+    max_vehicles: 15
+    inflow_rate: 1200
+    icv_ratio: 0.25
+    disturbance_level: 0.2
+    total_timesteps: 126000
+
+  - level: 3
+    name: "高流量场景"
+    description: "高流量，开始出现拥堵"
+    max_vehicles: 20
+    inflow_rate: 1800
+    icv_ratio: 0.25
+    disturbance_level: 0.4
+    total_timesteps: 126000
+
+  - level: 4
+    name: "极端场景"
+    description: "接近极限流量"
+    max_vehicles: 32
+    inflow_rate: 2400
+    icv_ratio: 0.15
+    disturbance_level: 0.7
+    total_timesteps: 126000
+
+  - level: 5
+    name: "赛题场景"
+    description: "初赛官方场景"
+    max_vehicles: 32
+    inflow_rate: 2000
+    icv_ratio: 0.25        # ⭐ 25%智能车
+    disturbance_level: 0.5
+    total_timesteps: 996000  # 充分训练
+
+# =============================================================================
+# 评估配置 - 初赛指标
+# =============================================================================
+evaluation:
+  eval_freq: 50000         # 每5万步评估一次
+  n_eval_episodes: 20      # 评估20个episodes
+
+  # ⭐ 初赛评估指标（优先级排序）
+  metrics:
+    - avg_speed            # ⭐ 平均速度（核心指标）
+    - throughput           # ⭐ 吞吐量（核心指标）
+    - intervention_rate    # 干预率（次要）
+    - episode_reward       # 总奖励
+    - episode_length       # Episode长度
+
+  # 评估场景（使用赛题官方参数）
+  eval_scenarios:
+    - name: "初赛标准场景"
+      max_vehicles: 32
+      inflow_rate: 2000
+      icv_ratio: 0.25
+      disturbance_level: 0.5
+      num_episodes: 20
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  tensorboard: true        # 启用TensorBoard
+  wandb: false            # 关闭WandB（初赛不需要）
+  log_interval: 500
+
+  # 要记录的指标
+  metrics:
+    - episode_reward
+    - episode_length
+    - avg_speed            # ⭐ 重点记录
+    - throughput           # ⭐ 重点记录
+    - intervention_rate
+    - curriculum_level
+    - kl_div
+
+# =============================================================================
+# 高级配置（性能优化）
+# =============================================================================
+advanced:
+  # 混合精度训练
+  mixed_precision: true
+  amp: true               # 启用PyTorch AMP
+
+  # 梯度检查点（节省显存）
+  gradient_checkpointing: false
+
+  # JIT编译（加速风险特征计算）
+  jit_compile: true
+
+  # 数据加载优化
+  num_workers: 4
+  pin_memory: true
+
+# =============================================================================
+# 初赛专用技巧配置
+# =============================================================================
+preliminary_tweaks:
+  # ⭐ Top-K自适应调整
+  adaptive_top_k:
+    enabled: true
+    min_k: 5              # 最少控制5辆
+    max_k: 12             # 最多控制12辆
+    threshold: 0.5        # 重要性评分阈值
+
+  # ⭐ 早期停止（防止过拟合）
+  early_stopping:
+    enabled: true
+    patience: 10          # 10个epoch无改善则停止
+    min_delta: 0.01       # 最小改善阈值
+
+  # ⭐ 模型集成（可选，用于最终提交）
+  ensemble:
+    enabled: false        # 默认关闭（训练时间太长）
+    num_models: 3
+    voting_strategy: "soft"  # 软投票

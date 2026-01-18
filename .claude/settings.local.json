@@ -42,7 +42,10 @@
       "Bash(taskkill:*)",
       "Bash(.\\\\train_all_stages:*)",
       "Bash(echo:*)",
-      "Bash(conda activate:*)"
+      "Bash(conda activate:*)",
+      "Bash(./train_all.sh:*)",
+      "Bash(/home/wyyyz/TJ_transport_v4/check_training_setup.sh:*)",
+      "Bash(test:*)"
     ]
   }
 }
