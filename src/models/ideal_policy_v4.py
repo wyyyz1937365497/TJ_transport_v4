@@ -325,11 +325,12 @@ class IdealTrafficPolicyV4(nn.Module):
         # ============================================================
         # 8. 动作分布（独立实现，不依赖SB3）
         # ============================================================
-        self.action_dist = DiagonalGaussianDistribution(action_dim=64)
+        self.action_dist = DiagonalGaussianDistribution(action_dim=self.max_vehicles * 2)
 
         # ✅ 可学习的log_std参数（用于策略探索）
         # 初始化为log(0.1) ≈ -2.3，与之前的固定值一致
-        self.log_std = nn.Parameter(torch.full((64,), np.log(0.1), dtype=torch.float32))
+        # 维度：max_vehicles * 2（512辆车 × 2个动作 = 1024维）
+        self.log_std = nn.Parameter(torch.full((self.max_vehicles * 2,), np.log(0.1), dtype=torch.float32))
 
         # ============================================================
         # 9. LSTM隐藏状态（用于世界模型）
@@ -730,7 +731,7 @@ class IdealTrafficPolicyV4(nn.Module):
             # 从observations中提取is_icv标志
             # vehicle_features: [batch, max_vehicles * 9]
             vehicle_features = observations[:, :self.max_vehicles * 9]  # [batch, 288]
-            vehicle_features_reshaped = vehicle_features.view(batch_size, self.max_vehicles, 9)  # [batch, 32, 9]
+            vehicle_features_reshaped = vehicle_features.view(batch_size, self.max_vehicles, 9)  # [batch, max_vehicles, 9]
 
             # 取第一个batch的is_icv标志（索引8）
             is_icv = vehicle_features_reshaped[0, :, 8]  # [max_vehicles]
@@ -761,8 +762,8 @@ class IdealTrafficPolicyV4(nn.Module):
 
         # 检查是否全为零（没有车辆或无效数据）
         if fused.abs().sum() < 1e-6:
-            # ✅ 返回零动作（64维：32辆车 × 2维动作）
-            action_mean = torch.zeros(batch_size, 64, device=device)
+            # ✅ 返回零动作（max_vehicles*2维：512辆车 × 2维动作 = 1024维）
+            action_mean = torch.zeros(batch_size, self.max_vehicles * 2, device=device)
         else:
             # ✅ 修复：为每辆车生成2维动作 [acceleration, lane_change]
             action_features = self.action_projection(fused)  # [max_vehicles, 2]
@@ -793,10 +794,10 @@ class IdealTrafficPolicyV4(nn.Module):
             # ✅ 新增：动态干预机制 - 根据干预必要性调整动作强度
             # 计算全局干预必要性评分
             if batch_size > 1:
-                global_stats_batch = observations[:, self.max_vehicles * 9:self.max_vehicles * 9 + 32]  # [batch, 32]
+                global_stats_batch = observations[:, self.max_vehicles * 9:self.max_vehicles * 9 + 32]  # [batch, 32] (全局统计维度固定32)
                 global_stats_single = global_stats_batch[0:1]  # [1, 32]
             else:
-                global_stats_single = observations[self.max_vehicles * 9:self.max_vehicles * 9 + 32].unsqueeze(0)  # [1, 32]
+                global_stats_single = observations[self.max_vehicles * 9:self.max_vehicles * 9 + 32].unsqueeze(0)  # [1, 32] (全局统计维度固定32)
 
             # 使用GNN全局嵌入 + 全局统计预测干预必要性
             global_embedding = features_dict['global_embedding']  # [1 or batch, hidden_dim]
@@ -825,26 +826,37 @@ class IdealTrafficPolicyV4(nn.Module):
                 self._step_count = 1
 
             if self._step_count % 100 == 0:
+                # ✅ 修复：统计实际车辆数（位置非零的车辆）
+                # vehicle_features: [max_vehicles, 9]，第一列是s坐标
+                if batch_size > 1:
+                    vehicle_features = observations[:, :self.max_vehicles * 9].view(batch_size, self.max_vehicles, 9)
+                    actual_vehicles = (vehicle_features[0, :, 0].abs() > 1e-6).sum().item()  # s坐标非零
+                else:
+                    vehicle_features = observations[:self.max_vehicles * 9].view(self.max_vehicles, 9)
+                    actual_vehicles = (vehicle_features[:, 0].abs() > 1e-6).sum().item()
+
+                icv_count = is_icv.sum().item()
                 print(f"[INTERVENTION] Necessity: {intervention_necessity.item():.3f}, Scale: {intervention_scale:.3f}")
-                print(f"  ICV count: {is_icv.sum().item()}, Max vehicles: {self.max_vehicles}")
+                print(f"  Actual vehicles: {actual_vehicles}, ICV count: {icv_count} ({icv_count/max(actual_vehicles,1)*100:.1f}%), Obs space: {self.max_vehicles}")
 
-            # ✅ 修复：展平为64维向量（32辆车 × 2维动作）
-            # 只取前32辆车的动作（max_vehicles可能大于32）
-            actions_clipped = actions[:self.max_vehicles, :]  # [max_vehicles, 2] → [32, 2]
+            # ✅ 修复：展平为max_vehicles*2维向量（512辆车 × 2维动作 = 1024维）
+            # 只取前max_vehicles辆车的动作
+            actions_clipped = actions[:self.max_vehicles, :]  # [max_vehicles, 2] → [512, 2]
 
-            # 展平：[32, 2] → [64]
-            action_flat = actions_clipped.flatten()  # [64]
+            # 展平：[512, 2] → [1024]
+            action_flat = actions_clipped.flatten()  # [1024]
 
-            # 确保是64维
-            if action_flat.size(0) < 64:
-                # 如果不足64维，padding零
+            # 确保是max_vehicles*2维
+            expected_dim = self.max_vehicles * 2
+            if action_flat.size(0) < expected_dim:
+                # 如果不足expected_dim维，padding零
                 action_flat = torch.cat([
                     action_flat,
-                    torch.zeros(64 - action_flat.size(0), device=device)
+                    torch.zeros(expected_dim - action_flat.size(0), device=device)
                 ])
 
             # 为batch中的每个样本复制相同的动作
-            action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, 64]
+            action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, 1024]
 
         # 动作分布（使用可学习的log_std参数）
         # 确保log_std形状与action_mean匹配
@@ -864,10 +876,10 @@ class IdealTrafficPolicyV4(nn.Module):
         else:
             actions_out = self.action_dist.get_actions(deterministic=False)
 
-        # 计算log_prob（64维动作空间）
+        # 计算log_prob（max_vehicles*2维动作空间，1024维）
         log_prob = self.action_dist.log_prob(actions_out)
 
-        # 返回完整的64维动作（32辆车 × 2个动作）
+        # 返回完整的max_vehicles*2维动作（512辆车 × 2个动作 = 1024维）
         return actions_out, values, log_prob
 
     def evaluate_actions(
@@ -965,7 +977,7 @@ class IdealTrafficPolicyV4(nn.Module):
 
         # 检查是否有有效数据
         if node_embeddings.size(0) == 0:
-            return torch.zeros(batch_size, 64, device=device)
+            return torch.zeros(batch_size, self.max_vehicles * 2, device=device)
 
         # 融合特征用于动作生成
         fused = torch.cat([
@@ -978,7 +990,7 @@ class IdealTrafficPolicyV4(nn.Module):
         fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
 
         if fused.abs().sum() < 1e-6:
-            return torch.zeros(batch_size, 64, device=device)
+            return torch.zeros(batch_size, self.max_vehicles * 2, device=device)
 
         # ✅ 修复：为每辆车生成2维动作
         action_features = self.action_projection(fused)  # [max_vehicles, 2]
@@ -1001,7 +1013,7 @@ class IdealTrafficPolicyV4(nn.Module):
 
         # ✅ 新增：动态干预机制 - 根据干预必要性调整动作强度
         # 计算全局干预必要性评分
-        global_stats_single = observations[:, self.max_vehicles * 9:self.max_vehicles * 9 + 32][0:1]  # [1, 32]
+        global_stats_single = observations[:, self.max_vehicles * 9:self.max_vehicles * 9 + 32][0:1]  # [1, 32] (全局统计维度固定32)
 
         # 使用GNN全局嵌入 + 全局统计预测干预必要性
         global_embedding = features_dict['global_embedding']  # [1 or batch, hidden_dim]
@@ -1019,19 +1031,20 @@ class IdealTrafficPolicyV4(nn.Module):
         # 应用干预缩放
         actions = actions * intervention_scale
 
-        # ✅ 修复：展平为64维向量（32辆车 × 2维动作）
-        actions_clipped = actions[:self.max_vehicles, :]  # [max_vehicles, 2] → [32, 2]
-        action_flat = actions_clipped.flatten()  # [64]
+        # ✅ 修复：展平为max_vehicles*2维向量（512辆车 × 2维动作 = 1024维）
+        actions_clipped = actions[:self.max_vehicles, :]  # [max_vehicles, 2] → [512, 2]
+        action_flat = actions_clipped.flatten()  # [1024]
 
-        # 确保是64维
-        if action_flat.size(0) < 64:
+        # 确保是max_vehicles*2维
+        expected_dim = self.max_vehicles * 2
+        if action_flat.size(0) < expected_dim:
             action_flat = torch.cat([
                 action_flat,
-                torch.zeros(64 - action_flat.size(0), device=device)
+                torch.zeros(expected_dim - action_flat.size(0), device=device)
             ])
 
         # 为batch中的每个样本复制相同的动作
-        action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, 64]
+        action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, 1024]
 
         return action_mean
 
@@ -1045,12 +1058,12 @@ class IdealTrafficPolicyV4(nn.Module):
         推理（预测动作）- 使用完整的影响力驱动控制器
 
         Args:
-            observation: 单个观测 [321]
+            observation: 单个观测 [4641] = 512×9(车辆特征) + 32(全局统计) + 1(车辆数量)
             deterministic: 是否确定性
             return_top_k: 是否返回Top-K信息
 
         Returns:
-            actions: [64] 动作向量（32辆车 × 2个动作）
+            actions: [1024] 动作向量（512辆车 × 2个动作）
             info: 额外信息（可选）
         """
         device = self.device_train
@@ -1104,7 +1117,7 @@ class IdealTrafficPolicyV4(nn.Module):
                         accel_flat[local_idx] = raw_actions[i, 0]
                         lane_flat[local_idx] = raw_actions[i, 1]
 
-            # 合并所有64维动作（32辆车 × 2个动作）
+            # 合并所有max_vehicles*2维动作（512辆车 × 2个动作 = 1024维）
             actions = torch.stack([accel_flat, lane_flat], dim=1).flatten().cpu().numpy()
 
             # 额外信息

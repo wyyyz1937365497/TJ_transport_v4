@@ -14,7 +14,7 @@ DEFAULT_STEP_LENGTH = 0.1
 DEFAULT_MAX_STEPS = 3600
 
 # 车辆配置
-MAX_VEHICLES = 32  # 最大支持的车辆数量
+MAX_VEHICLES = 512  # 最大支持的车辆数量（✅ 修复：从32提升到512，满足赛题要求）
 # Frenet坐标系特征: s(纵向), d(横向), vs(纵向速度), vd(横向速度), speed, acceleration, lane_index, angle, is_icv
 FEATURES_PER_VEHICLE = 9  # 每辆车的特征数（Frenet坐标系9维）
 
