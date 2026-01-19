@@ -32,7 +32,7 @@ from datetime import datetime
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from src.models.ideal_policy_v4 import create_ideal_traffic_policy_v4
+from src.models.ideal_policy_v4 import create_ideal_traffic_policy_v4, IdealTrafficPolicyV4
 from src.env.competition_env import CompetitionSumoEnv
 from src.training.world_model_train_v4 import WorldModelTrainer
 from src.training.custom_ppo_trainer import CustomPPOTrainer
@@ -217,7 +217,17 @@ def train_phase2_level(
 
     # 创建策略网络
     print("[MODEL] 创建策略网络...")
-    policy_cls = create_ideal_traffic_policy_v4(config)
+    # 获取观察空间和动作空间
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    print(f"[MODEL] 观测维度: {obs_dim}, 动作维度: {action_dim}")
+
+    # 创建策略实例
+    policy = IdealTrafficPolicyV4(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        config=config
+    )
 
     # 加载Phase 1权重（如果是Level 1）
     if level == 1 and phase1_checkpoint is not None:
@@ -236,11 +246,10 @@ def train_phase2_level(
     log_dir = Path(config['paths']['log_dir']) / 'preliminary' / f'level{level}'
 
     trainer = CustomPPOTrainer(
-        policy=policy_cls,
+        policy=policy,
         env=env,
         config=config['training']['phase2'],
         device=device,
-        tensorboard_log=str(log_dir),
         checkpoint_dir=str(checkpoint_dir)
     )
 

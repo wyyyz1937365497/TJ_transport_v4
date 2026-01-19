@@ -604,14 +604,11 @@ class IdealTrafficPolicyV4(nn.Module):
                 all_edge_indices = torch.empty((2, 0), dtype=torch.long, device=device)
                 all_edge_attrs = torch.empty((0, 4), device=device)
 
-            # 创建batch tensor
+            # 创建batch tensor - 每个节点标记它所属的batch索引
             batch_tensor = []
             for b in range(batch_size):
-                if b == 0:
-                    batch_tensor.append(torch.arange(num_veh_list[b], device=device))
-                else:
-                    offset = cumsum[b - 1].item()
-                    batch_tensor.append(torch.arange(num_veh_list[b], device=device) + offset)
+                # 第b个batch的所有节点都应该有batch索引b
+                batch_tensor.append(torch.full((num_veh_list[b],), b, device=device, dtype=torch.long))
 
             batch_tensor = torch.cat(batch_tensor, dim=0)
         else:
@@ -744,7 +741,7 @@ class IdealTrafficPolicyV4(nn.Module):
             # 应用Top-K掩码（使用重要性得分）
             k = min(self.top_k, int(is_icv.sum()))
             if k > 0 and importance.size(0) >= k:
-                top_k_values, top_k_indices = torch.topk(importance[:k], k)
+                top_k_values, top_k_indices = torch.topk(importance, k)
 
                 # 创建掩码 - 只控制Top-K车辆，其他置零
                 mask = torch.zeros_like(actions)  # [max_vehicles, 64]
@@ -761,8 +758,8 @@ class IdealTrafficPolicyV4(nn.Module):
             if batch_size > 1:
                 action_mean = action_mean.expand(batch_size, -1)  # [batch_size, 64]
 
-        # 动作分布
-        action_log_std = torch.ones_like(action_mean) * 0.1
+        # 动作分布（使用log标准差，与evaluate_actions一致）
+        action_log_std = torch.log(torch.ones_like(action_mean) * 0.1)
         self.action_dist.proba_distribution(action_mean, action_log_std)
 
         if deterministic:
@@ -770,12 +767,10 @@ class IdealTrafficPolicyV4(nn.Module):
         else:
             actions_out = self.action_dist.get_actions(deterministic=False)
 
-        # 计算log_prob（在压缩动作维度之前）
+        # 计算log_prob（64维动作空间）
         log_prob = self.action_dist.log_prob(actions_out)
 
-        # 压缩到2维动作空间 [acceleration, lane_change]
-        actions_out = actions_out[:, :2]
-
+        # 返回完整的64维动作（32辆车 × 2个动作）
         return actions_out, values, log_prob
 
     def evaluate_actions(
@@ -827,9 +822,8 @@ class IdealTrafficPolicyV4(nn.Module):
             self.action_dist.proba_distribution(action_mean, torch.log(action_std))
 
             # 5. 计算log_prob和entropy
-            # 扩展actions到64维
-            actions_64 = torch.cat([actions, torch.zeros(batch_size, 62, device=device)], dim=-1) if actions.size(1) == 2 else actions
-            log_prob = self.action_dist.log_prob(actions_64)
+            # actions 应该已经是64维
+            log_prob = self.action_dist.log_prob(actions)
             entropy = self.action_dist.entropy()
 
             return values, log_prob, entropy
@@ -855,7 +849,9 @@ class IdealTrafficPolicyV4(nn.Module):
         node_embeddings = features_dict['node_embeddings']
         z_flow = features_dict['z_flow']
         z_risk = features_dict['z_risk']
-        importance = features_dict['importance_scores']
+
+        # 处理importance_scores（需要切片和squeeze，与forward方法一致）
+        importance = features_dict['importance_scores'][:self.max_vehicles].squeeze(-1)
 
         # 检查是否有有效数据
         if node_embeddings.size(0) == 0:
@@ -891,7 +887,7 @@ class IdealTrafficPolicyV4(nn.Module):
 
         k = min(self.top_k, int(is_icv.sum()))
         if k > 0 and importance.size(0) >= k:
-            top_k_values, top_k_indices = torch.topk(importance[:k], k)
+            top_k_values, top_k_indices = torch.topk(importance, k)
             mask = torch.zeros_like(actions)
             mask[top_k_indices] = 1.0
             actions = actions * mask
@@ -917,7 +913,7 @@ class IdealTrafficPolicyV4(nn.Module):
             return_top_k: 是否返回Top-K信息
 
         Returns:
-            actions: [2] 动作 [acceleration, lane_change]
+            actions: [64] 动作向量（32辆车 × 2个动作）
             info: 额外信息（可选）
         """
         device = self.device_train
@@ -971,8 +967,8 @@ class IdealTrafficPolicyV4(nn.Module):
                         accel_flat[local_idx] = raw_actions[i, 0]
                         lane_flat[local_idx] = raw_actions[i, 1]
 
-            # 合并 - 只返回前2维 [acceleration, lane_change]
-            actions = torch.stack([accel_flat, lane_flat], dim=1).flatten()[:2].cpu().numpy()
+            # 合并所有64维动作（32辆车 × 2个动作）
+            actions = torch.stack([accel_flat, lane_flat], dim=1).flatten().cpu().numpy()
 
             # 额外信息
             info = None
@@ -1051,24 +1047,14 @@ def create_ideal_traffic_policy_v4(config: Dict[str, Any]) -> type:
                 config=config
             )
 
-        def to(self, device):
+        def to(self, *args, **kwargs):
             """重写to方法，确保所有子模块正确移动设备"""
             # 调用父类的to方法
-            result = super().to(device)
+            result = super().to(*args, **kwargs)
 
             # 确保所有子模块都在正确的设备上
-            if hasattr(self, 'perception_layer'):
-                self.perception_layer = self.perception_layer.to(device)
-            if hasattr(self, 'prediction_layer'):
-                self.prediction_layer = self.prediction_layer.to(device)
-            if hasattr(self, 'weight_gating'):
-                self.weight_gating = self.weight_gating.to(device)
-            if hasattr(self, 'decision_layer'):
-                self.decision_layer = self.decision_layer.to(device)
-            if hasattr(self, 'critic'):
-                self.critic = self.critic.to(device)
-            if hasattr(self, 'action_projection'):
-                self.action_projection = self.action_projection.to(device)
+            # (父类的to方法应该已经处理了所有注册的子模块，这里保留是为了兼容性)
+            # 注意：实际上这些调用是冗余的，因为父类的to方法已经处理了所有nn.Module子模块
             if hasattr(self, 'action_dist'):
                 # action_dist不是nn.Module，不需要移动
                 pass

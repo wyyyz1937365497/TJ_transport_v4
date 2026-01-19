@@ -30,7 +30,7 @@ environment:
   max_vehicles: 32      # 最大车辆数
   inflow_rate: 2000     # 流量（辆/小时）
   icv_ratio: 0.25       # ⭐ 智能车渗透率25%（初赛要求）
-  max_steps: 1800       # Episode长度（30分钟）
+  max_steps: 3600       # Episode长度（30分钟）
   warmup_steps: 150     # 预热步数
 
   # ⭐ 初赛奖励配置 - 侧重效率
@@ -118,8 +118,8 @@ training:
     total_timesteps: 1500000  # 150万步（5个级别）
 
     # 性能优化配置
-    num_envs: 1            # 单环境（SUMO CPU密集）
-    n_steps: 4096          # Rollout步数
+    num_envs: 2            # 单环境（SUMO CPU密集）
+    n_steps: 2048          # Rollout步数
     batch_size: 256        # 大batch提高GPU利用率
     update_epochs: 5       # 减少epoch避免过拟合
 

@@ -170,19 +170,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         icv_ids = set()
         if len(all_vehicle_ids) > 0:
             # 使用GPU进行随机采样（如果可用）
-            if torch.cuda.is_available() and self.device.type == 'cuda':
-                icv_indices = torch.randperm(
-                    len(all_vehicle_ids),
-                    device=self.device
-                )[:num_icv]
-                icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
-            else:
-                icv_indices = np.random.choice(
-                    len(all_vehicle_ids),
-                    size=min(num_icv, len(all_vehicle_ids)),
-                    replace=False
-                )
-                icv_ids = {all_vehicle_ids[i] for i in icv_indices}
+            icv_indices = torch.randperm(
+                len(all_vehicle_ids),
+                device=self.device
+            )[:num_icv]
+            icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
@@ -232,25 +224,18 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
 
                 # 优化的Frenet坐标系计算
-                if self.use_accurate_frenet and self.frenet_system is not None:
-                    # 使用精确的Frenet坐标系统(基于预计算的车道中心线)
-                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+                # 使用精确的Frenet坐标系统(基于预计算的车道中心线)
+                s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
 
-                    # 获取车道在该位置的航向角(用于速度分解)
-                    lane_heading = self.frenet_system.lanes.get(lane_id)
-                    if lane_heading is not None:
-                        heading_at_s = lane_heading.get_heading_at_s(s)
-                    else:
-                        heading_at_s = np.radians(angle)
+                # 获取车道在该位置的航向角(用于速度分解)
+                lane_heading = self.frenet_system.lanes.get(lane_id)
+                if lane_heading is not None:
+                    heading_at_s = lane_heading.get_heading_at_s(s)
+                else:
+                    heading_at_s = np.radians(angle)
 
                     # 检查是否在瓶颈区域
-                    in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
-                else:
-                    # 使用简化的Frenet坐标(SUMO原生)
-                    s = traci_lib.vehicle.getLanePosition(veh_id)
-                    d = traci_lib.vehicle.getLateralLanePosition(veh_id)
-                    heading_at_s = np.radians(self._get_lane_angle(lane_id))
-                    in_bottleneck = False
+                in_bottleneck = self.frenet_system.is_in_bottleneck(s, edge_id)
 
                 # 速度分解到Frenet坐标系
                 vs = speed * np.cos(angle * np.pi / 180.0 - heading_at_s)

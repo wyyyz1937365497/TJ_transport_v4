@@ -76,7 +76,6 @@ class GPURolloutBuffer:
     GPU上的Rollout Buffer
 
     数据从收集到存储都在GPU上，消除CPU-GPU传输瓶颈。
-    完全实现，无简化逻辑。
     """
 
     def __init__(
