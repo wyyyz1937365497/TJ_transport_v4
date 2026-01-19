@@ -25,7 +25,7 @@ import argparse
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from src.env.competition_env import CompetitionSumoEnv
+from src.env.gym_wrapper import GymSumoEnv
 from src.models.v5_lightweight import create_lightweight_policy_v5
 from src.training.ocr_rewards import create_ocr_reward_calculator
 from src.env.sparse_controller import create_sparse_controller
@@ -41,20 +41,10 @@ def load_config(config_path: str) -> dict:
 
 def create_environment(config: dict):
     """创建训练环境"""
-    env_config = config['environment']
-
-    env = CompetitionSumoEnv(
-        sumo_config=env_config['sumo_config'],
-        net_file=env_config.get('net_file'),
-        route_file=env_config.get('route_file'),
-        max_vehicles=env_config['max_vehicles'],
-        inflow_rate=env_config['inflow_rate'],
-        icv_ratio=env_config['icv_ratio'],
-        max_steps=env_config['max_steps'],
-        warmup_steps=env_config.get('warmup_steps', 150),
-        reward_weights=env_config.get('rewards', {}),
-        use_gui=False,  # 训练时不使用GUI
-        seed=config.get('seed', 42)
+    env = GymSumoEnv(
+        config=config,  # ✅ 传递完整的配置字典
+        seed=config.get('seed', 42),
+        device=config.get('device', 'cuda:0')
     )
 
     return env

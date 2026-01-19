@@ -48,7 +48,9 @@
       "Bash(test:*)",
       "Bash(grep:*)",
       "Bash(/bin/ls:*)",
-      "Bash(xargs:*)"
+      "Bash(xargs:*)",
+      "Bash(git commit:*)",
+      "Bash(git rm:*)"
     ]
   }
 }
