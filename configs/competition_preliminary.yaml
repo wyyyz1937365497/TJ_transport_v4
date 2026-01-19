@@ -109,7 +109,7 @@ training:
     epochs: 50              # 训练轮数
     batch_size: 256
     learning_rate: 0.0001   # 1e-4
-    num_parallel_workers: 16
+    num_parallel_workers: 8
     use_cache: true
     use_curriculum: true    # 使用课程学习
 

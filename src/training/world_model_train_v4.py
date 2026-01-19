@@ -1,538 +1,607 @@
 """
-Phase 1 世界模型训练器 v4.0
-
-训练目标：
-- 学习车辆状态编码器（RiskSensitiveGNN）
-- 学习交通流预测器（MultiScaleRSSM）
-- 学习动态权重门控（EnhancedDynamicWeightGating）
-- 预训练特征提取器，为Phase 2的PPO训练提供良好初始化
-
-使用方法：
-    from src.training.world_model_train_v4 import WorldModelTrainer
-
-    trainer = WorldModelTrainer(config=config, device=device)
-    trainer.train()
+Phase 1 世界模型训练器 - 正确版本
 """
 
 import os
-import time
+import pickle
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Tuple, List
 from tqdm import tqdm
 import numpy as np
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from dataclasses import dataclass
 
-from src.models.ideal_policy_v4 import IdealTrafficPolicyV4
+# 导入正确的模型
+try:
+    from src.models.v4_architecture import IdealTrafficControllerV4
+except ImportError:
+    # Fallback
+    from src.models.ideal_policy_v4 import IdealTrafficPolicyV4 as IdealTrafficControllerV4
+    
 from src.env.competition_env import CompetitionSumoEnv
 
 
-class WorldModelDataset(torch.utils.data.Dataset):
-    """
-    世界模型训练数据集
+@dataclass
+class TrafficTransition:
+    """交通状态转移数据"""
+    vehicle_states: List[Dict]
+    global_stats: np.ndarray
+    icv_ids: set
+    vehicle_ids: List[str]
+    num_vehicles: int
+    s_coords: np.ndarray
+    d_coords: np.ndarray
+    lanes: np.ndarray
+    speeds: np.ndarray
+    accels: np.ndarray
+    angles: np.ndarray
 
-    收集真实交通数据用于监督学习预训练
-    """
 
-    def __init__(
-        self,
-        env_config: Dict[str, Any],
-        num_episodes: int = 100,
-        steps_per_episode: int = 1000,
-        seed: int = 42
-    ):
-        """
-        Args:
-            env_config: 环境配置
-            num_episodes: 收集的episode数量
-            steps_per_episode: 每个episode的步数
-            seed: 随机种子
-        """
-        self.env_config = env_config
-        self.num_episodes = num_episodes
-        self.steps_per_episode = steps_per_episode
-        self.seed = seed
+def _collect_worker(worker_id: int, num_episodes: int, env_config: Dict, max_steps: int = 500) -> Tuple[List, List]:
+    """Worker函数"""
+    # ⭐ 关键：必须在任何PyTorch导入之前设置
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
-        # 数据存储
-        self.observations = []
-        self.next_observations = []
+    # 强制使用CPU
+    import torch
+    torch.cuda.is_available = lambda: False
 
-        print(f"[DATASET] Collecting {num_episodes} episodes...")
-        self._collect_data()
-        print(f"[OK] Dataset collected: {len(self.observations)} samples")
+    observations = []
+    next_observations = []
 
-    def _collect_data(self):
-        """使用环境收集数据"""
-        for episode in tqdm(range(self.num_episodes), desc="Collecting data"):
-            # 每个episode创建新环境（避免状态污染）
-            env = CompetitionSumoEnv(config=self.env_config, use_gui=False)
+    for ep in range(num_episodes):
+        env = CompetitionSumoEnv(env_config, use_gui=False)
+        try:
+            obs = env.reset()
 
-            try:
-                # 设置随机种子（如果环境支持）
-                if hasattr(env, 'seed'):
-                    env.seed(self.seed + episode)
+            for step in range(max_steps):
+                # ⭐ 只存储成对数据
+                obs_trans = _create_transition(obs)
 
-                obs = env.reset()
+                icv_ids = list(obs.get('icv_ids', set()))
+                if len(icv_ids) > 0:
+                    action = {icv_ids[0]: np.random.uniform(-1.0, 1.0, size=2)}
+                else:
+                    action = None
 
-                for step in range(self.steps_per_episode):
-                    # 存储当前观测（在step之前存储）
-                    self.observations.append(obs)
+                next_obs_dict, reward, done, info = env.step(action)
+                next_trans = _create_transition(next_obs_dict)
 
-                    # 生成随机动作字典 {vehicle_id: [acceleration, lane_change]}
-                    actions = {}
-                    # 修正：obs格式是 {'vehicle_ids': [...], 'vehicle_states': {...}}
-                    if 'vehicle_ids' in obs and len(obs['vehicle_ids']) > 0:
-                        vehicle_ids = obs['vehicle_ids']
-                        # 只控制前3辆车（避免所有车辆都做随机动作导致混乱）
-                        for veh_id in vehicle_ids[:3]:
-                            # 随机加速度 [-3, 2] m/s²
-                            accel = np.random.uniform(-3.0, 2.0)
-                            # 随机换道概率 [0, 1]
-                            lane_change = np.random.uniform(0, 1)
-                            actions[str(veh_id)] = np.array([accel, lane_change])
+                # ⭐ 只在不done时存储，确保成对
+                if not done:
+                    observations.append(obs_trans)
+                    next_observations.append(next_trans)
 
-                    # ⭐ 关键修复：即使没有车辆也要调用step()，推进仿真
-                    # 这让SUMO有机会生成新车辆
-                    next_obs, reward, done, info = env.step(actions)
+                if done:
+                    break
 
-                    # 存储下一个观测
-                    self.next_observations.append(next_obs)
+                obs = next_obs_dict
 
-                    if done:
-                        break
+        except Exception as e:
+            print(f"[WARNING] Worker {worker_id}, Episode {ep}: {e}")
+        finally:
+            env.close()
 
-                    obs = next_obs
+    return observations, next_observations
 
-            except Exception as e:
-                print(f"[WARNING] Episode {episode} failed: {e}")
-            finally:
-                env.close()
 
-    def __len__(self):
-        return len(self.observations)
+def _create_transition(obs: Dict) -> TrafficTransition:
+    """创建交通状态转移对象"""
+    vehicle_states = obs.get('vehicle_states', {})
+    global_stats = obs.get('global_stats', np.zeros(32))
+    icv_ids = obs.get('icv_ids', set())
+    vehicle_ids = obs.get('vehicle_ids', [])
+    num_veh = len(vehicle_ids)
+    
+    s_coords = np.zeros(num_veh)
+    d_coords = np.zeros(num_veh)
+    lanes = np.zeros(num_veh)
+    speeds = np.zeros(num_veh)
+    accels = np.zeros(num_veh)
+    angles = np.zeros(num_veh)
+    
+    for i, veh_id in enumerate(vehicle_ids):
+        state = vehicle_states.get(veh_id, {})
+        s_coords[i] = state.get('s', 0.0)
+        d_coords[i] = state.get('d', 0.0)
+        lanes[i] = state.get('lane_index', 0.0)
+        speeds[i] = state.get('speed', 0.0)
+        accels[i] = state.get('acceleration', 0.0)
+        angles[i] = state.get('angle', 0.0)
+    
+    return TrafficTransition(
+        vehicle_states=list(vehicle_states.values()),
+        global_stats=global_stats,
+        icv_ids=icv_ids,
+        vehicle_ids=vehicle_ids,
+        num_vehicles=num_veh,
+        s_coords=s_coords,
+        d_coords=d_coords,
+        lanes=lanes,
+        speeds=speeds,
+        accels=accels,
+        angles=angles
+    )
 
-    def _obs_to_tensor(self, obs: Dict[str, Any]) -> np.ndarray:
-        """
-        将观测字典转换为numpy数组
 
-        Args:
-            obs: 观测字典
+def _extract_node_features(trans: TrafficTransition) -> torch.Tensor:
+    """提取节点特征"""
+    num_veh = trans.num_vehicles
+    features = np.zeros((num_veh, 9), dtype=np.float32)
+    
+    for i in range(num_veh):
+        features[i, 0] = trans.s_coords[i] / 1000.0
+        features[i, 1] = trans.d_coords[i] / 10.0
+        features[i, 2] = trans.speeds[i] / 30.0
+        features[i, 3] = 0.0
+        features[i, 4] = trans.speeds[i] / 30.0
+        features[i, 5] = trans.accels[i] / 3.0
+        features[i, 6] = trans.lanes[i] / 10.0
+        features[i, 7] = trans.angles[i] / 360.0
+        features[i, 8] = 1.0 if i < len(trans.icv_ids) else 0.0
+    
+    return torch.from_numpy(features)
 
-        Returns:
-            扁平化的观测数组
-        """
-        # 提取全局统计特征
-        global_stats = obs.get('global_stats', np.zeros(32))
 
-        # 提取车辆状态并填充到固定大小的数组
-        vehicle_states = obs.get('vehicle_states', {})
-        vehicle_ids = obs.get('vehicle_ids', [])
+def _build_edges(trans: TrafficTransition, config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    """构建边"""
+    num_veh = trans.num_vehicles
+    if num_veh <= 1:
+        return (torch.empty((2, 0), dtype=torch.long),
+                torch.empty((0, 4), dtype=torch.float32))
+    
+    graph_config = config.get('model', {}).get('graph', {})
+    interaction_radius = graph_config.get('interaction_radius', 100.0)
+    max_neighbors = graph_config.get('max_neighbors', 8)
+    
+    sources, targets, edge_features_list = [], [], []
+    
+    for i in range(num_veh):
+        s_diff = trans.s_coords - trans.s_coords[i]
+        d_diff = trans.d_coords - trans.d_coords[i]
+        distances = np.sqrt(s_diff**2 + d_diff**2)
+        
+        mask = (distances < interaction_radius) & (distances > 0.1)
+        neighbors = np.where(mask)[0]
+        
+        if len(neighbors) > max_neighbors:
+            sorted_indices = np.argsort(distances[neighbors])[:max_neighbors]
+            neighbors = neighbors[sorted_indices]
+        
+        for j in neighbors:
+            sources.append(i)
+            targets.append(j)
+            edge_feat = np.array([
+                s_diff[j] / 100.0,
+                d_diff[j] / 10.0,
+                distances[j] / 100.0,
+                1.0 if trans.vehicle_ids[j] in trans.icv_ids else 0.0
+            ], dtype=np.float32)
+            edge_features_list.append(edge_feat)
+    
+    if len(sources) == 0:
+        return (torch.empty((2, 0), dtype=torch.long),
+                torch.empty((0, 4), dtype=torch.float32))
+    
+    edge_index = torch.stack([
+        torch.tensor(sources, dtype=torch.long),
+        torch.tensor(targets, dtype=torch.long)
+    ])
+    edge_features = torch.stack([torch.from_numpy(f) for f in edge_features_list])
+    
+    return edge_index, edge_features
 
-        # 最多32辆车，每辆车9个特征 (s, d, vs, vd, speed, accel, lane_index, angle, in_bottleneck)
-        max_vehicles = 32
-        vehicle_features = np.zeros((max_vehicles, 9))
 
-        for i, veh_id in enumerate(vehicle_ids[:max_vehicles]):
-            if veh_id in vehicle_states:
-                state = vehicle_states[veh_id]
-                vehicle_features[i] = [
-                    state.get('s', 0.0),
-                    state.get('d', 0.0),
-                    state.get('vs', 0.0),
-                    state.get('vd', 0.0),
-                    state.get('speed', 0.0),
-                    state.get('acceleration', 0.0),
-                    state.get('lane_index', 0.0),
-                    state.get('angle', 0.0),
-                    1.0 if state.get('in_bottleneck', False) else 0.0
-                ]
+def _compute_risk_features(trans: TrafficTransition) -> torch.Tensor:
+    """计算风险特征"""
+    num_veh = trans.num_vehicles
+    if num_veh == 0:
+        return torch.zeros((0, 2), dtype=torch.float32)
+    
+    risk1 = np.var(trans.speeds) / 100.0
+    risk2 = np.var(trans.accels) / 10.0
+    
+    risk_features = np.zeros((num_veh, 2), dtype=np.float32)
+    risk_features[:, 0] = risk1
+    risk_features[:, 1] = risk2
+    
+    return torch.from_numpy(risk_features)
 
-        # 展平车辆特征 (32 * 9 = 288)
-        vehicle_features_flat = vehicle_features.flatten()
 
-        # 拼接全局统计 (288 + 32 = 320，再加一个step特征 = 321)
-        step_feature = np.array([obs.get('step', 0) / 3600.0])  # 归一化step
+def _extract_next_speed(next_obs: TrafficTransition, num_veh: int) -> torch.Tensor:
+    """提取下一个时刻的速度"""
+    if num_veh == 0:
+        return torch.zeros((0, 1), dtype=torch.float32)
+    speeds = next_obs.speeds[:num_veh] / 30.0
+    return torch.from_numpy(speeds).unsqueeze(-1).float()
 
-        obs_array = np.concatenate([
-            vehicle_features_flat,
-            global_stats,
-            step_feature
-        ])
 
-        return obs_array.astype(np.float32)
+def _extract_next_position(next_obs: TrafficTransition, num_veh: int) -> torch.Tensor:
+    """提取下一个时刻的位置"""
+    if num_veh == 0:
+        return torch.zeros((0, 2), dtype=torch.float32)
+    s = next_obs.s_coords[:num_veh] / 1000.0
+    d = next_obs.d_coords[:num_veh] / 10.0
+    positions = np.stack([s, d], axis=1)
+    return torch.from_numpy(positions).float()
 
-    def __getitem__(self, idx):
-        obs = self._obs_to_tensor(self.observations[idx])
-        next_obs = self._obs_to_tensor(self.next_observations[idx])
-        return (
-            torch.from_numpy(obs),
-            torch.from_numpy(next_obs)
-        )
+
+def _compute_conflict_label(obs: TrafficTransition, next_obs: TrafficTransition) -> torch.Tensor:
+    """计算冲突标签"""
+    # ⭐ 使用min确保车辆数一致
+    num_veh = min(obs.num_vehicles, next_obs.num_vehicles)
+
+    if num_veh == 0:
+        return torch.zeros((0, 1), dtype=torch.float32)
+
+    labels = np.zeros(num_veh, dtype=np.float32)
+    for i in range(num_veh):
+        min_dist = float('inf')
+        for j in range(num_veh):
+            if i == j:
+                continue
+            s_diff = obs.s_coords[i] - obs.s_coords[j]
+            d_diff = obs.d_coords[i] - obs.d_coords[j]
+            dist = np.sqrt(s_diff**2 + d_diff**2)
+            if dist < min_dist:
+                min_dist = dist
+        if min_dist < 5.0:
+            labels[i] = 1.0
+
+    return torch.from_numpy(labels).unsqueeze(-1)
 
 
 class WorldModelTrainer:
-    """
-    世界模型训练器（Phase 1）
-
-    训练流程：
-    1. 收集真实交通数据（使用随机策略）
-    2. 监督学习预训练特征提取器
-       - GNN: 车辆交互建模
-       - RSSM: 交通流预测
-       - 动态权重门控: 场景识别
-    3. 保存预训练权重供Phase 2使用
-    """
-
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        device: torch.device,
-    ):
-        """
-        Args:
-            config: 配置字典
-            device: 计算设备
-        """
+    """世界模型训练器"""
+    
+    def __init__(self, config: Dict[str, Any], device: torch.device):
         self.config = config
         self.device = device
-
-        # Phase 1配置
+        
         phase1_config = config.get('training', {}).get('phase1', {})
-        self.num_epochs = phase1_config.get('num_epochs', 100)
-        self.batch_size = phase1_config.get('batch_size', 32)
-        self.learning_rate = phase1_config.get('learning_rate', 1e-3)
+        self.num_epochs = phase1_config.get('epochs', 50)
+        self.batch_size = phase1_config.get('batch_size', 256)
+        self.learning_rate = float(phase1_config.get('learning_rate', 1e-4))
         self.num_episodes = phase1_config.get('num_episodes', 100)
-        self.steps_per_episode = phase1_config.get('steps_per_episode', 1000)
-
-        # 环境配置（使用简化场景）
-        env_config = config.get('environment', {}).copy()
-        env_config.update({
-            'max_vehicles': 10,  # Phase 1使用小规模场景
+        self.num_workers = phase1_config.get('num_parallel_workers', 4)
+        
+        checkpoint_dir = Path(config.get('paths', {}).get('checkpoint_dir', 'checkpoints'))
+        self.checkpoint_dir = checkpoint_dir / 'preliminary' / 'phase1'
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.cache_dir = self.checkpoint_dir / 'cache'
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_dir / 'data.pkl'
+        
+        self.env_config = config.get('environment', {}).copy()
+        self.env_config.update({
+            'max_vehicles': 10,
             'inflow_rate': 800,
             'icv_ratio': 0.3,
             'disturbance_level': 0.0,
         })
-        self.env_config = env_config
-
-        # 创建模型
-        print("[MODEL] Creating policy network for pretraining...")
-        self.model = IdealTrafficPolicyV4(
-            obs_dim=321,
-            action_dim=2,
-            config=config
-        ).to(device)
-
-        # 创建优化器
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=1e-5
-        )
-
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=10,
-            verbose=True
-        )
-
-        # 损失函数
-        self.mse_loss = nn.MSELoss()
-
-        # 训练历史
-        self.history = {
-            'train_loss': [],
-            'val_loss': [],
-            'learning_rate': []
-        }
-
+        
         print(f"[OK] WorldModelTrainer initialized")
         print(f"  - Device: {device}")
         print(f"  - Epochs: {self.num_epochs}")
         print(f"  - Batch size: {self.batch_size}")
         print(f"  - Learning rate: {self.learning_rate}")
-
-    def collect_data(self) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
-        """
-        收集训练和验证数据
-
-        Returns:
-            train_dataset, val_dataset
-        """
-        print("\n[COLLECT] Collecting training data...")
-
-        # 训练集（80%）
-        train_dataset = WorldModelDataset(
-            env_config=self.env_config,
-            num_episodes=int(self.num_episodes * 0.8),
-            steps_per_episode=self.steps_per_episode,
-            seed=self.config.get('seed', 42)
-        )
-
-        # 验证集（20%）
-        val_dataset = WorldModelDataset(
-            env_config=self.env_config,
-            num_episodes=int(self.num_episodes * 0.2),
-            steps_per_episode=self.steps_per_episode,
-            seed=self.config.get('seed', 42) + 1000
-        )
-
-        return train_dataset, val_dataset
-
-    def compute_prediction_loss(
-        self,
-        obs: torch.Tensor,
-        next_obs: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        计算预测损失
-
-        目标：让模型学习预测下一个时刻的状态
-
-        Args:
-            obs: 当前观测 [batch_size, 321]
-            next_obs: 下一个观测 [batch_size, 321]
-
-        Returns:
-            total_loss, loss_dict
-        """
-        # 提取当前观测的特征
-        features_dict = self.model.extract_features(obs)
-
-        # 提取下一个观测的特征（用于预测目标）
-        with torch.no_grad():
-            next_features_dict = self.model.extract_features(next_obs)
-
-        # 预测损失：预测下一时刻的全局嵌入
-        pred_global = features_dict['global_embedding']
-        target_global = next_features_dict['global_embedding']
-
-        # 清理NaN
-        pred_global = torch.nan_to_num(pred_global, nan=0.0, posinf=0.0, neginf=0.0)
-        target_global = torch.nan_to_num(target_global, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # MSE损失
-        loss_global = self.mse_loss(pred_global, target_global)
-
-        # 预测下一时刻的节点嵌入
-        node_embeddings = features_dict['node_embeddings']
-        next_node_embeddings = next_features_dict['node_embeddings']
-
-        # 对齐维度（可能由于车辆数量不同）
-        if node_embeddings.size(0) == next_node_embeddings.size(0):
-            loss_node = self.mse_loss(
-                node_embeddings,
-                next_node_embeddings
-            )
-        else:
-            # 如果车辆数量不同，使用均值
-            loss_node = self.mse_loss(
-                node_embeddings.mean(dim=0, keepdim=True).expand_as(next_node_embeddings),
-                next_node_embeddings
-            )
-
-        # 总损失
-        total_loss = loss_global + 0.5 * loss_node
-
-        loss_dict = {
-            'global': loss_global.item(),
-            'node': loss_node.item(),
-            'total': total_loss.item()
-        }
-
-        return total_loss, loss_dict
-
-    def train_epoch(
-        self,
-        train_loader: torch.utils.data.DataLoader,
-        epoch: int
-    ) -> float:
-        """
-        训练一个epoch
-
-        Args:
-            train_loader: 训练数据加载器
-            epoch: 当前epoch
-
-        Returns:
-            平均损失
-        """
-        self.model.train()
-        total_loss = 0.0
-        num_batches = 0
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs} [Train]")
-
-        for batch_idx, (obs, next_obs) in enumerate(pbar):
-            obs = obs.to(self.device)
-            next_obs = next_obs.to(self.device)
-
-            # 前向传播
-            loss, loss_dict = self.compute_prediction_loss(obs, next_obs)
-
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-            self.optimizer.step()
-
-            # 记录
-            total_loss += loss.item()
-            num_batches += 1
-
-            # 更新进度条
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg': f'{total_loss/num_batches:.4f}'
-            })
-
-        return total_loss / num_batches
-
-    def validate(
-        self,
-        val_loader: torch.utils.data.DataLoader
-    ) -> float:
-        """
-        验证
-
-        Args:
-            val_loader: 验证数据加载器
-
-        Returns:
-            平均损失
-        """
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-
-        with torch.no_grad():
-            for obs, next_obs in val_loader:
-                obs = obs.to(self.device)
-                next_obs = next_obs.to(self.device)
-
-                loss, _ = self.compute_prediction_loss(obs, next_obs)
-
-                total_loss += loss.item()
-                num_batches += 1
-
-        return total_loss / num_batches
-
+        print(f"  - Parallel workers: {self.num_workers}")
+    
     def train(self):
         """完整训练流程"""
         print("\n" + "=" * 80)
         print("[PHASE 1] World Model Training")
         print("=" * 80)
+        
+        # 1. 创建模型
+        model_config = self.config.get('model', {})
+        model = IdealTrafficControllerV4(
+            node_dim=model_config.get('gnn', {}).get('node_dim', 9),
+            edge_dim=model_config.get('gnn', {}).get('edge_dim', 4),
+            global_dim=model_config.get('controller', {}).get('global_dim', 32),
+            gnn_hidden_dim=model_config.get('gnn', {}).get('hidden_dim', 64),
+            gnn_output_dim=model_config.get('gnn', {}).get('output_dim', 256),
+            rssm_hidden_dim=model_config.get('world_model', {}).get('hidden_dim', 128),
+            rssm_latent_dim=model_config.get('world_model', {}).get('latent_dim', 64),
+            controller_hidden_dim=model_config.get('controller', {}).get('hidden_dim', 128),
+            top_k=model_config.get('controller', {}).get('top_k', 5),
+            device=str(self.device)
+        ).to(self.device)
+        
+        # 2. 收集数据
+        print("\n[DATA] Collecting training data...")
+        data = self._collect_data()
+        print(f"[OK] Collected {len(data['observations'])} samples")
 
-        # 1. 收集数据
-        train_dataset, val_dataset = self.collect_data()
+        # ⭐ 验证数据完整性
+        if len(data['observations']) != len(data['next_observations']):
+            print(f"[ERROR] CRITICAL: Data length mismatch!")
+            print(f"  observations: {len(data['observations'])}")
+            print(f"  next_observations: {len(data['next_observations'])}")
+            raise ValueError("Observations and next_observations must have the same length")
 
-        # 2. 创建数据加载器
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True
-        )
+        print(f"[VALIDATE] Data integrity check passed")
 
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True
-        )
-
-        print(f"\n[DATA] Train samples: {len(train_dataset)}")
-        print(f"[DATA] Val samples: {len(val_dataset)}")
-        print(f"[DATA] Train batches: {len(train_loader)}")
-        print(f"[DATA] Val batches: {len(val_loader)}")
-
-        # 3. 训练循环
-        best_val_loss = float('inf')
-        patience_counter = 0
-        patience = 15
-
-        start_time = time.time()
-
+        # 3. 训练
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs, eta_min=1e-6)
+        
+        print(f"\n[TRAIN] Starting training...")
+        best_loss = float('inf')
+        num_samples = len(data['observations'])
+        
         for epoch in range(self.num_epochs):
-            # 训练
-            train_loss = self.train_epoch(train_loader, epoch)
-
-            # 验证
-            val_loss = self.validate(val_loader)
-
-            # 学习率调度
-            self.scheduler.step(val_loss)
-            current_lr = self.optimizer.param_groups[0]['lr']
-
-            # 记录历史
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['learning_rate'].append(current_lr)
-
-            # 打印进度
+            model.train()
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            indices = np.random.permutation(num_samples)
+            
+            pbar = tqdm(range(0, num_samples, self.batch_size), desc=f"Epoch {epoch+1}/{self.num_epochs}")
+            
+            for batch_start in pbar:
+                batch_end = min(batch_start + self.batch_size, num_samples)
+                batch_indices = indices[batch_start:batch_end]
+                
+                if len(batch_indices) == 0:
+                    continue
+                
+                batch = self._prepare_batch(data, batch_indices)
+                
+                if batch['node_features'].size(0) == 0:
+                    continue
+                
+                # 前向传播
+                gnn_output = model.perception_layer(
+                    node_features=batch['node_features'],
+                    edge_index=batch['edge_index'],
+                    edge_features=batch['edge_features'],
+                    risk_features=batch['risk_features']
+                )
+                
+                rssm_output = model.prediction_layer(
+                    node_embeddings=gnn_output['node_embeddings']
+                )
+                
+                # 计算损失
+                loss_dict = self._compute_loss(rssm_output, batch)
+                total_loss = (loss_dict['speed_mse'] * 1.0 +
+                            loss_dict['position_mse'] * 0.5 +
+                            loss_dict['conflict_bce'] * 2.0)
+                
+                # 反向传播
+                optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                
+                epoch_loss += total_loss.item()
+                num_batches += 1
+                
+                pbar.set_postfix({'loss': f'{total_loss.item():.4f}'})
+            
+            scheduler.step()
+            avg_loss = epoch_loss / max(num_batches, 1)
+            
             print(f"\n[EPOCH {epoch+1}/{self.num_epochs}]")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  LR:         {current_lr:.6f}")
-            print(f"  Time:       {time.time() - start_time:.1f}s")
-
+            print(f"  Train Loss: {avg_loss:.4f}")
+            print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+            
             # 保存最佳模型
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-
-                # 保存检查点
-                checkpoint_dir = Path(self.config.get('paths', {}).get('checkpoint_dir', 'checkpoints/competition'))
-                checkpoint_dir = checkpoint_dir / 'phase1'
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                checkpoint_path = checkpoint_dir / 'world_model_best.pth'
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                checkpoint_path = self.checkpoint_dir / 'world_model_best.pth'
                 torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'config': self.config,
                     'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': val_loss,
-                    'config': self.config
+                    'loss': avg_loss
                 }, checkpoint_path)
-
-                print(f"  [SAVE] Best model saved (val_loss: {val_loss:.4f})")
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"\n[EARLY STOP] No improvement for {patience} epochs")
-                    break
-
-        total_time = time.time() - start_time
-
-        print("\n" + "=" * 80)
-        print("[DONE] Phase 1 Training Completed!")
-        print(f"  - Total time: {total_time/60:.1f} minutes")
-        print(f"  - Best val loss: {best_val_loss:.4f}")
-        print("=" * 80)
-
-    def save_checkpoint(self, filepath: str):
-        """
-        保存最终检查点
-
-        Args:
-            filepath: 保存路径
-        """
-        checkpoint_dir = Path(filepath).parent
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
+                print(f"  [SAVE] Best model saved")
+        
+        # 保存最终模型
+        final_path = self.checkpoint_dir / 'world_model_final.pth'
         torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'model_state_dict': model.state_dict(),
             'config': self.config,
-            'history': self.history
-        }, filepath)
+            'epoch': self.num_epochs
+        }, final_path)
+        
+        print(f"\n[DONE] Phase 1 complete!")
+        print(f"   Model: {final_path}")
+        print(f"   Best loss: {best_loss:.4f}")
+        
+        return str(final_path)
+    
+    def _collect_data(self) -> Dict[str, Any]:
+        """收集训练数据"""
+        if self.cache_file.exists():
+            print(f"[CACHE] Loading from cache...")
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                if len(data.get('observations', [])) > 0:
+                    print(f"[CACHE] Cache loaded successfully")
+                    return data
+                else:
+                    print(f"[CACHE] Invalid cache, recollecting...")
+                    self.cache_file.unlink()
+            except Exception as e:
+                print(f"[CACHE] Failed to load cache: {e}")
 
-        print(f"[SAVE] Final checkpoint saved: {filepath}")
+        print("[COLLECT] Collecting data...")
+
+        num_workers = min(self.num_workers, cpu_count())
+        episodes_per_worker = self.num_episodes // num_workers
+        remainder = self.num_episodes % num_workers
+
+        episode_counts = [
+            episodes_per_worker + 1 if i < remainder else episodes_per_worker
+            for i in range(num_workers)
+        ]
+
+        print(f"   Workers: {num_workers}, Episodes/worker: {episode_counts}")
+
+        observations = []
+        next_observations = []
+
+        collect_func = partial(_collect_worker, env_config=self.env_config, max_steps=500)
+
+        try:
+            # ⭐ 使用spawn方法避免CUDA问题
+            import multiprocessing as mp
+            mp.set_start_method('spawn', force=True)
+
+            with Pool(processes=num_workers) as pool:
+                worker_results = []
+                for worker_id, count in enumerate(episode_counts):
+                    if count > 0:
+                        result = pool.apply_async(collect_func, (worker_id, count))
+                        worker_results.append(result)
+
+                for result in worker_results:
+                    worker_obs, worker_next_obs = result.get(timeout=600)
+                    observations.extend(worker_obs)
+                    next_observations.extend(worker_next_obs)
+
+        except RuntimeError as e:
+            if 'set_start_method' in str(e):
+                # 已经设置过，使用默认方法
+                with Pool(processes=num_workers) as pool:
+                    worker_results = []
+                    for worker_id, count in enumerate(episode_counts):
+                        if count > 0:
+                            result = pool.apply_async(collect_func, (worker_id, count))
+                            worker_results.append(result)
+
+                    for result in worker_results:
+                        worker_obs, worker_next_obs = result.get(timeout=600)
+                        observations.extend(worker_obs)
+                        next_observations.extend(worker_next_obs)
+            else:
+                raise e
+
+        except Exception as e:
+            print(f"[ERROR] Collection failed: {e}")
+
+        print(f"   [OK] Collected {len(observations)} transitions")
+
+        # ⭐ 验证数据长度一致性
+        if len(observations) != len(next_observations):
+            print(f"[ERROR] Data length mismatch: obs={len(observations)}, next_obs={len(next_observations)}")
+            min_len = min(len(observations), len(next_observations))
+            observations = observations[:min_len]
+            next_observations = next_observations[:min_len]
+            print(f"[FIX] Truncated to {min_len} samples")
+
+        data = {'observations': observations, 'next_observations': next_observations}
+
+        # 保存缓存
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            print(f"[WARNING] Failed to save cache: {e}")
+
+        return data
+    
+    def _prepare_batch(self, data: Dict, indices: np.ndarray) -> Dict[str, torch.Tensor]:
+        """准备训练batch"""
+        device = self.device
+
+        all_node_features = []
+        all_edge_indices = []
+        all_edge_features = []
+        all_risk_features = []
+        all_next_speeds = []
+        all_next_positions = []
+        all_conflict_labels = []
+
+        node_offset = 0
+
+        for idx in indices:
+            # ⭐ 双重检查索引有效性
+            if idx >= len(data['observations']) or idx >= len(data['next_observations']):
+                continue
+
+            obs = data['observations'][idx]
+            next_obs = data['next_observations'][idx]
+
+            # ⭐ 关键修复：使用min确保车辆数一致
+            num_veh = min(obs.num_vehicles, next_obs.num_vehicles)
+
+            if num_veh == 0:
+                continue
+
+            node_features = _extract_node_features(obs)
+            all_node_features.append(node_features[:num_veh])
+
+            edge_index, edge_attr = _build_edges(obs, self.config)
+            # 只保留有效车辆的边
+            valid_mask = (edge_index[0] < num_veh) & (edge_index[1] < num_veh)
+            edge_index = edge_index[:, valid_mask] + node_offset
+            edge_attr = edge_attr[valid_mask]
+            all_edge_indices.append(edge_index)
+            all_edge_features.append(edge_attr)
+            node_offset += num_veh
+
+            risk_features = _compute_risk_features(obs)
+            all_risk_features.append(risk_features[:num_veh])
+            
+            all_next_speeds.append(_extract_next_speed(next_obs, num_veh))
+            all_next_positions.append(_extract_next_position(next_obs, num_veh))
+            all_conflict_labels.append(_compute_conflict_label(obs, next_obs))
+        
+        if len(all_node_features) == 0:
+            return self._get_empty_batch(device)
+        
+        node_features = torch.cat(all_node_features, dim=0).to(device)
+        edge_index = torch.cat(all_edge_indices, dim=1).to(device)
+        edge_features = torch.cat(all_edge_features, dim=0).to(device)
+        risk_features = torch.cat(all_risk_features, dim=0).to(device)
+        next_speed = torch.cat(all_next_speeds, dim=0).to(device)
+        next_position = torch.cat(all_next_positions, dim=0).to(device)
+        conflict_label = torch.cat(all_conflict_labels, dim=0).to(device)
+        
+        return {
+            'node_features': node_features,
+            'edge_index': edge_index,
+            'edge_features': edge_features,
+            'risk_features': risk_features,
+            'next_speed': next_speed,
+            'next_position': next_position,
+            'conflict_label': conflict_label
+        }
+    
+    def _get_empty_batch(self, device) -> Dict[str, torch.Tensor]:
+        """返回空batch"""
+        return {
+            'node_features': torch.zeros((1, 9), device=device),
+            'edge_index': torch.zeros((2, 1), dtype=torch.long, device=device),
+            'edge_features': torch.zeros((1, 4), device=device),
+            'risk_features': torch.zeros((1, 2), device=device),
+            'next_speed': torch.zeros((1, 1), device=device),
+            'next_position': torch.zeros((1, 2), device=device),
+            'conflict_label': torch.zeros((1, 1), device=device),
+        }
+    
+    def _compute_loss(self, rssm_output: Dict, batch: Dict) -> Dict[str, torch.Tensor]:
+        """计算损失"""
+        speed_pred = rssm_output['speed_pred']
+        pos_pred = rssm_output['position_pred']
+        conflict_prob = rssm_output['conflict_prob']
+        
+        speed_target = batch['next_speed']
+        pos_target = batch['next_position']
+        conflict_target = batch['conflict_label']
+        
+        return {
+            'speed_mse': F.mse_loss(speed_pred, speed_target),
+            'position_mse': F.mse_loss(pos_pred, pos_target),
+            'conflict_bce': F.binary_cross_entropy(conflict_prob.squeeze(-1), conflict_target.squeeze(-1))
+        }

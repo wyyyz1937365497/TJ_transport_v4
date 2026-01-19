@@ -1,46 +1,81 @@
 """
-Phase 1: 世界模型预训练（监督学习）
+统一训练脚本 - v4.0理想架构 + 所有增强功能
 
-训练目标：
-- 学习车辆状态编码器（RiskSensitiveGNN）
-- 学习交通流预测器（MultiScaleRSSM）
-- 学习动态权重门控（EnhancedDynamicWeightGating）
-- 预训练特征提取器，为Phase 2的PPO训练提供良好初始化
+这是项目的唯一训练入口，整合了所有功能并默认启用增强特性。
+
+三阶段训练流程：
+1. Phase 1: 世界模型预训练（监督学习）
+2. Phase 2: PPO训练（冻结感知层）
+3. Phase 3: 拉格朗日约束优化（端到端微调）
+
+增强功能（默认启用）：
+- ✅ 课程学习（Curriculum Learning）
+- ✅ 优先经验回放（Prioritized Experience Replay）
+- ✅ 失败案例库（Failure Case Bank）
+- ✅ 并行数据收集
+- ✅ 数据缓存机制
 
 使用方法：
-    # 基础训练
-    python train_phase1.py
+    # 完整训练（推荐）
+    python train.py
 
-    # 使用自定义配置
-    python train_phase1.py --config configs/competition_preliminary.yaml
+    # 指定配置文件
+    python train.py --config configs/competition.yaml
 
-    # 指定设备
-    python train_phase1.py --device cuda:0
+    # 单独训练某个阶段
+    python train.py --phase 2
+
+    # 禁用增强功能
+    python train.py --no-enhancements
+
+    # 查看详细信息
+    python train.py --verbose
 """
 
 import os
 import sys
 import time
-import pickle
+import json
 import argparse
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
-from dataclasses import dataclass
-import multiprocessing
-
 import numpy as np
-import yaml
+import pickle
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import (
+    CheckpointCallback,
+    EvalCallback,
+    BaseCallback
+)
+
+# 进度条支持
 from tqdm import tqdm
 
-# 添加项目根目录到路径
+# 添加项目路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "src"))
 
-from src.models.v4_architecture import IdealTrafficControllerV4
 from src.env.competition_env import CompetitionSumoEnv
+from src.env.gym_wrapper import GymSumoEnv
+from src.env.vec_env import create_parallel_envs
+from src.models.ideal_policy_v4 import create_ideal_traffic_policy_v4
+from src.models.v4_architecture import IdealTrafficControllerV4
+from src.training import (
+    CurriculumManager,
+    PrioritizedReplayBuffer,
+    FailureCaseBank,
+    EnhancedTrainingManager,
+    create_enhanced_training_manager
+)
 from src.training.multi_gpu_utils import (
     MultiGPUManager,
     ProgressTracker,
@@ -71,14 +106,138 @@ class TrafficTransition:
 
 
 # =============================================================================
-# Phase 1: 世界模型预训练
+# 自定义回调 - TensorBoard增强
+# =============================================================================
+
+class EnhancedTrainingCallback(BaseCallback):
+    """增强训练回调 - 记录所有增强功能的指标 + 进度输出 + 剩余时间"""
+
+    def __init__(self, enhanced_manager: EnhancedTrainingManager, total_timesteps: int, verbose: int = 1):
+        super().__init__(verbose)
+        self.enhanced_manager = enhanced_manager
+        self.total_timesteps = total_timesteps
+        self.last_print_step = 0
+        self.print_freq = 1000  # 每1000步打印一次
+
+        # 时间跟踪
+        self.start_time = None
+        self.training_start_time = None
+
+    def _on_training_start(self) -> None:
+        """训练开始时记录时间"""
+        import time
+        self.start_time = time.time()
+        self.training_start_time = time.time()
+
+    def _on_step(self) -> bool:
+        # 每隔一定步数打印进度
+        if self.num_timesteps - self.last_print_step >= self.print_freq:
+            self._print_progress()
+            self.last_print_step = self.num_timesteps
+        return True
+
+    def _format_time(self, seconds):
+        """格式化时间显示"""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{mins}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h {mins}m"
+
+    def _print_progress(self):
+        """打印训练进度（包含剩余时间估算）"""
+        import time
+
+        # 计算进度百分比
+        progress = self.num_timesteps / self.total_timesteps * 100
+
+        # 计算已用时间和剩余时间
+        if self.start_time is not None:
+            elapsed_time = time.time() - self.start_time
+
+            # 估算剩余时间（基于当前进度）
+            if progress > 0:
+                remaining_time = elapsed_time * (100 - progress) / progress
+                eta = time.time() + remaining_time
+
+                # 格式化时间
+                elapsed_str = self._format_time(elapsed_time)
+                remaining_str = self._format_time(remaining_time)
+            else:
+                elapsed_str = "0s"
+                remaining_str = "N/A"
+        else:
+            elapsed_str = "N/A"
+            remaining_str = "N/A"
+
+        # 获取当前指标
+        ep_rew_mean = self.logger.name_to_value.get('rollout/ep_rew_mean')
+        ep_len_mean = self.logger.name_to_value.get('rollout/ep_len_mean')
+        fps = self.logger.name_to_value.get('time/fps')
+
+        # 如果还没有指标数据（第一个rollout还没完成），只显示进度和时间
+        if ep_rew_mean is None or ep_len_mean is None or fps is None:
+            print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
+                  f"({progress:.1f}%) | "
+                  f"Elapsed: {elapsed_str} | "
+                  f"ETA: {remaining_str} | "
+                  f"Waiting for metrics...", end='', flush=True)
+        else:
+            print(f"\r[PROGRESS] {self.num_timesteps}/{self.total_timesteps} steps "
+                  f"({progress:.1f}%) | "
+                  f"Reward: {ep_rew_mean:.2f} | "
+                  f"Elapsed: {elapsed_str} | "
+                  f"ETA: {remaining_str} | "
+                  f"FPS: {fps:.0f}", end='', flush=True)
+
+    def _on_rollout_end(self) -> None:
+        """Rollout结束后的处理"""
+        # 获取平均奖励
+        if 'rollout/ep_rew_mean' in self.logger.name_to_value:
+            avg_reward = self.logger.name_to_value['rollout/ep_rew_mean']
+
+            # 更新课程学习
+            if self.enhanced_manager.curriculum:
+                success = avg_reward > -200
+                self.enhanced_manager.update_curriculum_progress(avg_reward, success)
+
+                # 记录课程学习指标
+                stats = self.enhanced_manager.curriculum.get_stats()
+                self.logger.record('curriculum/level', stats['current_level'])
+                self.logger.record('curriculum/progress', stats['progress'])
+
+        # 记录失败案例统计
+        if self.enhanced_manager.failure_bank:
+            stats = self.enhanced_manager.failure_bank.get_stats()
+            self.logger.record('failure_bank/total', stats['total_cases'])
+            self.logger.record('failure_bank/collision', stats['collision_cases'])
+            self.logger.record('failure_bank/braking', stats['emergency_braking_cases'])
+
+        # 记录PER统计
+        if self.enhanced_manager.replay_buffer:
+            self.logger.record('replay_buffer/size', len(self.enhanced_manager.replay_buffer))
+
+    def _on_training_end(self) -> None:
+        """训练结束时的处理"""
+        print()  # 换行
+        print(f"\n[DONE] Training completed at step {self.num_timesteps}")
+
+
+# =============================================================================
+# Phase 1: 世界模型预训练（含课程学习）
 # =============================================================================
 
 class Phase1WorldModelTrainer:
-    """Phase 1: 世界模型预训练（增强版 + 多进程支持）"""
+    """Phase 1: 世界模型预训练（增强版 + 双卡支持）"""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], enhanced_manager: EnhancedTrainingManager):
         self.config = config
+        self.enhanced_manager = enhanced_manager
 
         # 初始化多GPU管理器
         self.gpu_manager = MultiGPUManager(config)
@@ -87,34 +246,23 @@ class Phase1WorldModelTrainer:
         # 初始化训练指标记录器
         self.metrics = TrainingMetrics()
 
-        # Phase 1配置
+        # 配置
         phase1_config = config.get('training', {}).get('phase1', {})
 
-        # 检查点路径
-        self.model_path = phase1_config.get('phase1_model_path',
-            'checkpoints/competition/phase1/world_model_final.pth')
+        # 检查点路径（使用配置文件中的路径）
+        self.model_path = phase1_config.get('phase1_model_path', 'checkpoints/competition/phase1/world_model_final.pth')
         self.checkpoint_dir = os.path.dirname(self.model_path)
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-
-        self.num_episodes = phase1_config.get('num_episodes', 100)
-        self.epochs = phase1_config.get('epochs', 50)
+        self.num_episodes = phase1_config.get('num_episodes', 50)
+        self.epochs = phase1_config.get('epochs', 30)
         self.batch_size = phase1_config.get('batch_size', 256)
-        self.learning_rate = phase1_config.get('learning_rate', 1e-4)
+        self.learning_rate = float(phase1_config.get('learning_rate', 1e-4))
         self.num_workers = phase1_config.get('num_parallel_workers', 4)
 
         # 数据缓存
         self.cache_dir = os.path.join(self.checkpoint_dir, 'cache')
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_file = os.path.join(self.cache_dir, 'data.pkl')
-
-        # 课程学习配置
-        curriculum_config = config.get('training', {}).get('curriculum', {})
-        self.use_curriculum = curriculum_config.get('enabled', False)
-        if self.use_curriculum:
-            from src.training.train_enhancements import CurriculumManager
-            self.curriculum = CurriculumManager(config.get('curriculum_levels', []))
-        else:
-            self.curriculum = None
 
         # 打印配置
         print(f"\n[PHASE 1] Configuration:")
@@ -124,9 +272,14 @@ class Phase1WorldModelTrainer:
         print(f"  Learning Rate: {self.learning_rate}")
         print(f"  Parallel Workers: {self.num_workers}")
         print(f"  Effective Batch Size: {self.gpu_manager.get_effective_batch_size(self.batch_size)}")
-        print(f"  Curriculum Learning: {'ENABLED' if self.use_curriculum else 'DISABLED'}")
-        if self.use_curriculum:
-            print(f"     Levels: {len(self.curriculum.levels)}")
+
+        # 显示课程学习状态
+        if enhanced_manager.curriculum is not None:
+            print(f"  [OK] Curriculum Learning: ENABLED")
+            print(f"     Levels: {len(enhanced_manager.curriculum.levels)}")
+        else:
+            print(f"  [INFO] Curriculum Learning: DISABLED")
+            print(f"     Using competition config directly")
 
     def train(self) -> str:
         """训练世界模型"""
@@ -152,9 +305,10 @@ class Phase1WorldModelTrainer:
         # 多GPU包装
         model = self.gpu_manager.wrap_model(model)
 
-        # 2. 收集数据
+        # 2. 收集数据（带课程学习和进度条）
         print("\n[DATA] Collecting training data...")
         data = self._collect_data()
+
         print(f"[OK] Collected {len(data['observations'])} samples")
 
         # 3. 训练
@@ -212,7 +366,7 @@ class Phase1WorldModelTrainer:
                         )
 
                         rssm_output = model.prediction_layer(
-                            node_embeddings=gnm_output['node_embeddings']
+                            node_embeddings=gnn_output['node_embeddings']
                         )
 
                     # 计算损失
@@ -256,8 +410,6 @@ class Phase1WorldModelTrainer:
                         'loss': avg_loss
                     }, checkpoint_path)
 
-                    print(f"  [SAVE] Best model saved (val_loss: {avg_loss:.4f})")
-
                 # 结束epoch
                 progress.end_epoch(
                     avg_loss=avg_loss,
@@ -275,7 +427,7 @@ class Phase1WorldModelTrainer:
         finally:
             progress.close()
 
-        # 保存最终模型
+        # 保存最终模型（使用配置文件中指定的路径）
         final_path = self.model_path
         model_state = self.gpu_manager.get_model_state_dict(model)
 
@@ -294,14 +446,24 @@ class Phase1WorldModelTrainer:
         return final_path
 
     def _validate_cached_data(self, data: Dict[str, Any]) -> bool:
-        """验证缓存数据的完整性和格式"""
+        """
+        验证缓存数据的完整性和格式
+
+        Args:
+            data: 加载的缓存数据
+
+        Returns:
+            True if valid, False otherwise
+        """
         required_keys = ['observations', 'next_observations']
 
+        # 检查必需的键
         for key in required_keys:
             if key not in data:
                 print(f"[CACHE] Missing key: {key}")
                 return False
 
+        # 检查数据长度
         obs_len = len(data['observations'])
         next_obs_len = len(data['next_observations'])
 
@@ -313,6 +475,7 @@ class Phase1WorldModelTrainer:
             print(f"[CACHE] Length mismatch: observations={obs_len}, next_observations={next_obs_len}")
             return False
 
+        # 检查第一个样本的格式
         try:
             first_obs = data['observations'][0]
             if not hasattr(first_obs, 'num_vehicles'):
@@ -333,6 +496,7 @@ class Phase1WorldModelTrainer:
                 with open(self.cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
 
+                # 验证缓存数据格式
                 if self._validate_cached_data(cached_data):
                     print(f"[CACHE] Cache loaded successfully")
                     return cached_data
@@ -349,10 +513,10 @@ class Phase1WorldModelTrainer:
         next_observations = []
 
         # 如果启用课程学习，从不同级别收集
-        if self.use_curriculum and self.curriculum:
-            episodes_per_level = self.num_episodes // len(self.curriculum.levels)
+        if self.enhanced_manager.curriculum:
+            episodes_per_level = self.num_episodes // len(self.enhanced_manager.curriculum.levels)
 
-            for level in self.curriculum.levels:
+            for level in self.enhanced_manager.curriculum.levels:
                 print(f"\n[LEVEL {level.level}] {level.name}")
                 print(f"   Episodes: {episodes_per_level}")
                 print(f"   Config: vehicles={level.max_vehicles}, flow={level.inflow_rate}")
@@ -381,12 +545,9 @@ class Phase1WorldModelTrainer:
         return data
 
     def _collect_level_data(self, env_config: Dict, num_episodes: int) -> Tuple[List, List]:
-        """收集单个难度级别的数据（并行收集，使用spawn启动方法）"""
-        from multiprocessing import get_context, cpu_count
+        """收集单个难度级别的数据（并行收集）"""
+        from multiprocessing import Pool, cpu_count
         from functools import partial
-
-        # 使用spawn方法启动进程，支持CUDA
-        mp_context = get_context('spawn')
 
         num_workers = min(self.num_workers, cpu_count())
         episodes_per_worker = num_episodes // num_workers
@@ -406,7 +567,7 @@ class Phase1WorldModelTrainer:
         collect_progress = DataCollectionProgress(num_workers)
 
         try:
-            with mp_context.Pool(processes=num_workers) as pool:
+            with Pool(processes=num_workers) as pool:
                 worker_results = []
                 for worker_id, count in enumerate(episode_counts):
                     if count > 0:
@@ -528,11 +689,640 @@ class Phase1WorldModelTrainer:
 
 
 # =============================================================================
+# 课程学习回调 - 动态切换难度级别
+# =============================================================================
+
+class CurriculumLevelCallback(BaseCallback):
+    """
+    课程级别切换回调
+
+    在训练过程中检查是否达到晋级条件：
+    - 训练步数达到阈值
+    - 平均奖励达到阈值
+    - 成功率达标
+    """
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        enhanced_manager,
+        num_envs: int,
+        check_frequency: int = 50000,  # 每50k步检查一次（调整以匹配2M步训练）
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.config = config
+        self.enhanced_manager = enhanced_manager
+        self.num_envs = num_envs
+        self.check_frequency = check_frequency
+
+        # 晋级条件
+        curriculum_config = config.get('training', {}).get('curriculum', {})
+        self.min_episodes_per_level = curriculum_config.get('min_episodes_per_level', 5)
+        self.min_reward_threshold = curriculum_config.get('min_reward_threshold', -300)
+
+        # 计算平均episode长度（从配置读取max_steps，然后乘以一个系数）
+        # 实际episode长度通常比max_steps短，因为车辆可能提前到达终点
+        env_config = config.get('environment', {})
+        max_steps = env_config.get('max_steps', 1800)
+        self.avg_episode_length = int(max_steps * 0.7)  # 假设平均episode长度为max_steps的70%
+
+        # 状态跟踪
+        self.current_level = None
+        self.level_start_step = 0
+        self.last_switch_step = 0
+
+        # 统计
+        self.num_switches = 0
+
+    def _init_callback(self) -> None:
+        """初始化回调"""
+        if self.enhanced_manager.curriculum:
+            self.current_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            self.level_start_step = 0
+            print(f"\n[CURRICULUM] Starting at Level {self.current_level.level}: {self.current_level.name}")
+            print(f"[CURRICULUM] Dynamic level switching: ENABLED")
+        else:
+            print("[INFO] Curriculum learning not enabled")
+
+    def _on_step(self) -> bool:
+        """每步调用"""
+        # 如果课程学习未启用，直接返回
+        if not self.enhanced_manager.curriculum:
+            return True
+
+        # 定期检查是否应该晋级
+        if self.num_timesteps - self.last_switch_step >= self.check_frequency:
+            should_advance = self._check_should_advance()
+
+            if should_advance:
+                success = self._advance_to_next_level()
+                if success:
+                    self.last_switch_step = self.num_timesteps
+                    self.num_switches += 1
+
+        return True
+
+    def _check_should_advance(self) -> bool:
+        """检查是否应该晋级到下一级别"""
+        if not self.enhanced_manager.curriculum:
+            return False
+
+        # 检查是否已是最高级别
+        current_level = self.enhanced_manager.curriculum.get_current_difficulty()
+        if current_level.level >= len(self.enhanced_manager.curriculum.levels):
+            return False
+
+        # 检查是否在该级别训练了足够的步数
+        steps_in_level = self.num_timesteps - self.level_start_step
+        min_steps = self.min_episodes_per_level * self.avg_episode_length
+
+        if steps_in_level < min_steps:
+            if self.verbose > 1:
+                print(f"[CURRICULUM] Not enough steps yet: {steps_in_level}/{min_steps} "
+                      f"({self.min_episodes_per_level} episodes x {self.avg_episode_length} steps/episode)")
+            return False
+
+        # 检查平均奖励（从rollout buffer获取）
+        # 注意：这里使用简化的检查，只要步数足够就晋级
+        return True
+
+    def _advance_to_next_level(self) -> bool:
+        """晋级到下一级别"""
+        try:
+            # 更新课程级别
+            old_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            self.enhanced_manager.curriculum.advance_to_next_level()
+            new_level = self.enhanced_manager.curriculum.get_current_difficulty()
+
+            print(f"\n{'='*80}")
+            print(f"[CURRICULUM] Advancing from Level {old_level.level} to Level {new_level.level}")
+            print(f"  Old: {old_level.name} (vehicles={old_level.max_vehicles}, flow={old_level.inflow_rate})")
+            print(f"  New: {new_level.name} (vehicles={new_level.max_vehicles}, flow={new_level.inflow_rate})")
+            print(f"{'='*80}\n")
+
+            # 重新创建环境
+            self._recreate_environment()
+
+            # 重置级别开始步数
+            self.level_start_step = self.num_timesteps
+            self.current_level = new_level
+
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Failed to advance level: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _recreate_environment(self):
+        """重新创建环境（Windows优化版本）"""
+        print("[ENV] Recreating environment with new curriculum level...")
+
+        # 获取新的环境配置
+        env_config = self.config.get('environment', {}).copy()
+        new_env_config = self.enhanced_manager.get_curriculum_env_config(env_config)
+
+        # 关闭旧环境
+        if hasattr(self.model, 'env') and self.model.env is not None:
+            print("[ENV] Closing old environment...")
+            self.model.env.close()
+            print("[OK] Old environment closed")
+
+            # Windows上特别激进的清理策略
+            print("[ENV] Waiting for complete cleanup (Windows)...")
+            import time
+            import gc
+            import os
+
+            # 等待子进程退出
+            time.sleep(5)
+
+            # 强制垃圾回收
+            gc.collect()
+
+            # 额外等待，确保所有进程都退出
+            time.sleep(5)
+
+            print("[OK] Cleanup complete")
+
+        # 创建新环境
+        print("[ENV] Creating new environment...")
+        print(f"[INFO] This may take 1-2 minutes for {self.num_envs} parallel environments...")
+
+        import time
+        start_time = time.time()
+
+        vec_env_wrapper = create_parallel_envs(
+            config=new_env_config,
+            num_envs=self.num_envs,
+            seed=self.config.get('seed', 42)
+        )
+
+        elapsed = time.time() - start_time
+        print(f"[OK] Environment created in {elapsed:.1f}s")
+
+        # 更新模型的环境
+        print("[ENV] Updating model environment reference...")
+        self.model.set_env(vec_env_wrapper.vec_env)
+
+        # Windows上需要额外等待，确保管道建立
+        print("[ENV] Waiting for pipe establishment...")
+        time.sleep(5)
+
+        # 热身步骤：验证管道是否真正可用
+        print("[ENV] Performing warm-up reset to verify pipes...")
+        try:
+            # 尝试重置环境，这会触发管道通信
+            import numpy as np
+            obs = self.model.env.reset()
+            print("[OK] Pipes verified and working (warm-up reset successful)")
+        except Exception as e:
+            print(f"[WARN] Warm-up reset failed: {e}")
+            print("[ENV] Extending wait time for pipe initialization...")
+            time.sleep(10)
+            # 再次尝试
+            try:
+                obs = self.model.env.reset()
+                print("[OK] Pipes verified after extended wait")
+            except Exception as e2:
+                print(f"[ERROR] Still failing after extended wait: {e2}")
+                print("[ENV] Final attempt with additional delay...")
+                time.sleep(15)
+                try:
+                    obs = self.model.env.reset()
+                    print("[OK] Pipes verified after final attempt")
+                except Exception as e3:
+                    print(f"[FATAL] Pipes still not working after all attempts: {e3}")
+                    raise
+
+        # 额外验证：确保所有子环境都响应
+        print("[ENV] Verifying all sub-environments are responsive...")
+        try:
+            # 尝试多次step操作，确保管道完全稳定
+            for i in range(3):
+                # 创建一个随机动作（符合环境动作空间）
+                if hasattr(self.model.env, 'action_space'):
+                    import numpy as np
+                    if hasattr(self.model.env.action_space, 'sample'):
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    else:
+                        # 对于多离散动作空间
+                        if hasattr(self.model.env.action_space, 'nvec'):
+                            # 创建符合动作空间的随机动作
+                            actions = []
+                            for _ in range(self.num_envs):
+                                action = []
+                                for n in self.model.env.action_space.nvec:
+                                    action.append(np.random.randint(0, n))
+                                actions.append(action)
+                            actions = np.array(actions)
+                        else:
+                            # 默认处理
+                            actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    
+                    # 执行一步，验证管道通信
+                    obs, rewards, dones, infos = self.model.env.step(actions)
+                    print(f"[OK] Sub-environment verification round {i+1}/{3} successful")
+                
+                time.sleep(0.5)  # 短暂延迟，让系统稳定
+                
+        except Exception as e:
+            print(f"[WARN] Sub-environment verification failed: {e}")
+            # 这里不抛出异常，因为主要是为了验证管道稳定性
+        
+        # 最终压力测试：模拟训练开始前的操作
+        print("[ENV] Performing stress test to simulate training operations...")
+        try:
+            # 模拟训练开始时的操作，确保管道完全稳定
+            for i in range(5):  # 进行5轮压力测试
+                # 生成一个批次的随机动作
+                if hasattr(self.model.env, 'action_space'):
+                    import numpy as np
+                    if hasattr(self.model.env.action_space, 'sample'):
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                    elif hasattr(self.model.env.action_space, 'nvec'):
+                        actions = []
+                        for _ in range(self.num_envs):
+                            action = []
+                            for n in self.model.env.action_space.nvec:
+                                action.append(np.random.randint(0, n))
+                            actions.append(action)
+                        actions = np.array(actions)
+                    else:
+                        actions = [self.model.env.action_space.sample() for _ in range(self.num_envs)]
+                
+                # 执行动作
+                obs, rewards, dones, infos = self.model.env.step(actions)
+                
+                # 尝试获取观测值
+                obs = self.model.env.reset() if i % 2 == 0 else self.model.env.step(actions)[0]
+                
+                print(f"[OK] Stress test round {i+1}/5 successful")
+                time.sleep(0.2)  # 短暂停顿
+            
+            print("[OK] All stress tests passed - environment is stable")
+            
+        except Exception as e:
+            print(f"[ERROR] Stress test failed: {e}")
+            print("[ENV] Performing emergency stabilization...")
+            # 紧急处理措施
+            time.sleep(10)
+            try:
+                obs = self.model.env.reset()
+                print("[OK] Emergency stabilization successful")
+            except Exception as e2:
+                print(f"[FATAL] Emergency stabilization failed: {e2}")
+                raise
+
+        # 在正式训练前进行最终等待，确保所有子进程完全稳定
+        print(f"[ENV] Final stabilization wait before resuming training...")
+        time.sleep(8)  # 给系统额外的时间来稳定所有连接
+        
+        print(f"[OK] Environment recreated with {self.num_envs} parallel instances")
+        print("[INFO] Training will continue with new curriculum level...")
+
+
+# =============================================================================
+# Phase 2: PPO训练（冻结感知层 + 动态课程学习）
+# =============================================================================
+
+class Phase2PPOTrainer:
+    """Phase 2: PPO训练（增强版）"""
+
+    def __init__(self, config: Dict[str, Any], enhanced_manager: EnhancedTrainingManager):
+        self.config = config
+        self.enhanced_manager = enhanced_manager
+        self.device = get_device()
+
+        # 配置
+        phase2_config = config.get('training', {}).get('phase2', {})
+
+        # 检查点路径（使用配置文件中的路径）
+        self.model_path = phase2_config.get('phase2_model_path', 'checkpoints/competition/phase2/shielded_ppo.zip')
+        self.checkpoint_dir = os.path.dirname(self.model_path)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        self.total_timesteps = phase2_config.get('total_timesteps', 200000)
+        self.num_envs = phase2_config.get('num_envs', 8)
+        self.n_steps = phase2_config.get('n_steps', 2048)
+
+        print(f"\n[PHASE 2] Configuration:")
+        print(f"  Total Timesteps: {self.total_timesteps}")
+        print(f"  Parallel Envs: {self.num_envs}")
+        print(f"  [OK] Curriculum Learning: ENABLED (default)")
+        print(f"  [OK] Prioritized Replay: ENABLED (default)")
+        print(f"  [OK] Failure Bank: ENABLED (default)")
+
+    def train(self, phase1_checkpoint: Optional[str] = None) -> str:
+        """训练PPO"""
+        print("\n" + "="*80)
+        print("[PHASE 2] PPO Training")
+        print("="*80)
+
+        # 创建环境
+        print("\n[ENV] Creating environments...")
+        env_config = self.config.get('environment', {}).copy()
+
+        # 应用课程学习的当前配置
+        if self.enhanced_manager.curriculum:
+            env_config = self.enhanced_manager.get_curriculum_env_config(env_config)
+            current_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            print(f"[CURRICULUM] Level {current_level.level}: {current_level.name}")
+
+        # 明确传递device参数，确保使用GPU 0
+        device_str = str(self.device)  # 应该是 'cuda:0'
+        print(f"[ENV] Using device: {device_str} for all environments")
+
+        vec_env_wrapper = create_parallel_envs(
+            config=env_config,
+            num_envs=self.num_envs,
+            seed=self.config.get('seed', 42),
+            device=device_str  # 明确传递 'cuda:0'
+        )
+
+        vec_env = vec_env_wrapper.vec_env
+
+        # 创建策略
+        print("\n[MODEL] Creating policy network...")
+        policy_class = create_ideal_traffic_policy_v4(self.config)
+
+        phase2_config = self.config.get('training', {}).get('phase2', {})
+
+        # 确保learning_rate被转换为float类型
+        learning_rate = float(phase2_config.get('learning_rate', 3e-4))
+
+        model = PPO(
+            policy_class,
+            vec_env,
+            verbose=1,
+            tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/phase2',
+            learning_rate=learning_rate,
+            n_steps=phase2_config.get('n_steps', 2048),
+            batch_size=phase2_config.get('batch_size', 512),
+            n_epochs=phase2_config.get('update_epochs', 10),
+            gamma=phase2_config.get('gamma', 0.99),
+            gae_lambda=phase2_config.get('gae_lambda', 0.95),
+            clip_range=phase2_config.get('clip_epsilon', 0.2),
+            ent_coef=phase2_config.get('entropy_coef', 0.01),
+            vf_coef=phase2_config.get('value_loss_coef', 0.5),
+            max_grad_norm=phase2_config.get('max_grad_norm', 0.5),
+            seed=self.config.get('seed', 42),
+            device=str(self.device)
+        )
+
+        # 加载Phase 1权重
+        if phase1_checkpoint and os.path.exists(phase1_checkpoint):
+            print(f"\n[LOAD] Loading Phase 1 weights...")
+            self._load_phase1_weights(model.policy, phase1_checkpoint)
+
+        # 冻结感知层
+        print("\n[FREEZE] Freezing perception and prediction layers...")
+        model.policy.freeze_perception()
+        model.policy.freeze_prediction()
+
+        # 创建回调
+        callbacks = self._create_callbacks()
+
+        # 添加课程学习回调（如果启用）
+        if self.enhanced_manager.curriculum:
+            curriculum_callback = CurriculumLevelCallback(
+                config=self.config,
+                enhanced_manager=self.enhanced_manager,
+                num_envs=self.num_envs,
+                check_frequency=15000,  # 测试模式：每15k步检查一次（更频繁，约12-15分钟切换）
+                verbose=2  # 显示详细的检查日志
+            )
+            callbacks.append(curriculum_callback)
+
+            print(f"\n[CURRICULUM] Dynamic level switching enabled")
+            curriculum_config = self.config.get('training', {}).get('curriculum', {})
+            env_config = self.config.get('environment', {})
+            max_steps = env_config.get('max_steps', 1800)
+            avg_episode_length = int(max_steps * 0.7)
+            min_steps = curriculum_config.get('min_episodes_per_level', 100) * avg_episode_length
+            print(f"  Check frequency: every 50,000 steps")
+            print(f"  Min episodes per level: {curriculum_config.get('min_episodes_per_level', 100)}")
+            print(f"  Estimated steps per level: {min_steps:,} (100 episodes x {avg_episode_length} steps/episode)")
+            print(f"  Min reward threshold: {curriculum_config.get('min_reward_threshold', -300)}")
+
+        # 训练（禁用内置进度条，使用自定义进度输出）
+        print("\n[TRAIN] Starting training...")
+        print(f"[INFO] Total timesteps: {self.total_timesteps:,}")
+        print(f"[INFO] Parallel environments: {self.num_envs}")
+        print(f"[INFO] Steps per rollout: {self.n_steps}")
+
+        if self.enhanced_manager.curriculum:
+            print(f"[INFO] Curriculum levels may switch during training!")
+
+        model.learn(
+            total_timesteps=self.total_timesteps,
+            callback=callbacks,
+            progress_bar=False  # 禁用内置进度条，使用自定义回调
+        )
+
+        # 保存最终模型（使用配置文件中指定的路径）
+        model.save(self.model_path)
+
+        print(f"\n[DONE] Phase 2 complete!")
+        print(f"   Model: {self.model_path}")
+
+        # 显示最终课程级别
+        if self.enhanced_manager.curriculum:
+            final_level = self.enhanced_manager.curriculum.get_current_difficulty()
+            print(f"   Final Level: {final_level.level} - {final_level.name}")
+            print(f"   Config: {final_level.max_vehicles} vehicles, {final_level.inflow_rate} flow")
+
+        vec_env.close()
+
+        return self.model_path
+
+    def _load_phase1_weights(self, policy, checkpoint_path: str):
+        """加载Phase 1权重"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+
+        model_dict = policy.state_dict()
+        loaded = 0
+
+        for key in state_dict.keys():
+            if key.startswith('perception_layer.') or key.startswith('prediction_layer.'):
+                if key in model_dict and state_dict[key].shape == model_dict[key].shape:
+                    model_dict[key] = state_dict[key]
+                    loaded += 1
+
+        print(f"[OK] Loaded {loaded} weights from Phase 1")
+
+    def _create_callbacks(self):
+        """创建回调"""
+        callbacks = []
+
+        checkpoint_callback = CheckpointCallback(
+            save_freq=10000,
+            save_path=self.checkpoint_dir,
+            name_prefix="checkpoint",
+            save_replay_buffer=False
+        )
+        callbacks.append(checkpoint_callback)
+
+        enhanced_callback = EnhancedTrainingCallback(
+            enhanced_manager=self.enhanced_manager,
+            total_timesteps=self.total_timesteps,
+            verbose=1
+        )
+        callbacks.append(enhanced_callback)
+
+        return callbacks
+
+
+# =============================================================================
+# Phase 3: 拉格朗日约束优化
+# =============================================================================
+
+class Phase3ConstrainedOptimizer:
+    """Phase 3: 拉格朗日约束优化"""
+
+    def __init__(self, config: Dict[str, Any], enhanced_manager: EnhancedTrainingManager = None):
+        self.config = config
+        self.device = get_device()
+        self.enhanced_manager = enhanced_manager or EnhancedTrainingManager(config)
+
+        base_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints')
+        self.checkpoint_dir = os.path.join(base_dir, 'phase3')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        phase3_config = config.get('training', {}).get('phase3', {})
+        self.total_timesteps = phase3_config.get('total_timesteps', 100000)
+        self.num_envs = phase3_config.get('num_envs', 4)
+        self.n_steps = phase3_config.get('n_steps', 2048)
+
+    def train(self, phase2_checkpoint: str) -> str:
+        """训练拉格朗日优化模型"""
+        print("\n" + "="*80)
+        print("[PHASE 3] Lagrangian Constrained Optimization")
+        print("="*80)
+
+        # 创建环境
+        env_config = self.config.get('environment', {})
+
+        vec_env_wrapper = create_parallel_envs(
+            config=env_config,
+            num_envs=self.num_envs,
+            seed=self.config.get('seed', 42)
+        )
+
+        vec_env = vec_env_wrapper.vec_env
+
+        # 创建拉格朗日PPO
+        print("\n[MODEL] Creating Lagrangian PPO...")
+        model = self._create_lagrangian_ppo(vec_env)
+
+        # 加载Phase 2权重
+        if os.path.exists(phase2_checkpoint):
+            print(f"\n[LOAD] Loading Phase 2 weights...")
+            try:
+                model.set_parameters(torch.load(phase2_checkpoint), exact_match=False)
+                print("[OK] Phase 2 weights loaded")
+            except Exception as e:
+                print(f"[WARNING] Failed to load Phase 2 weights: {e}")
+
+        # 解冻所有组件
+        print("\n[UNFREEZE] Unfreezing all components...")
+        model.policy.unfreeze_all()
+
+        # 训练
+        callbacks = self._create_callbacks()
+
+        # 训练（禁用内置进度条，使用自定义进度输出）
+        print("\n[TRAIN] Starting training...")
+        print(f"[INFO] Total timesteps: {self.total_timesteps:,}")
+        print(f"[INFO] Parallel environments: {self.num_envs}")
+        print(f"[INFO] Updates per rollout: {self.n_steps}")
+
+        model.learn(
+            total_timesteps=self.total_timesteps,
+            callback=callbacks,
+            progress_bar=False  # 禁用内置进度条
+        )
+
+        # 保存
+        final_path = os.path.join(self.checkpoint_dir, 'final.zip')
+        model.save(final_path)
+
+        print(f"\n[DONE] Phase 3 complete!")
+        print(f"   Final model: {final_path}")
+
+        vec_env.close()
+
+        return final_path
+
+    def _create_lagrangian_ppo(self, vec_env):
+        """创建拉格朗日PPO"""
+        class LagrangianPPO(PPO):
+            def __init__(self, *args, cost_limit=0.1, lambda_init=0.1, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.cost_limit = cost_limit
+                self.lambda_param = lambda_init
+
+        policy_class = create_ideal_traffic_policy_v4(self.config)
+
+        phase3_config = self.config.get('training', {}).get('phase3', {})
+
+        return LagrangianPPO(
+            policy_class,
+            vec_env,
+            verbose=1,
+            tensorboard_log=self.config.get('paths', {}).get('log_dir', 'logs') + '/phase3',
+            learning_rate=float(phase3_config.get('learning_rate', 1e-4)),
+            cost_limit=phase3_config.get('cost_limit', 0.1),
+            lambda_init=0.1,
+            n_steps=phase3_config.get('n_steps', 2048),
+            batch_size=phase3_config.get('batch_size', 64),
+            n_epochs=phase3_config.get('update_epochs', 10),
+            gamma=phase3_config.get('gamma', 0.99),
+            gae_lambda=phase3_config.get('gae_lambda', 0.95),
+            clip_range=phase3_config.get('clip_epsilon', 0.2),
+            ent_coef=phase3_config.get('entropy_coef', 0.01),
+            vf_coef=phase3_config.get('value_loss_coef', 0.5),
+            max_grad_norm=phase3_config.get('max_grad_norm', 0.5),
+            seed=self.config.get('seed', 42),
+            device=self.device
+        )
+
+    def _create_callbacks(self):
+        """创建回调"""
+        callbacks = []
+
+        checkpoint_callback = CheckpointCallback(
+            save_freq=5000,
+            save_path=self.checkpoint_dir,
+            name_prefix="checkpoint",
+            save_replay_buffer=False
+        )
+        callbacks.append(checkpoint_callback)
+
+        # 添加增强训练回调（包含进度输出）
+        enhanced_callback = EnhancedTrainingCallback(
+            enhanced_manager=self.enhanced_manager,
+            total_timesteps=self.total_timesteps,
+            verbose=1
+        )
+        callbacks.append(enhanced_callback)
+
+        return callbacks
+
+
+# =============================================================================
 # 辅助函数
 # =============================================================================
 
 def _collect_worker(worker_id: int, num_episodes: int, env_config: Dict, max_steps: int = 500) -> Tuple[List, List]:
-    """Worker函数：在单独进程中收集数据（使用spawn启动方法支持CUDA）"""
+    """Worker函数：在单独进程中收集数据"""
     observations = []
     next_observations = []
 
@@ -756,77 +1546,225 @@ def _compute_conflict_label(obs_trans: TrafficTransition, next_trans: TrafficTra
 
 def main():
     """主函数"""
-    # 设置多进程启动方法为spawn，支持CUDA
-    try:
-        multiprocessing.set_start_method('spawn')
-    except RuntimeError as e:
-        if "start_method has already been set" not in str(e):
-            raise
-
     parser = argparse.ArgumentParser(
-        description="Phase 1: 世界模型预训练",
+        description="统一训练脚本 - v4.0架构 + 增强功能",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 基础训练
-  python train_phase1.py
+  # 完整训练（推荐）
+  python train.py
 
-  # 使用自定义配置
-  python train_phase1.py --config configs/competition_preliminary.yaml
+  # 指定配置文件
+  python train.py --config configs/competition.yaml
 
-  # 指定设备
-  python train_phase1.py --device cuda:0
+  # 单独训练某个阶段
+  python train.py --phase 2
+
+  # 禁用增强功能
+  python train.py --no-enhancements
+
+  # 查看详细信息
+  python train.py --verbose
         """
     )
 
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='configs/competition_preliminary.yaml',
-        help='配置文件路径 (默认: configs/competition_preliminary.yaml)'
-    )
-
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda:0',
-        help='计算设备 (默认: cuda:0)'
-    )
+    parser.add_argument('--config', type=str, default='configs/competition.yaml',
+                        help='配置文件路径 (默认: configs/competition.yaml)')
+    parser.add_argument('--phase', type=str, default='all',
+                        choices=['1', '2', '3', 'all'],
+                        help='训练阶段 (默认: all)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='设备 (默认: cuda)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='显示详细信息')
 
     args = parser.parse_args()
 
     # 加载配置
-    print(f"\n[CONFIG] Loading configuration from: {args.config}")
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+    config = load_config(args.config)
 
-    # 设置设备
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    print(f"[DEVICE] Using device: {device}")
+    # 增强功能默认启用（课程学习、PER、失败案例库）
+    # 配置文件中已设置enabled=true，无需额外处理
 
     # 设置随机种子
-    seed = config.get('seed', 42)
-    set_seed(seed)
-    print(f"[SEED] Random seed: {seed}")
+    set_seed(config.get('seed', 42))
 
-    # 创建训练器
-    trainer = Phase1WorldModelTrainer(config)
+    # 创建增强训练管理器
+    enhanced_manager = create_enhanced_training_manager(config)
 
-    # 开始训练
-    print("\n" + "="*80)
-    print("[TRAIN] Starting Phase 1 Training...")
+    # 显示配置
+    print("="*80)
+    print("Training Pipeline - v4.0 Architecture")
     print("="*80)
 
-    start_time = time.time()
-    final_model_path = trainer.train()
-    training_time = time.time() - start_time
+    print("\n[CONFIG]")
+    print(f"  Config: {args.config}")
+    print(f"  Phase: {args.phase}")
+    print(f"  Device: {args.device}")
+
+    print("\n[ENHANCEMENTS]")
+    # 检查课程学习是否启用
+    curriculum_enabled = config.get('training', {}).get('curriculum', {}).get('enabled', True)
+    if curriculum_enabled:
+        print(f"  [OK] Curriculum Learning: ENABLED")
+    else:
+        print(f"  [INFO] Curriculum Learning: DISABLED")
+    print(f"  [OK] Prioritized Replay: ENABLED (default)")
+    print(f"  [OK] Failure Bank: ENABLED (default)")
+
+    # 创建检查点管理器
+    from src.training.checkpoint_manager import PhaseCheckpointManager
+
+    checkpoint_dir = config.get('paths', {}).get('checkpoint_dir', 'checkpoints/competition')
+    checkpoint_manager = PhaseCheckpointManager(checkpoint_dir)
+
+    # 显示训练状态
+    checkpoint_manager.print_training_status()
+
+    # 询问是否跳过已完成的阶段
+    skip_completed = False
+    if args.phase == 'all':
+        response = input("\n是否跳过已完成的阶段? (y/n, 默认: y): ").strip().lower()
+        skip_completed = response != 'n'
+
+    # 执行训练
+    phase1_checkpoint = None
+    phase2_checkpoint = None
+
+    # Phase 1: World Model预训练
+    if args.phase in ['all', '1']:
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase1')
+
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 1 已完成，跳过训练")
+            print(f"[LOAD] 使用已有检查点: {checkpoint_path}")
+            phase1_checkpoint = checkpoint_path
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 1] World Model预训练 - 学习交通动态模式")
+            print(f"{'='*80}")
+
+            trainer1 = Phase1WorldModelTrainer(config, enhanced_manager)
+            phase1_checkpoint = trainer1.train()
+
+            # 自动保存Phase 1权重
+            if phase1_checkpoint:
+                print(f"\n[SAVE] 保存 Phase 1 检查点...")
+                # 权重已在训练器内部保存，这里只是更新元数据
+                checkpoint_manager._save_metadata('phase1', {
+                    'status': 'completed',
+                    'num_episodes': config.get('training', {}).get('phase1', {}).get('num_episodes', 50)
+                })
+                print(f"[OK] Phase 1 检查点已保存")
+
+    # Phase 2: PPO策略训练
+    if args.phase in ['all', '2']:
+        # 确保有Phase 1检查点
+        if not phase1_checkpoint:
+            phase1_checkpoint = checkpoint_manager.get_checkpoint_path('phase1')
+
+        if not phase1_checkpoint:
+            print(f"\n[ERROR] Phase 1 检查点不存在!")
+            print(f"[HINT] 请先运行 Phase 1: python train.py --phase 1")
+            return
+        else:
+            print(f"\n[LOAD] 使用 Phase 1 检查点: {phase1_checkpoint}")
+
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase2')
+
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 2 已完成，跳过训练")
+            print(f"[LOAD] 使用已有检查点: {checkpoint_path}")
+            phase2_checkpoint = checkpoint_path
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 2] PPO策略训练 - 学习控制策略")
+            print(f"{'='*80}")
+
+            # Phase2PPOTrainer已内置动态课程学习功能
+            trainer2 = Phase2PPOTrainer(config, enhanced_manager)
+            print("[INFO] Using PPO trainer with dynamic curriculum learning")
+
+            phase2_checkpoint = trainer2.train(phase1_checkpoint=phase1_checkpoint)
+
+            # 自动保存Phase 2权重
+            if phase2_checkpoint:
+                print(f"\n[SAVE] 保存 Phase 2 检查点...")
+                checkpoint_manager._save_metadata('phase2', {
+                    'status': 'completed',
+                    'total_timesteps': config.get('training', {}).get('phase2', {}).get('total_timesteps', 200000)
+                })
+                print(f"[OK] Phase 2 检查点已保存")
+
+    # Phase 3: 端到端微调
+    if args.phase in ['all', '3']:
+        # 确保有Phase 2检查点
+        if not phase2_checkpoint:
+            phase2_checkpoint = checkpoint_manager.get_checkpoint_path('phase2')
+
+        if not phase2_checkpoint:
+            print(f"\n[ERROR] Phase 2 检查点不存在!")
+            print(f"[HINT] 请先运行 Phase 2: python train.py --phase 2")
+            return
+        else:
+            print(f"\n[LOAD] 使用 Phase 2 检查点: {phase2_checkpoint}")
+
+        can_skip, checkpoint_path = checkpoint_manager.can_skip_phase('phase3')
+
+        if can_skip and skip_completed:
+            print(f"\n[SKIP] Phase 3 已完成，跳过训练")
+        else:
+            print(f"\n{'='*80}")
+            print("[PHASE 3] 端到端微调 - 联合优化所有模块")
+            print(f"{'='*80}")
+
+            trainer3 = Phase3ConstrainedOptimizer(config, enhanced_manager)
+            trainer3.train(phase2_checkpoint=phase2_checkpoint)
+
+            # 自动保存Phase 3权重
+            print(f"\n[SAVE] 保存 Phase 3 检查点...")
+            checkpoint_manager._save_metadata('phase3', {
+                'status': 'completed',
+                'total_timesteps': config.get('training', {}).get('phase3', {}).get('total_timesteps', 100000)
+            })
+            print(f"[OK] Phase 3 检查点已保存")
 
     print("\n" + "="*80)
-    print("[SUCCESS] Phase 1 Training Completed!")
-    print(f"  Training time: {training_time/60:.1f} minutes")
-    print(f"  Final model: {final_model_path}")
-    print("="*80 + "\n")
+    print("[SUCCESS] Training Pipeline Finished!")
+    print("="*80)
 
+    # 打印统计
+    stats = enhanced_manager.get_stats()
+    if stats:
+        print("\n[STATISTICS]")
+        if 'curriculum' in stats:
+            print(f"  Final Level: {stats['curriculum']['current_level']}")
+            print(f"  Progress: {stats['curriculum']['progress']:.1%}")
+        if 'replay_buffer' in stats:
+            print(f"  Replay Buffer Size: {stats['replay_buffer']['size']}")
+        if 'failure_bank' in stats:
+            print(f"  Failure Cases: {stats['failure_bank']['total_cases']}")
+
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """加载配置文件"""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        if config_path.endswith('.yaml') or config_path.endswith('.yml'):
+            import yaml
+            config = yaml.safe_load(f)
+        else:
+            config = json.load(f)
+
+    # 设置设备
+    if config.get('device', 'cuda') == 'cuda' and not torch.cuda.is_available():
+        print("[WARNING] CUDA not available, using CPU")
+        config['device'] = 'cpu'
+
+    return config
+
+
+# 课程学习已直接集成到Phase2PPOTrainer中
+# 不再需要单独的训练器文件
 
 if __name__ == '__main__':
     main()

@@ -34,8 +34,88 @@ sys.path.insert(0, str(project_root))
 
 from src.models.ideal_policy_v4 import create_ideal_traffic_policy_v4, IdealTrafficPolicyV4
 from src.env.competition_env import CompetitionSumoEnv
-from src.training.world_model_train_v4 import WorldModelTrainer
 from src.training.custom_ppo_trainer import CustomPPOTrainer
+
+# 导入恢复的Phase 1训练器
+try:
+    from train_phase1 import Phase1WorldModelTrainer
+
+    # 创建缺失的依赖类
+    class MultiGPUManager:
+        """简化的多GPU管理器"""
+        def __init__(self, config):
+            self.config = config
+            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.multi_gpu = torch.cuda.device_count() > 1
+
+        def wrap_model(self, model):
+            if self.multi_gpu:
+                return torch.nn.DataParallel(model)
+            return model
+
+        def get_model_state_dict(self, model):
+            if self.multi_gpu:
+                return model.module.state_dict()
+            return model.state_dict()
+
+        def get_effective_batch_size(self, batch_size):
+            return batch_size * max(1, torch.cuda.device_count())
+
+    class TrainingMetrics:
+        """简化的训练指标记录器"""
+        def __init__(self):
+            self.history = {'train_loss': [], 'val_loss': [], 'learning_rate': []}
+
+        def update(self, **kwargs):
+            for key, value in kwargs.items():
+                if key in self.history:
+                    self.history[key].append(value)
+
+        def print_summary(self):
+            print("[TRAINING METRICS SUMMARY]")
+            print(f"  Total epochs: {len(self.history['train_loss'])}")
+            if self.history['train_loss']:
+                print(f"  Final train loss: {self.history['train_loss'][-1]:.4f}")
+
+except ImportError:
+    # Fallback to current version
+    from src.training.world_model_train_v4 import WorldModelTrainer as Phase1WorldModelTrainer
+
+    class MultiGPUManager:
+        """简化的多GPU管理器"""
+        def __init__(self, config):
+            self.config = config
+            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.multi_gpu = torch.cuda.device_count() > 1
+
+        def wrap_model(self, model):
+            if self.multi_gpu:
+                return torch.nn.DataParallel(model)
+            return model
+
+        def get_model_state_dict(self, model):
+            if self.multi_gpu:
+                return model.module.state_dict()
+            return model.state_dict()
+
+        def get_effective_batch_size(self, batch_size):
+            return batch_size * max(1, torch.cuda.device_count())
+
+    class TrainingMetrics:
+        """简化的训练指标记录器"""
+        def __init__(self):
+            self.history = {'train_loss': [], 'val_loss': [], 'learning_rate': []}
+
+        def update(self, **kwargs):
+            for key, value in kwargs.items():
+                if key in self.history:
+                    self.history[key].append(value)
+
+        def print_summary(self):
+            print("[TRAINING METRICS SUMMARY]")
+            print(f"  Total epochs: {len(self.history['train_loss'])}")
+            if self.history['train_loss']:
+                print(f"  Final train loss: {self.history['train_loss'][-1]:.4f}")
 
 
 # =============================================================================
@@ -178,7 +258,7 @@ def check_existing_checkpoints(config: Dict[str, Any], curriculum_levels: List[D
 # =============================================================================
 def train_phase1(config: Dict[str, Any], device: torch.device):
     """
-    Phase 1: 世界模型预训练
+    Phase 1: 世界模型预训练（使用恢复的正确实现）
 
     训练目标：
         - 学习车辆状态编码器（GNN）
@@ -195,27 +275,26 @@ def train_phase1(config: Dict[str, Any], device: torch.device):
     print("  4. 为Phase 2提供良好的初始化")
     print("="*80 + "\n")
 
+    # 导入必要的依赖
+    from train_phase1 import Phase1WorldModelTrainer, EnhancedTrainingManager
+
+    # 创建增强训练管理器
+    enhanced_manager = EnhancedTrainingManager(config)
+
     # 创建Phase 1训练器
-    phase1_trainer = WorldModelTrainer(
+    phase1_trainer = Phase1WorldModelTrainer(
         config=config,
-        device=device
+        enhanced_manager=enhanced_manager
     )
 
     # 开始训练
-    phase1_trainer.train()
-
-    # 保存最终检查点
-    checkpoint_dir = Path(config['paths']['checkpoint_dir']) / 'preliminary' / 'phase1'
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    final_checkpoint = checkpoint_dir / 'world_model_final.pth'
-    phase1_trainer.save_checkpoint(str(final_checkpoint))
+    checkpoint_path = phase1_trainer.train()
 
     print(f"\n[SUCCESS] Phase 1 训练完成！")
-    print(f"  - 检查点保存至: {final_checkpoint}")
+    print(f"  - 检查点: {checkpoint_path}")
     print(f"  - 将用于Phase 2的初始化\n")
 
-    return str(final_checkpoint)
+    return checkpoint_path
 
 
 # =============================================================================
