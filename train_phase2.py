@@ -164,29 +164,79 @@ def train_stage(
     print("[INFO] torch.compile() is disabled to avoid dynamic shape issues")
 
     # 加载权重
-    if prev_checkpoint and os.path.exists(prev_checkpoint):
-        print(f"\n[LOAD] Loading previous stage: {prev_checkpoint}")
-        checkpoint = torch.load(prev_checkpoint, map_location=str(device))
-        if 'policy_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['policy_state_dict'])
-        else:
-            print(f"[WARN] No 'policy_state_dict' found, using checkpoint directly")
-            policy.load_state_dict(checkpoint)
-        print(f"[OK] Loaded")
-    elif phase1_checkpoint and os.path.exists(phase1_checkpoint):
-        print(f"\n[LOAD] Loading Phase 1: {phase1_checkpoint}")
-        checkpoint = torch.load(phase1_checkpoint, map_location=str(device))
-        print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys())}")
+    # 智能识别checkpoint类型：Phase 1 (.pth) 或 Phase 2 (.zip)
+    checkpoint_to_load = None
+    checkpoint_type = None
 
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-            if state_dict is not None:
-                policy.load_state_dict(state_dict, strict=False)
-                print(f"[OK] Loaded Phase 1 weights")
-            else:
-                print(f"[ERROR] 'model_state_dict' is None!")
+    if prev_checkpoint and os.path.exists(prev_checkpoint):
+        checkpoint_to_load = prev_checkpoint
+        # 判断checkpoint类型
+        if prev_checkpoint.endswith('.pth'):
+            checkpoint_type = 'phase1'
+        elif prev_checkpoint.endswith('.zip'):
+            checkpoint_type = 'phase2'
         else:
-            print(f"[ERROR] No 'model_state_dict' found in checkpoint!")
+            # 通过内容判断
+            checkpoint = torch.load(prev_checkpoint, map_location=str(device), weights_only=False)
+            if 'model_state_dict' in checkpoint:
+                checkpoint_type = 'phase1'
+            elif 'policy_state_dict' in checkpoint:
+                checkpoint_type = 'phase2'
+
+    elif phase1_checkpoint and os.path.exists(phase1_checkpoint):
+        checkpoint_to_load = phase1_checkpoint
+        checkpoint_type = 'phase1'
+
+    # 加载checkpoint
+    if checkpoint_to_load:
+        print(f"\n[LOAD] Loading checkpoint: {checkpoint_to_load} (type: {checkpoint_type})")
+        checkpoint = torch.load(checkpoint_to_load, map_location=str(device), weights_only=False)
+
+        if checkpoint_type == 'phase2':
+            # Phase 2 checkpoint - 加载PPO策略
+            if 'policy_state_dict' in checkpoint:
+                policy.load_state_dict(checkpoint['policy_state_dict'])
+                print(f"[OK] Loaded Phase 2 policy weights")
+            else:
+                print(f"[WARN] No 'policy_state_dict' found, trying direct load")
+                try:
+                    policy.load_state_dict(checkpoint)
+                    print(f"[OK] Loaded directly")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load: {e}")
+
+        elif checkpoint_type == 'phase1':
+            # Phase 1 checkpoint - 从完整模型中提取匹配的权重
+            print(f"[DEBUG] Checkpoint keys: {list(checkpoint.keys())}")
+
+            if 'model_state_dict' in checkpoint:
+                phase1_state_dict = checkpoint['model_state_dict']
+                if phase1_state_dict is not None:
+                    # 从Phase 1的完整模型state_dict中提取匹配的权重
+                    policy_state_dict = policy.state_dict()
+                    matched_weights = {}
+
+                    for key in policy_state_dict.keys():
+                        if key in phase1_state_dict:
+                            if phase1_state_dict[key].shape == policy_state_dict[key].shape:
+                                matched_weights[key] = phase1_state_dict[key]
+                                print(f"[MATCH] {key}: {phase1_state_dict[key].shape} -> {policy_state_dict[key].shape}")
+                            else:
+                                print(f"[SKIP] {key}: shape mismatch {phase1_state_dict[key].shape} vs {policy_state_dict[key].shape}")
+
+                    print(f"[INFO] Matched {len(matched_weights)}/{len(policy_state_dict)} weights")
+
+                    if len(matched_weights) > 0:
+                        policy.load_state_dict(matched_weights, strict=False)
+                        print(f"[OK] Loaded Phase 1 weights ({len(matched_weights)} parameters)")
+                    else:
+                        print(f"[WARN] No matching weights found, starting from scratch")
+                else:
+                    print(f"[ERROR] 'model_state_dict' is None!")
+            else:
+                print(f"[ERROR] No 'model_state_dict' found in checkpoint!")
+    else:
+        print(f"\n[INFO] No checkpoint found, starting from scratch")
 
     # 冻结感知层和预测层
     print("\n[FREEZE] Freezing perception and prediction layers...")

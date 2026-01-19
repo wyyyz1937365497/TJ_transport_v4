@@ -46,7 +46,9 @@
       "Bash(./train_all.sh:*)",
       "Bash(/home/wyyyz/TJ_transport_v4/check_training_setup.sh:*)",
       "Bash(test:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(/bin/ls:*)",
+      "Bash(xargs:*)"
     ]
   }
 }

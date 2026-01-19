@@ -129,9 +129,12 @@ train_phase1() {
 # Phase 2: PPO训练（课程学习）
 ################################################################################
 
+# 全局变量用于存储checkpoint路径
+TRAIN_PHASE2_CURRENT_CHECKPOINT=""
+
 train_phase2_stage() {
     local stage=$1
-    local prev_checkpoint=$2
+    local prev_checkpoint="$2"
 
     local stage_config=(
         [1]="level:1,name:基础场景,max_vehicles:10,inflow:800"
@@ -153,6 +156,7 @@ train_phase2_stage() {
         echo
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
             log_success "Skipping Stage ${stage}"
+            TRAIN_PHASE2_CURRENT_CHECKPOINT="${checkpoint}"
             return 0
         fi
         log_info "Retraining Stage ${stage}..."
@@ -162,7 +166,7 @@ train_phase2_stage() {
     local cmd="python train_phase2.py --stage ${stage}"
 
     if [ -n "${prev_checkpoint}" ]; then
-        cmd="${cmd} --prev-checkpoint ${prev_checkpoint}"
+        cmd="${cmd} --prev-checkpoint \"${prev_checkpoint}\""
     fi
 
     log_info "Starting Stage ${stage} training..."
@@ -171,8 +175,8 @@ train_phase2_stage() {
     if eval ${cmd} 2>&1 | tee "${LOG_DIR}/phase2/stage${stage}_$(date +%Y%m%d_%H%M%S).log"; then
         log_success "Stage ${stage} training completed!"
 
-        # 返回检查点路径供下一阶段使用
-        echo "${checkpoint}"
+        # 设置全局变量供下一阶段使用
+        TRAIN_PHASE2_CURRENT_CHECKPOINT="${checkpoint}"
     else
         log_error "Stage ${stage} training failed!"
         exit 1
@@ -193,7 +197,7 @@ train_phase2() {
     log_info "Using Phase 1 checkpoint: ${phase1_checkpoint}"
 
     # 训练所有课程阶段
-    local current_checkpoint=""
+    local prev_checkpoint="${phase1_checkpoint}"
     local stages=(1 2 3 4 5)
 
     for stage in "${stages[@]}"; do
@@ -209,17 +213,15 @@ train_phase2() {
             echo
             if [[ ! $REPLY =~ ^[Nn]$ ]]; then
                 log_success "Skipping Stage ${stage}"
-                current_checkpoint="${checkpoint}"
+                prev_checkpoint="${checkpoint}"
                 continue
             fi
         fi
 
         # 训练当前阶段
-        if [ ${stage} -eq 1 ]; then
-            current_checkpoint=$(train_phase2_stage ${stage} "${phase1_checkpoint}")
-        else
-            current_checkpoint=$(train_phase2_stage ${stage} "${current_checkpoint}")
-        fi
+        train_phase2_stage ${stage} "${prev_checkpoint}"
+        # 从全局变量获取checkpoint路径
+        prev_checkpoint="${TRAIN_PHASE2_CURRENT_CHECKPOINT}"
     done
 
     log_success "All Phase 2 stages completed!"
