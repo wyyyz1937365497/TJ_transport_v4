@@ -101,6 +101,10 @@ class GPUSumoEnvironmentOptimized:
             'ended_vehicles': set()
         }
 
+        # Episode跟踪（用于PPO训练）
+        self._current_episode_reward = 0.0
+        self._current_episode_length = 0
+
         # 订阅相关
         self._subscription_enabled = False
         self._junction_id = None
@@ -218,6 +222,10 @@ class GPUSumoEnvironmentOptimized:
             'ended_vehicles': set()
         }
 
+        # 重置episode跟踪
+        self._current_episode_reward = 0.0
+        self._current_episode_length = 0
+
         # 优先使用子类的_get_observation()（如果被覆盖），否则使用优化版本
         if hasattr(self, '_get_observation') and '_get_observation' in type(self).__dict__:
             # 子类覆盖了_get_observation()，使用它
@@ -271,11 +279,15 @@ class GPUSumoEnvironmentOptimized:
         # 计算奖励
         reward = self._compute_reward_gpu(observation)
 
+        # 累积episode奖励和长度
+        self._current_episode_reward += reward
+        self._current_episode_length += 1
+
         # 检查是否结束
         done = self._is_done()
 
         # 额外信息
-        info = self._get_info()
+        info = self._get_info(done)
 
         return observation, reward, done, info
 
@@ -537,13 +549,30 @@ class GPUSumoEnvironmentOptimized:
         except Exception:
             return False
 
-    def _get_info(self) -> Dict[str, Any]:
-        """获取额外信息"""
-        return {
+    def _get_info(self, done: bool = False) -> Dict[str, Any]:
+        """
+        获取额外信息
+
+        Args:
+            done: 是否episode结束（如果是，则返回episode统计）
+        """
+        info = {
             'current_step': self.current_step,
             'arrived_count': len(self.stats['arrived_vehicles']),
             'departed_count': len(self.stats['departed_vehicles']),
         }
+
+        # 如果episode结束，添加episode统计（PPO训练需要）
+        if done:
+            info['episode'] = {
+                'r': self._current_episode_reward,
+                'l': self._current_episode_length,
+            }
+            # 重置episode统计
+            self._current_episode_reward = 0.0
+            self._current_episode_length = 0
+
+        return info
 
 
 # 使用说明

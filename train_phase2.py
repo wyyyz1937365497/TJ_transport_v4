@@ -43,7 +43,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 800,
         'icv_ratio': 0.3,
         'disturbance_level': 0.0,
-        'total_timesteps': 126000,
+        'total_timesteps': 409600,  # ⭐ 100个updates (打牢基础)
     },
     {
         'level': 2,
@@ -52,7 +52,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1200,
         'icv_ratio': 0.25,
         'disturbance_level': 0.2,
-        'total_timesteps': 126000,
+        'total_timesteps': 409600,  # ⭐ 100个updates
     },
     {
         'level': 3,
@@ -61,7 +61,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 1800,
         'icv_ratio': 0.25,
         'disturbance_level': 0.4,
-        'total_timesteps': 126000,
+        'total_timesteps': 409600,  # ⭐ 100个updates
     },
     {
         'level': 4,
@@ -70,7 +70,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2400,
         'icv_ratio': 0.15,
         'disturbance_level': 0.7,
-        'total_timesteps': 126000,
+        'total_timesteps': 655360,  # ⭐ 160个updates (最难场景)
     },
     {
         'level': 5,
@@ -79,7 +79,7 @@ CURRICULUM_LEVELS = [
         'inflow_rate': 2000,
         'icv_ratio': 0.2,
         'disturbance_level': 0.5,
-        'total_timesteps': 1494000,
+        'total_timesteps': 655360,  # ⭐ 160个updates (减少，因基础已打好)
     },
 ]
 
@@ -253,12 +253,12 @@ def train_stage(
         'n_steps': n_steps,
         'batch_size': batch_size,
         'n_epochs': n_epochs,
-        'gamma': 0.99,
-        'gae_lambda': 0.95,
-        'clip_range': 0.2,
-        'ent_coef': 0.01,
-        'vf_coef': 0.5,
-        'max_grad_norm': 0.5,
+        'gamma': phase2_config.get('gamma', 0.99),
+        'gae_lambda': phase2_config.get('gae_lambda', 0.95),
+        'clip_range': phase2_config.get('clip_range', 0.2),
+        'ent_coef': phase2_config.get('entropy_coef', 0.01),  # ✅ 从配置文件读取
+        'vf_coef': phase2_config.get('value_loss_coef', 0.5),
+        'max_grad_norm': phase2_config.get('max_grad_norm', 0.5),
     }
 
     checkpoint_dir = Path(config.get('paths', {}).get('checkpoint_dir', 'checkpoints/competition'))

@@ -12,7 +12,7 @@ Phase 1: 世界模型预训练（监督学习）
     python train_phase1.py
 
     # 使用自定义配置
-    python train_phase1.py --config configs/competition_preliminary.yaml
+    python train_phase1.py --config configs/competition.yaml
 
     # 指定设备
     python train_phase1.py --device cuda:0
@@ -772,7 +772,7 @@ def main():
   python train_phase1.py
 
   # 使用自定义配置
-  python train_phase1.py --config configs/competition_preliminary.yaml
+  python train_phase1.py --config configs/competition.yaml
 
   # 指定设备
   python train_phase1.py --device cuda:0
@@ -782,8 +782,8 @@ def main():
     parser.add_argument(
         '--config',
         type=str,
-        default='configs/competition_preliminary.yaml',
-        help='配置文件路径 (默认: configs/competition_preliminary.yaml)'
+        default='configs/competition.yaml',
+        help='配置文件路径 (默认: configs/competition.yaml)'
     )
 
     parser.add_argument(

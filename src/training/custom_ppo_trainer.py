@@ -22,6 +22,7 @@ import torch.optim as optim
 from typing import Dict, Any, Tuple, Optional, List, Iterable
 import numpy as np
 import time
+import sys
 from pathlib import Path
 import gymnasium as gym
 from tqdm import tqdm
@@ -311,6 +312,7 @@ class CustomPPOTrainer:
             'policy_loss': [],
             'value_loss': [],
             'entropy_loss': [],
+            'env_step': [],  # SUMO环境step时间
         }
 
         # 训练统计
@@ -323,6 +325,9 @@ class CustomPPOTrainer:
 
         # ✅ 奖励归一化（用于训练稳定性）
         self.ret_rms = RunningMeanStd()
+
+        # ✅ 缓存最后的value估计（避免重复计算）
+        self.last_values = None
 
     def collect_rollouts(self) -> Dict[str, float]:
         """
@@ -358,14 +363,25 @@ class CustomPPOTrainer:
             transfer_time = time.perf_counter() - transfer_start
             self.timings['data_transfer'].append(transfer_time)
 
-            # 环境step
+            # 环境step（SUMO仿真，这是性能瓶颈！）
+            env_step_start = time.perf_counter()
             next_obs, rewards, dones, infos = self.env.step(actions_np)
+            env_step_time = time.perf_counter() - env_step_start
+            self.timings['env_step'].append(env_step_time)
 
             # 处理episode信息
             for idx, info in enumerate(infos):
                 maybe_ep_info = info.get('episode')
                 if maybe_ep_info is not None:
                     self.ep_info_buffer.append(maybe_ep_info)
+
+                # ✅ 额外记录：如果环境有累积的奖励（即使episode未结束），也记录下来
+                # 这对于长episode（max_steps > n_steps）的情况很有用
+                if 'episode_reward' in info:
+                    self.ep_info_buffer.append({
+                        'r': info['episode_reward'],
+                        'l': info.get('episode_length', 0)
+                    })
 
             # 更新episode_starts
             episode_starts = dones
@@ -386,7 +402,7 @@ class CustomPPOTrainer:
             if (step + 1) % 256 == 0:
                 elapsed = time.perf_counter() - start_time
                 progress = (step + 1) / self.n_steps * 100
-                print(f"[ROLLOUT] {step+1}/{self.n_steps} steps ({progress:.1f}%) | Elapsed: {elapsed:.1f}s")
+                print(f"[ROLLOUT] {step+1}/{self.n_steps} steps ({progress:.1f}%) | Elapsed: {elapsed:.1f}s", flush=True)
 
         # 最后的value估计（用于GAE）
         with torch.no_grad():
@@ -399,6 +415,9 @@ class CustomPPOTrainer:
             if last_values.dim() > 1:
                 last_values = last_values.flatten()
             last_values = last_values[:self.buffer.n_envs]
+
+            # ✅ 缓存last_values，避免在train()中重复计算
+            self.last_values = last_values.cpu()  # 移到CPU节省GPU显存
 
         rollout_time = time.perf_counter() - start_time
         self.timings['rollout'].append(rollout_time)
@@ -440,13 +459,18 @@ class CustomPPOTrainer:
         # 1. 计算advantages
         gae_start = time.perf_counter()
         with torch.no_grad():
-            # 获取最后的values和dones
-            obs_tensor = torch.as_tensor(self.buffer.observations[-1], dtype=torch.float32, device=self.device)
-            # policy.forward返回 (actions, values, log_probs)
-            _, last_values, _ = self.policy(obs_tensor)
-
-            if last_values.dim() > 1:
-                last_values = last_values.flatten()
+            # ✅ 使用collect_rollouts中缓存的last_values，避免重复计算
+            if self.last_values is None:
+                # Fallback：如果没有缓存，重新计算（理论上不应该发生）
+                print("[WARNING] last_values not cached, recomputing...", flush=True)
+                obs_tensor = torch.as_tensor(self.buffer.observations[-1], dtype=torch.float32, device=self.device)
+                _, last_values, _ = self.policy(obs_tensor)
+                if last_values.dim() > 1:
+                    last_values = last_values.flatten()
+                last_values = last_values[:self.buffer.n_envs]
+            else:
+                # 从CPU缓存加载到GPU
+                last_values = self.last_values.to(self.device)
 
             last_dones = np.zeros(self.buffer.n_envs, dtype=bool)
 
@@ -455,11 +479,14 @@ class CustomPPOTrainer:
         gae_time = time.perf_counter() - gae_start
         self.timings['compute_gae'].append(gae_time)
 
-        # 2. 准备advantages（标准化）
-        advantages = self.buffer.advantages.flatten()
-        # 标准化advantages（稳定训练）
-        if advantages.std() > 1e-8:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # 2. ✅ 修复：标准化advantages并存回buffer
+        with torch.no_grad():
+            advantages = self.buffer.advantages
+            if advantages.std() > 1e-8:
+                # 标准化advantages（稳定训练）
+                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                # 存回buffer，这样minibatch.get()会返回标准化后的advantages
+                self.buffer.advantages.copy_(normalized_advantages)
 
         # 3. 多个epoch的更新
         policy_losses = []
@@ -482,7 +509,7 @@ class CustomPPOTrainer:
                 # 每32个minibatch打印一次进度
                 if current_minibatch % 32 == 0:
                     progress = current_minibatch / total_minibatches * 100
-                    print(f"[UPDATE] Epoch {epoch+1}/{self.n_epochs} | Minibatch {current_minibatch}/{total_minibatches} ({progress:.1f}%)")
+                    print(f"[UPDATE] Epoch {epoch+1}/{self.n_epochs} | Minibatch {current_minibatch}/{total_minibatches} ({progress:.1f}%)", flush=True)
                 forward_start = time.perf_counter()
 
                 # 准备数据
@@ -542,8 +569,12 @@ class CustomPPOTrainer:
                 kl_divs.append(kl_div.item())
 
                 # ✅ KL散度早停（如果KL过大，提前终止epoch）
-                if kl_div.item() > self.target_kl * 1.5:
-                    print(f"[EARLY STOP] KL divergence ({kl_div.item():.4f}) exceeds threshold ({self.target_kl * 1.5:.4f}). Stopping epoch early.")
+                # ⭐ 方案A：使用非常宽松的KL阈值，让训练能够正常进行
+                # 设置为10.0，只有在极端情况下才会早停
+                kl_threshold = 10.0
+
+                if kl_div.item() > kl_threshold:
+                    print(f"[EARLY STOP] KL divergence ({kl_div.item():.4f}) exceeds threshold ({kl_threshold:.4f}). Stopping epoch early.", flush=True)
                     break
 
                 # Backward pass
@@ -629,8 +660,9 @@ class CustomPPOTrainer:
         returns = torch.nan_to_num(returns, nan=0.0, posinf=10.0, neginf=-10.0)
         old_values = torch.nan_to_num(old_values, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        # 标准MSE loss
-        value_loss = nn.functional.mse_loss(values, returns)
+        # ✅ 修复：使用逐元素的squared error，而不是mse_loss（会返回标量）
+        # 标准的squared error
+        value_loss_unclipped = (values - returns).pow(2)
 
         # ✅ 使用Clipped Value Loss（更稳定，PPO论文建议）
         value_pred_clipped = old_values + torch.clamp(
@@ -638,8 +670,10 @@ class CustomPPOTrainer:
             -self.clip_range,
             self.clip_range
         )
-        value_loss_clipped = nn.functional.mse_loss(value_pred_clipped, returns)
-        value_loss = torch.max(value_loss, value_loss_clipped).mean()
+        value_loss_clipped = (value_pred_clipped - returns).pow(2)
+
+        # 逐元素取最大值，然后求平均
+        value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
         return value_loss
 
@@ -678,10 +712,23 @@ class CustomPPOTrainer:
         print("=" * 80)
         print(f"[INFO] Total timesteps: {total_timesteps:,}")
         print(f"[INFO] Device: {self.device}")
+        print(f"[INFO] Parallel envs: {self.env.num_envs}")
+        print(f"[INFO] Steps per rollout: {self.n_steps}")
         print(f"[INFO] Batch size: {self.batch_size}")
         print(f"[INFO] Epochs per update: {self.n_epochs}")
         print(f"[INFO] Learning rate: {self.learning_rate}")
+        print(f"[INFO] Entropy coefficient: {self.ent_coef}")
+        print(f"[INFO] Value function coefficient: {self.vf_coef}")
+        print(f"[INFO] Clip range: {self.clip_range}")
+        print(f"[INFO] Max grad norm: {self.max_grad_norm}")
         print(f"[INFO] Target KL: {self.target_kl}")
+        print(f"[INFO] KL early stop threshold: 10.0")
+
+        # 计算实际训练参数
+        transitions_per_update = self.n_steps * self.env.num_envs
+        total_updates = total_timesteps // transitions_per_update
+        print(f"[INFO] Transitions per update: {transitions_per_update}")
+        print(f"[INFO] Total updates: {total_updates}")
         print()
 
         # 计算update次数
@@ -721,7 +768,8 @@ class CustomPPOTrainer:
             desc=f"[TRAIN] Phase 2",
             unit="update",
             ncols=120,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+            disable=False  # 确保进度条始终显示
         )
 
         for update in pbar:
@@ -737,23 +785,44 @@ class CustomPPOTrainer:
             steps = (update + 1) * self.n_steps * self.env.num_envs
             total_time = time.perf_counter() - update_start
 
+            # 计算SUMO时间（如果可用）
+            sumo_time_str = "N/A"
+            if len(self.timings['env_step']) > 0:
+                # 计算这个rollout中的SUMO时间
+                recent_env_steps = self.timings['env_step'][-self.n_steps:]
+                avg_sumo_step = np.mean(recent_env_steps) * 1000  # 转换为ms
+                sumo_time_str = f"{avg_sumo_step:.0f}ms"
+
             pbar.set_postfix({
                 'Steps': f'{steps:,}',
-                'Reward': f'{rollout_metrics.get("ep_rew_mean", 0):.1f}',
-                'Len': f'{rollout_metrics.get("ep_len_mean", 0):.0f}',
-                'Loss': f'{train_metrics["policy_loss"]:.3f}',
-                'Time': f'{total_time:.1f}s'
+                'SUMO': sumo_time_str,
+                'Reward': f'{rollout_metrics.get("ep_rew_mean", 0):.0f}',
+                'Time': f'{total_time:.0f}s'
             })
 
-            # 详细打印（每10次update）
-            if (update + 1) % 10 == 0:
-                tqdm.write(f"\n[Update {update+1}/{n_updates}] Steps: {steps:,}/{total_timesteps:,}")
-                tqdm.write(f"  [TIMING] Rollout: {rollout_metrics['rollout_time']:.2f}s | Update: {train_metrics['update_time']:.2f}s | Total: {total_time:.2f}s")
-                tqdm.write(f"  [METRICS] Episode Reward: {rollout_metrics.get('ep_rew_mean', 0):.2f} | Length: {rollout_metrics.get('ep_len_mean', 0):.2f}")
-                tqdm.write(f"  [LOSS] Policy: {train_metrics['policy_loss']:.4f} | Value: {train_metrics['value_loss']:.4f} | Entropy: {train_metrics['entropy_loss']:.4f}")
-                # ✅ 显示KL散度
-                if 'kl_div' in train_metrics:
-                    tqdm.write(f"  [KL] Divergence: {train_metrics['kl_div']:.4f} (Target: {self.target_kl})")
+            # 每次update都打印详细信息（使用tqdm.write避免被进度条覆盖）
+            # 添加flush=True确保立即输出
+            tqdm.write(f"\n[Update {update+1}/{n_updates}] Steps: {steps:,}/{total_timesteps:,}")
+            tqdm.write(f"  [TIMING] Rollout: {rollout_metrics['rollout_time']:.2f}s | Update: {train_metrics['update_time']:.2f}s | Total: {total_time:.2f}s")
+
+            # 显示详细时间分解
+            if len(self.timings['env_step']) > 0:
+                avg_env_step = np.mean(self.timings['env_step'][-self.n_steps:])
+                total_env_time = np.sum(self.timings['env_step'][-self.n_steps:])
+                tqdm.write(f"  [SUMO] Avg step: {avg_env_step*1000:.1f}ms | Total: {total_env_time:.1f}s ({total_env_time/rollout_metrics['rollout_time']*100:.1f}% of rollout)")
+
+            tqdm.write(f"  [METRICS] Episode Reward: {rollout_metrics.get('ep_rew_mean', 0):.2f} | Length: {rollout_metrics.get('ep_len_mean', 0):.2f}")
+            # 显示entropy（正值）而不是entropy_loss（负值）
+            entropy_value = -train_metrics['entropy_loss']
+            tqdm.write(f"  [LOSS] Policy: {train_metrics['policy_loss']:.4f} | Value: {train_metrics['value_loss']:.4f} | Entropy: {entropy_value:.4f}")
+
+            # ✅ 显示KL散度
+            if 'kl_div' in train_metrics:
+                kl_threshold = 10.0  # 与train方法保持一致
+                tqdm.write(f"  [KL] Divergence: {train_metrics['kl_div']:.4f} (Threshold: {kl_threshold:.4f})")
+
+            # 强制刷新输出（使用sys.stdout.flush确保立即显示）
+            sys.stdout.flush()
 
             # 保存checkpoint
             if self.checkpoint_dir is not None and (update + 1) % 100 == 0:

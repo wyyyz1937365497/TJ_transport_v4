@@ -42,15 +42,23 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
     ):
         super().__init__(config, use_gui=use_gui, device=device)
 
-        # 读取比赛配置中的奖励权重
+        # ✅ 修复：从正确的配置路径读取奖励权重
+        # 配置文件中使用的是 'rewards' 而不是 'competition.reward_weights'
+        reward_config = config.get('rewards', {})
         competition_config = config.get('competition', {})
         reward_weights = competition_config.get('reward_weights', {})
-        self.speed_norm_factor = reward_weights.get('speed_norm', 1.0 / 30.0)  # 速度归一化因子
-        self.throughput_weight = reward_weights.get('throughput', 10.0)  # 吞吐量权重
-        self.efficiency_weights = competition_config.get('efficiency_weights', [5.0, 3.0, 2.0])  # 效率权重
-        self.stability_weight = competition_config.get('stability_weight', 0.5)  # 稳定性权重
-        self.congestion_penalty_weight = competition_config.get('congestion_penalty_weight', 2.0)  # 拥堵惩罚权重
-        self.stopped_penalty_weight = competition_config.get('stopped_penalty_weight', 1.0)  # 停车惩罚权重
+
+        # 优先使用 reward_weights，否则使用 reward_config，最后使用默认值
+        self.speed_norm_factor = reward_weights.get('speed_norm',
+                                                     reward_config.get('speed_weight', 1.0) / 30.0)
+        self.throughput_weight = reward_weights.get('throughput',
+                                                    reward_config.get('efficiency_weight', 2.0) * 5.0)
+        self.efficiency_weights = reward_weights.get('efficiency_weights',
+                                                      competition_config.get('efficiency_weights', [5.0, 3.0, 2.0]))
+        self.stability_weight = reward_weights.get('stability_weight',
+                                                    reward_config.get('safety_weight', 3.0) * 0.2)
+        self.congestion_penalty_weight = reward_weights.get('congestion_penalty_weight', 2.0)
+        self.stopped_penalty_weight = reward_weights.get('stopped_penalty_weight', 1.0)
 
         # 初始化优化的Frenet坐标系(基于固定路网)
         net_xml_path = config.get('net_file', '仿真环境_初赛_1.0/仿真环境-初赛/net.xml')
@@ -86,6 +94,12 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self.vehicle_travel_times = {}  # {vehicle_id: {'start': step, 'end': step}}
         self.vehicle_departure_times = {}  # {vehicle_id: departure_step}
 
+        # ✅ 新增：动态ICV管理状态
+        self.current_icv_ids = set()  # 当前ICV车辆集合
+        self.icv_scores = {}  # 当前ICV的重要性评分 {veh_id: score}
+        self.icv_selection_step = 0  # 上次ICV选择的step
+        self.icv_reevaluate_interval = 10  # 每10步重新评估一次ICV组成
+
         # 性能指标
         self.performance_metrics = {
             'avg_speed': 0.0,
@@ -110,6 +124,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         }
         self.vehicle_travel_times = {}
         self.vehicle_departure_times = {}
+
+        # ✅ 重置动态ICV状态
+        self.current_icv_ids = set()
+        self.icv_scores = {}
+        self.icv_selection_step = 0
 
         return obs
 
@@ -163,18 +182,52 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         vehicle_states = {}
         valid_vehicle_ids = []
 
-        # 使用GPU选择ICV（如果可用）
+        # ✅ 智能ICV选择机制（基于规则的影响力评分 + 动态释放）
         control_ratio = self.config.get('control_ratio', 0.25)
         num_icv = max(1, int(len(all_vehicle_ids) * control_ratio))
 
         icv_ids = set()
         if len(all_vehicle_ids) > 0:
-            # 使用GPU进行随机采样（如果可用）
-            icv_indices = torch.randperm(
-                len(all_vehicle_ids),
-                device=self.device
-            )[:num_icv]
-            icv_ids = {all_vehicle_ids[i] for i in icv_indices.cpu().numpy()}
+            # ✅ 动态ICV管理：定期重新评估ICV组成
+            should_reevaluate = (
+                self.current_step == 0 or  # episode开始
+                (self.current_step - self.icv_selection_step) >= self.icv_reevaluate_interval  # 超过间隔
+            )
+
+            if should_reevaluate and len(self.current_icv_ids) > 0:
+                # 动态更新：重新评估并可能释放部分ICV
+                icv_ids = self._dynamic_update_icv(
+                    all_vehicle_ids,
+                    traci_lib,
+                    num_icv
+                )
+            else:
+                # 初始选择或保持不变
+                if len(self.current_icv_ids) == 0:
+                    # 初始选择
+                    icv_ids = self._intelligent_select_icv(
+                        all_vehicle_ids,
+                        traci_lib,
+                        num_icv
+                    )
+                    self.current_icv_ids = icv_ids
+                else:
+                    # 保持当前ICV集合（但需要检查车辆是否还在路网中）
+                    icv_ids = self.current_icv_ids & set(all_vehicle_ids)
+
+                    # 如果ICV数量不足，补充新的
+                    if len(icv_ids) < num_icv:
+                        additional_needed = num_icv - len(icv_ids)
+                        remaining_vehicles = set(all_vehicle_ids) - icv_ids
+                        if remaining_vehicles:
+                            # 从剩余车辆中选择重要性最高的
+                            additional_icv = self._intelligent_select_icv(
+                                list(remaining_vehicles),
+                                traci_lib,
+                                additional_needed
+                            )
+                            icv_ids.update(additional_icv)
+                            self.current_icv_ids = icv_ids
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
@@ -295,6 +348,265 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             return angle
         except:
             return 0.0
+
+    def _compute_vehicle_score(
+        self,
+        veh_id: str,
+        traci_lib,
+        all_vehicle_ids: List[str]
+    ) -> float:
+        """
+        计算单辆车的重要性评分
+
+        评分标准：
+        1. 位置权重：瓶颈区域车辆优先（最多25分）
+        2. 速度权重：速度异常车辆（最多10分）
+        3. 车道权重：关键车道车辆（最多5分）
+        4. 加速度权重：急加减速车辆（5分）
+        5. 跟驰距离权重：跟驰风险（最多8分）
+
+        Args:
+            veh_id: 车辆ID
+            traci_lib: TraCI库实例
+            all_vehicle_ids: 所有车辆ID列表（用于前车查询）
+
+        Returns:
+            重要性评分（0-53分）
+        """
+        score = 0.0
+
+        try:
+            # 获取车辆基本信息
+            lane_id = traci_lib.vehicle.getLaneID(veh_id)
+            lane_index = traci_lib.vehicle.getLaneIndex(veh_id)
+            speed = traci_lib.vehicle.getSpeed(veh_id)
+            position = traci_lib.vehicle.getPosition(veh_id)  # (x, y)
+
+            # ========== 1. 位置权重：优先选择瓶颈区域（最多25分） ==========
+            # ✅ 修复：使用真实的s坐标判断是否在瓶颈区域
+            if hasattr(self, 'frenet_system') and self.frenet_system is not None:
+                try:
+                    # 计算Frenet坐标
+                    x, y = position
+                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+
+                    # 获取真实的s坐标
+                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+
+                    # 判断是否在瓶颈区域
+                    in_bottleneck = self.frenet_system.is_in_bottleneck(
+                        s=s,
+                        edge_id=edge_id
+                    )
+
+                    if in_bottleneck:
+                        score += 15.0  # 瓶颈区域车辆优先
+
+                    # ✅ 额外：距离瓶颈越近，权重越高
+                    # 获取瓶颈区域的s范围（如果有的话）
+                    if hasattr(self.frenet_system, 'bottleneck_s_range'):
+                        s_min, s_max = self.frenet_system.bottleneck_s_range.get(edge_id, (0, 0))
+                        if s_max > s_min:
+                            # 计算到瓶颈中心的距离
+                            bottleneck_center = (s_min + s_max) / 2.0
+                            dist_to_bottleneck = abs(s - bottleneck_center)
+                            # 距离越近，分数越高（最高10分）
+                            proximity_score = max(0, 10.0 - dist_to_bottleneck / 100.0)
+                            score += proximity_score
+
+                except Exception as e:
+                    # 如果Frenet坐标计算失败，使用简化的边缘判断
+                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+                    # 简化判断：某些edge_id可能包含瓶颈关键字
+                    is_bottleneck_edge = any(keyword in edge_id.lower()
+                                             for keyword in ['bottleneck', 'ramp', 'merge', 'junction'])
+                    if is_bottleneck_edge:
+                        score += 10.0  # 降低权重，因为不够精确
+            else:
+                # 如果没有Frenet系统，使用简化的边缘判断
+                edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+                is_bottleneck_edge = any(keyword in edge_id.lower()
+                                         for keyword in ['bottleneck', 'ramp', 'merge', 'junction'])
+                if is_bottleneck_edge:
+                    score += 10.0
+
+            # ========== 2. 速度权重：优先选择速度异常的车辆（最多10分） ==========
+            if speed < 5.0:
+                score += 10.0  # 慢速车（可能是拥堵源）
+            elif speed > 20.0:
+                score += 5.0   # 快速车（需要协调）
+
+            # ========== 3. 车道权重：优先选择关键车道（最多5分） ==========
+            # 最外侧车道（index=0）通常是汇流车道
+            if lane_index == 0:
+                score += 5.0
+            elif lane_index == 1:
+                score += 3.0
+            # 中间车道权重较低
+
+            # ========== 4. 加速度权重：优先选择急加减速的车辆（5分） ==========
+            acceleration = traci_lib.vehicle.getAcceleration(veh_id)
+            if abs(acceleration) > 2.0:
+                score += 5.0  # 急加减速（不稳定因素）
+
+            # ========== 5. 跟驰距离权重：优先选择跟驰距离近的车辆（最多8分） ==========
+            # 获取前车信息
+            leader_id = traci_lib.vehicle.getLeader(veh_id, 100.0)
+            if leader_id and leader_id in all_vehicle_ids:
+                leader_speed = traci_lib.vehicle.getSpeed(leader_id)
+                speed_diff = speed - leader_speed
+                if speed_diff < -5.0:  # 比前车慢很多（可能是瓶颈）
+                    score += 8.0
+                elif speed_diff > 5.0:  # 比前车快很多（可能追尾风险）
+                    score += 6.0
+
+        except Exception as e:
+            # 如果获取车辆信息失败，给予最低分数
+            score = 0.0
+
+        return score
+
+    def _dynamic_update_icv(
+        self,
+        all_vehicle_ids: List[str],
+        traci_lib,
+        num_icv: int
+    ) -> set:
+        """
+        ✅ 动态更新ICV集合：释放低重要性车辆，招募高重要性车辆
+
+        工作流程：
+        1. 重新评估当前ICV的重要性评分
+        2. 识别低重要性ICV（评分低于阈值）
+        3. 释放低重要性ICV的名额
+        4. 从非ICV车辆池中招募高重要性车辆
+        5. 更新ICV集合和评分缓存
+
+        Args:
+            all_vehicle_ids: 当前所有车辆ID列表
+            traci_lib: TraCI库实例
+            num_icv: 目标ICV数量
+
+        Returns:
+            更新后的ICV集合
+        """
+        # ========== 1. 重新评估当前ICV的重要性 ==========
+        current_scores = {}
+        icv_still_in_network = set()
+
+        for veh_id in self.current_icv_ids:
+            if veh_id in all_vehicle_ids:
+                # 车辆仍在路网中，重新计算评分
+                score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+                current_scores[veh_id] = score
+                icv_still_in_network.add(veh_id)
+            # else: 车辆已经离开路网，不需要保留
+
+        # ========== 2. 识别低重要性ICV ==========
+        # 阈值设置：如果评分<10分，认为重要性不够，需要释放
+        release_threshold = 10.0
+        low_importance_icvs = {
+            veh_id for veh_id, score in current_scores.items()
+            if score < release_threshold
+        }
+
+        # ========== 3. 释放低重要性ICV ==========
+        remaining_icvs = icv_still_in_network - low_importance_icvs
+
+        # ========== 4. 从非ICV车辆池中招募新高重要性车辆 ==========
+        num_to_replace = num_icv - len(remaining_icvs)
+
+        if num_to_replace > 0:
+            # 候选车辆池：当前不是ICV的车辆
+            non_icv_vehicles = set(all_vehicle_ids) - remaining_icvs
+
+            if non_icv_vehicles:
+                # 计算候选车辆的评分
+                candidate_scores = {}
+                for veh_id in non_icv_vehicles:
+                    score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+                    candidate_scores[veh_id] = score
+
+                # 选择评分最高的K辆车辆
+                sorted_candidates = sorted(
+                    candidate_scores.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+
+                new_icvs = set([veh_id for veh_id, score in sorted_candidates[:num_to_replace]])
+                remaining_icvs.update(new_icvs)
+
+        # ========== 5. 更新状态 ==========
+        self.current_icv_ids = remaining_icvs
+        self.icv_scores = {
+            veh_id: current_scores.get(veh_id, 0)
+            for veh_id in remaining_icvs
+        }
+        self.icv_selection_step = self.current_step
+
+        # ========== 调试信息（可选） ==========
+        if self.current_step % 100 == 0:
+            print(f"[ICV Update] Step {self.current_step}:")
+            print(f"  - Released {len(low_importance_icvs)} low-importance ICVs")
+            print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv}")
+
+            if len(self.icv_scores) > 0:
+                scores_list = list(self.icv_scores.values())
+                print(f"  - ICV scores: min={min(scores_list):.1f}, max={max(scores_list):.1f}, "
+                      f"mean={sum(scores_list)/len(scores_list):.1f}")
+
+        return remaining_icvs
+
+    def _intelligent_select_icv(
+        self,
+        all_vehicle_ids: List[str],
+        traci_lib,
+        num_icv: int
+    ) -> set:
+        """
+        ✅ 智能选择ICV车辆（基于影响力评分）
+
+        优先选择关键车辆：
+        1. 瓶颈区域的车辆（汇流区、减速区）
+        2. 速度异常的车辆（过慢或过快）
+        3. 关键位置的车辆（最外侧车道、上游瓶颈）
+
+        Args:
+            all_vehicle_ids: 所有车辆ID列表
+            traci_lib: TraCI库实例
+            num_icv: 需要选择的ICV数量
+
+        Returns:
+            选中车辆ID的集合
+        """
+        if len(all_vehicle_ids) <= num_icv:
+            # 如果车辆总数少于需要选择的数量，全部选择
+            return set(all_vehicle_ids)
+
+        # 计算每辆车的关键性评分
+        vehicle_scores = {}
+        for veh_id in all_vehicle_ids:
+            score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+            vehicle_scores[veh_id] = score
+
+        # 选择评分最高的K辆车辆
+        sorted_vehicles = sorted(
+            vehicle_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # 取前K辆
+        selected_vehicles = set([veh_id for veh_id, score in sorted_vehicles[:num_icv]])
+
+        # 调试信息（可选）
+        if self.current_step % 100 == 0:  # 每100步打印一次
+            top_scores = [score for _, score in sorted_vehicles[:5]]
+            print(f"[ICV Selection] Selected {len(selected_vehicles)} ICVs out of {len(all_vehicle_ids)} vehicles")
+            print(f"  Top scores: {top_scores}")
+
+        return selected_vehicles
 
     def _compute_competition_global_stats(self, vehicle_states: Dict[str, Dict]) -> np.ndarray:
         """

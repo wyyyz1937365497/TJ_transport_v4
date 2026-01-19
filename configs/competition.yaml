@@ -14,6 +14,19 @@ paths:
   tensorboard_dir: runs
 
 # =============================================================================
+# 比赛专用配置
+# =============================================================================
+competition:
+  # ✅ 奖励权重配置（用于CompetitionSumoEnv）
+  reward_weights:
+    speed_norm: 1.0 / 30.0          # 速度归一化因子（30m/s为最大速度）
+    throughput: 10.0                # 吞吐量权重
+    efficiency_weights: [5.0, 3.0, 2.0]  # 效率权重：[speed, throughput, completion]
+    stability_weight: 0.5           # 稳定性权重（速度方差惩罚）
+    congestion_penalty_weight: 2.0  # 拥堵惩罚权重
+    stopped_penalty_weight: 1.0     # 停车惩罚权重
+
+# =============================================================================
 # 环境配置
 # =============================================================================
 environment:
@@ -118,22 +131,25 @@ training:
   phase2:
     total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
 
-    # ⚡ 性能优化配置（基于性能分析）
-    num_envs: 1  # ✅ 单环境（SUMO CPU密集，多进程开销 > 并行收益）
-    n_steps: 4096  # ✅ 增加rollout步数（2048 → 4096）
-    batch_size: 256  # ✅ 大batch提高GPU利用率（64 → 256）
-    update_epochs: 5  # ✅ 减少epoch避免过拟合（10 → 5）
+    # ⚡ 性能优化配置（⭐ 性能优化版 - 2024更新）
+    num_envs: 4  # ⭐ 增加到4个并行环境（原来是1）
+    n_steps: 1024  # ⭐ 减少到1024步（原来是4096），保持总步数不变
+    batch_size: 512  # ⭐ 增加batch size（原来是256）
+    update_epochs: 10  # ⭐ 增加epoch（原来是5），提高样本利用率
 
     # 学习率
-    learning_rate: 0.0003  # 3e-4
+    learning_rate: 0.0001  # ⭐ 降低到1e-4（稳定训练，因为修改了动作范围）
 
     # PPO超参数
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数
-    clip_epsilon: 0.2  # PPO裁剪参数
-    entropy_coef: 0.01  # 熵系数
+    clip_range: 0.2  # ⭐ PPO裁剪参数（与代码中的clip_epsilon一致）
+    entropy_coef: 0.1  # ⭐ 提高熵系数10倍（0.01→0.1，增强探索）
     value_loss_coef: 0.5  # 价值损失系数
     max_grad_norm: 0.5  # 梯度裁剪
+
+    # KL散度控制
+    target_kl: 0.01  # ⭐ KL散度目标值（用于early stop）
 
     # 增强功能集成
     use_curriculum: true  # 启用课程学习（确保5个级别都能学到，Level 5充分学习）

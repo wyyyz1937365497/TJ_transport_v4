@@ -117,11 +117,11 @@ training:
   phase2:
     total_timesteps: 1500000  # 150万步（5个级别）
 
-    # 性能优化配置
-    num_envs: 2            # 单环境（SUMO CPU密集）
-    n_steps: 2048          # Rollout步数
-    batch_size: 256        # 大batch提高GPU利用率
-    update_epochs: 5       # 减少epoch避免过拟合
+    # 性能优化配置（⭐ 性能优化版）
+    num_envs: 4            # ⭐ 增加到4个并行环境（原来是2）
+    n_steps: 1024          # ⭐ 减少到1024步（原来是2048），保持总步数不变
+    batch_size: 512        # ⭐ 增加batch size（原来是256）
+    update_epochs: 10      # ⭐ 增加epoch（原来是5），提高样本利用率
 
     # 学习率
     learning_rate: 0.0003   # 3e-4

@@ -66,6 +66,10 @@ class GymSumoEnv(gym.Env):
         self.max_steps = config.get('max_steps', DEFAULT_MAX_STEPS)
         self.step_length = config.get('step_length', DEFAULT_STEP_LENGTH)
 
+        # Episode跟踪（用于PPO训练）
+        self._current_episode_reward = 0.0
+        self._current_episode_length = 0
+
         # 设置种子
         if seed is not None:
             self._set_seed(seed)
@@ -110,6 +114,10 @@ class GymSumoEnv(gym.Env):
         if seed is not None:
             self._set_seed(seed)
 
+        # 重置episode跟踪
+        self._current_episode_reward = 0.0
+        self._current_episode_length = 0
+
         # 重置SUMO环境
         observation = self.sumo_env.reset()
 
@@ -135,6 +143,10 @@ class GymSumoEnv(gym.Env):
         # 执行一步
         observation, reward, done, info = self.sumo_env.step(vehicle_actions)
 
+        # 累积episode奖励和长度
+        self._current_episode_reward += reward
+        self._current_episode_length += 1
+
         # 转换为标准格式
         obs = self._format_observation(observation)
 
@@ -142,8 +154,9 @@ class GymSumoEnv(gym.Env):
         terminated = done
         truncated = self.sumo_env.current_step >= self.max_steps
 
-        # 合并info
-        info = self._get_info(observation)
+        # 合并info（当episode结束时添加episode统计）
+        episode_done = terminated or truncated
+        info = self._get_info(observation, done=episode_done)
         info['truncated'] = truncated
 
         return obs, reward, terminated, truncated, info
@@ -235,13 +248,34 @@ class GymSumoEnv(gym.Env):
 
         return flat_obs
 
-    def _get_info(self, observation: Dict) -> Dict:
-        """获取额外信息"""
-        return {
+    def _get_info(self, observation: Dict, done: bool = False) -> Dict:
+        """
+        获取额外信息
+
+        Args:
+            observation: 观测字典
+            done: 是否episode结束（如果是，则返回episode统计）
+        """
+        info = {
             'vehicle_ids': observation.get('vehicle_ids', []),
             'icv_ids': list(observation.get('icv_ids', set())),
-            'step': self.sumo_env.current_step
+            'step': self.sumo_env.current_step,
+            # ✅ 始终返回当前累积的奖励和长度（用于训练监控）
+            'episode_reward': self._current_episode_reward,
+            'episode_length': self._current_episode_length,
         }
+
+        # 如果episode结束，添加episode统计（PPO训练需要）
+        if done:
+            info['episode'] = {
+                'r': self._current_episode_reward,
+                'l': self._current_episode_length,
+            }
+            # 重置episode统计
+            self._current_episode_reward = 0.0
+            self._current_episode_length = 0
+
+        return info
 
     def _set_seed(self, seed: int):
         """设置随机种子"""
