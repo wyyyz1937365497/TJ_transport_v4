@@ -25,234 +25,88 @@ except ImportError:
 from src.env.competition_env import CompetitionSumoEnv
 
 
-@dataclass
-class TrafficTransition:
-    """交通状态转移数据"""
-    vehicle_states: List[Dict]
-    global_stats: np.ndarray
-    icv_ids: set
-    vehicle_ids: List[str]
-    num_vehicles: int
-    s_coords: np.ndarray
-    d_coords: np.ndarray
-    lanes: np.ndarray
-    speeds: np.ndarray
-    accels: np.ndarray
-    angles: np.ndarray
+class WorldModelDataset(torch.utils.data.Dataset):
+    """
+    世界模型训练数据集
 
+    收集真实交通数据用于监督学习预训练
+    """
 
-def _collect_worker(worker_id: int, num_episodes: int, env_config: Dict, max_steps: int = 500) -> Tuple[List, List]:
-    """Worker函数"""
-    # ⭐ 关键：必须在任何PyTorch导入之前设置
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    def __init__(
+        self,
+        env_config: Dict[str, Any],
+        num_episodes: int = 100,
+        steps_per_episode: int = 1000,
+        seed: int = 42
+    ):
+        """
+        Args:
+            env_config: 环境配置
+            num_episodes: 收集的episode数量
+            steps_per_episode: 每个episode的步数
+            seed: 随机种子
+        """
+        self.env_config = env_config
+        self.num_episodes = num_episodes
+        self.steps_per_episode = steps_per_episode
+        self.seed = seed
 
-    # 强制使用CPU
-    import torch
-    torch.cuda.is_available = lambda: False
+        # 数据存储
+        self.observations = []
+        self.next_observations = []
 
-    observations = []
-    next_observations = []
+        print(f"[DATASET] Collecting {num_episodes} episodes...")
+        self._collect_data()
+        print(f"[OK] Dataset collected: {len(self.observations)} samples")
 
-    for ep in range(num_episodes):
-        env = CompetitionSumoEnv(env_config, use_gui=False)
-        try:
+    def _collect_data(self):
+        """使用环境收集数据"""
+        env = CompetitionSumoEnv(config=self.env_config)
+
+        for episode in tqdm(range(self.num_episodes), desc="Collecting data"):
+            # 设置随机种子（如果环境支持）
+            if hasattr(env, 'seed'):
+                env.seed(self.seed + episode)
+
             obs = env.reset()
 
-            for step in range(max_steps):
-                # ⭐ 只存储成对数据
-                obs_trans = _create_transition(obs)
+            for step in range(self.steps_per_episode):
+                # 生成随机动作字典 {vehicle_id: [acceleration, lane_change]}
+                actions = {}
+                if 'vehicles' in obs and 'id' in obs['vehicles']:
+                    vehicle_ids = obs['vehicles']['id']
+                    for i, veh_id in enumerate(vehicle_ids):
+                        # 随机加速度 [-3, 2] m/s²
+                        accel = np.random.uniform(-3.0, 2.0)
+                        # 随机换道概率 [0, 1]
+                        lane_change = np.random.uniform(0, 1)
+                        actions[str(veh_id)] = np.array([accel, lane_change])
 
-                icv_ids = list(obs.get('icv_ids', set()))
-                if len(icv_ids) > 0:
-                    action = {icv_ids[0]: np.random.uniform(-1.0, 1.0, size=2)}
-                else:
-                    action = None
+                # 如果没有车辆，跳过这个step
+                if not actions:
+                    continue
 
-                next_obs_dict, reward, done, info = env.step(action)
-                next_trans = _create_transition(next_obs_dict)
+                next_obs, reward, done, info = env.step(actions)
 
-                # ⭐ 只在不done时存储，确保成对
-                if not done:
-                    observations.append(obs_trans)
-                    next_observations.append(next_trans)
+                # 存储数据
+                self.observations.append(obs)
+                self.next_observations.append(next_obs)
 
                 if done:
                     break
 
-                obs = next_obs_dict
+                obs = next_obs
 
-        except Exception as e:
-            print(f"[WARNING] Worker {worker_id}, Episode {ep}: {e}")
-        finally:
-            env.close()
+        env.close()
 
-    return observations, next_observations
+    def __len__(self):
+        return len(self.observations)
 
-
-def _create_transition(obs: Dict) -> TrafficTransition:
-    """创建交通状态转移对象"""
-    vehicle_states = obs.get('vehicle_states', {})
-    global_stats = obs.get('global_stats', np.zeros(32))
-    icv_ids = obs.get('icv_ids', set())
-    vehicle_ids = obs.get('vehicle_ids', [])
-    num_veh = len(vehicle_ids)
-    
-    s_coords = np.zeros(num_veh)
-    d_coords = np.zeros(num_veh)
-    lanes = np.zeros(num_veh)
-    speeds = np.zeros(num_veh)
-    accels = np.zeros(num_veh)
-    angles = np.zeros(num_veh)
-    
-    for i, veh_id in enumerate(vehicle_ids):
-        state = vehicle_states.get(veh_id, {})
-        s_coords[i] = state.get('s', 0.0)
-        d_coords[i] = state.get('d', 0.0)
-        lanes[i] = state.get('lane_index', 0.0)
-        speeds[i] = state.get('speed', 0.0)
-        accels[i] = state.get('acceleration', 0.0)
-        angles[i] = state.get('angle', 0.0)
-    
-    return TrafficTransition(
-        vehicle_states=list(vehicle_states.values()),
-        global_stats=global_stats,
-        icv_ids=icv_ids,
-        vehicle_ids=vehicle_ids,
-        num_vehicles=num_veh,
-        s_coords=s_coords,
-        d_coords=d_coords,
-        lanes=lanes,
-        speeds=speeds,
-        accels=accels,
-        angles=angles
-    )
-
-
-def _extract_node_features(trans: TrafficTransition) -> torch.Tensor:
-    """提取节点特征"""
-    num_veh = trans.num_vehicles
-    features = np.zeros((num_veh, 9), dtype=np.float32)
-    
-    for i in range(num_veh):
-        features[i, 0] = trans.s_coords[i] / 1000.0
-        features[i, 1] = trans.d_coords[i] / 10.0
-        features[i, 2] = trans.speeds[i] / 30.0
-        features[i, 3] = 0.0
-        features[i, 4] = trans.speeds[i] / 30.0
-        features[i, 5] = trans.accels[i] / 3.0
-        features[i, 6] = trans.lanes[i] / 10.0
-        features[i, 7] = trans.angles[i] / 360.0
-        features[i, 8] = 1.0 if i < len(trans.icv_ids) else 0.0
-    
-    return torch.from_numpy(features)
-
-
-def _build_edges(trans: TrafficTransition, config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-    """构建边"""
-    num_veh = trans.num_vehicles
-    if num_veh <= 1:
-        return (torch.empty((2, 0), dtype=torch.long),
-                torch.empty((0, 4), dtype=torch.float32))
-    
-    graph_config = config.get('model', {}).get('graph', {})
-    interaction_radius = graph_config.get('interaction_radius', 100.0)
-    max_neighbors = graph_config.get('max_neighbors', 8)
-    
-    sources, targets, edge_features_list = [], [], []
-    
-    for i in range(num_veh):
-        s_diff = trans.s_coords - trans.s_coords[i]
-        d_diff = trans.d_coords - trans.d_coords[i]
-        distances = np.sqrt(s_diff**2 + d_diff**2)
-        
-        mask = (distances < interaction_radius) & (distances > 0.1)
-        neighbors = np.where(mask)[0]
-        
-        if len(neighbors) > max_neighbors:
-            sorted_indices = np.argsort(distances[neighbors])[:max_neighbors]
-            neighbors = neighbors[sorted_indices]
-        
-        for j in neighbors:
-            sources.append(i)
-            targets.append(j)
-            edge_feat = np.array([
-                s_diff[j] / 100.0,
-                d_diff[j] / 10.0,
-                distances[j] / 100.0,
-                1.0 if trans.vehicle_ids[j] in trans.icv_ids else 0.0
-            ], dtype=np.float32)
-            edge_features_list.append(edge_feat)
-    
-    if len(sources) == 0:
-        return (torch.empty((2, 0), dtype=torch.long),
-                torch.empty((0, 4), dtype=torch.float32))
-    
-    edge_index = torch.stack([
-        torch.tensor(sources, dtype=torch.long),
-        torch.tensor(targets, dtype=torch.long)
-    ])
-    edge_features = torch.stack([torch.from_numpy(f) for f in edge_features_list])
-    
-    return edge_index, edge_features
-
-
-def _compute_risk_features(trans: TrafficTransition) -> torch.Tensor:
-    """计算风险特征"""
-    num_veh = trans.num_vehicles
-    if num_veh == 0:
-        return torch.zeros((0, 2), dtype=torch.float32)
-    
-    risk1 = np.var(trans.speeds) / 100.0
-    risk2 = np.var(trans.accels) / 10.0
-    
-    risk_features = np.zeros((num_veh, 2), dtype=np.float32)
-    risk_features[:, 0] = risk1
-    risk_features[:, 1] = risk2
-    
-    return torch.from_numpy(risk_features)
-
-
-def _extract_next_speed(next_obs: TrafficTransition, num_veh: int) -> torch.Tensor:
-    """提取下一个时刻的速度"""
-    if num_veh == 0:
-        return torch.zeros((0, 1), dtype=torch.float32)
-    speeds = next_obs.speeds[:num_veh] / 30.0
-    return torch.from_numpy(speeds).unsqueeze(-1).float()
-
-
-def _extract_next_position(next_obs: TrafficTransition, num_veh: int) -> torch.Tensor:
-    """提取下一个时刻的位置"""
-    if num_veh == 0:
-        return torch.zeros((0, 2), dtype=torch.float32)
-    s = next_obs.s_coords[:num_veh] / 1000.0
-    d = next_obs.d_coords[:num_veh] / 10.0
-    positions = np.stack([s, d], axis=1)
-    return torch.from_numpy(positions).float()
-
-
-def _compute_conflict_label(obs: TrafficTransition, next_obs: TrafficTransition) -> torch.Tensor:
-    """计算冲突标签"""
-    # ⭐ 使用min确保车辆数一致
-    num_veh = min(obs.num_vehicles, next_obs.num_vehicles)
-
-    if num_veh == 0:
-        return torch.zeros((0, 1), dtype=torch.float32)
-
-    labels = np.zeros(num_veh, dtype=np.float32)
-    for i in range(num_veh):
-        min_dist = float('inf')
-        for j in range(num_veh):
-            if i == j:
-                continue
-            s_diff = obs.s_coords[i] - obs.s_coords[j]
-            d_diff = obs.d_coords[i] - obs.d_coords[j]
-            dist = np.sqrt(s_diff**2 + d_diff**2)
-            if dist < min_dist:
-                min_dist = dist
-        if min_dist < 5.0:
-            labels[i] = 1.0
-
-    return torch.from_numpy(labels).unsqueeze(-1)
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.observations[idx]).float(),
+            torch.from_numpy(self.next_observations[idx]).float()
+        )
 
 
 class WorldModelTrainer:

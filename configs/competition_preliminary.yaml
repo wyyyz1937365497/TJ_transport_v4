@@ -118,13 +118,13 @@ training:
     total_timesteps: 1500000  # 150万步（5个级别）
 
     # 性能优化配置
-    num_envs: 4            # 单环境（SUMO CPU密集）
+    num_envs: 2            # 单环境（SUMO CPU密集）
     n_steps: 2048          # Rollout步数
     batch_size: 256        # 大batch提高GPU利用率
-    update_epochs: 10      # 增加epoch提高样本利用率
+    update_epochs: 5       # 减少epoch避免过拟合
 
     # 学习率
-    learning_rate: 0.0001   # 降低学习率使策略更新更稳定
+    learning_rate: 0.0003   # 3e-4
 
     # PPO超参数
     gamma: 0.99            # 折扣因子
@@ -140,7 +140,7 @@ training:
     use_failure_bank: false   # 关闭失败案例库（初赛不需要）
 
     # KL散度控制
-    target_kl: 0.05           # 放宽KL阈值（实际值0.3-3.4，0.05是合理目标）
+    target_kl: 0.01           # KL散度目标值
 
 # =============================================================================
 # 课程学习级别 - 初赛5级渐进
