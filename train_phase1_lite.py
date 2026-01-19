@@ -41,8 +41,24 @@ def load_config(config_path: str) -> dict:
 
 def create_environment(config: dict):
     """创建训练环境"""
+    # ✅ 修复：提取 environment 配置并与顶层配置合并
+    # 因为环境代码期望从顶层 config 读取 sumo_config
+    env_config = config.get('environment', {})
+
+    # 将相对路径转换为绝对路径（基于项目根目录）
+    if 'sumo_config' in env_config:
+        import os
+        sumo_config = env_config['sumo_config']
+        if not os.path.isabs(sumo_config):
+            # 转换为绝对路径
+            project_root = Path(__file__).parent.resolve()
+            env_config['sumo_config'] = str(project_root / sumo_config)
+
+    # 合并配置：environment 配置覆盖顶层配置（如果存在）
+    merged_config = {**config, **env_config}
+
     env = GymSumoEnv(
-        config=config,  # ✅ 传递完整的配置字典
+        config=merged_config,
         seed=config.get('seed', 42),
         device=config.get('device', 'cuda:0')
     )
