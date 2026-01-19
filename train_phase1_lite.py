@@ -25,7 +25,7 @@ import argparse
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from src.env.gpu_sumo_env_optimized import CompetitionSumoEnv
+from src.env.competition_env import CompetitionSumoEnv
 from src.models.v5_lightweight import create_lightweight_policy_v5
 from src.training.ocr_rewards import create_ocr_reward_calculator
 from src.env.sparse_controller import create_sparse_controller
