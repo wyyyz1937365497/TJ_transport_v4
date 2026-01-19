@@ -64,51 +64,110 @@ class WorldModelDataset(torch.utils.data.Dataset):
 
     def _collect_data(self):
         """使用环境收集数据"""
-        env = CompetitionSumoEnv(config=self.env_config)
-
         for episode in tqdm(range(self.num_episodes), desc="Collecting data"):
-            # 设置随机种子（如果环境支持）
-            if hasattr(env, 'seed'):
-                env.seed(self.seed + episode)
+            # 每个episode创建新环境（避免状态污染）
+            env = CompetitionSumoEnv(config=self.env_config, use_gui=False)
 
-            obs = env.reset()
+            try:
+                # 设置随机种子（如果环境支持）
+                if hasattr(env, 'seed'):
+                    env.seed(self.seed + episode)
 
-            for step in range(self.steps_per_episode):
-                # 生成随机动作字典 {vehicle_id: [acceleration, lane_change]}
-                actions = {}
-                if 'vehicles' in obs and 'id' in obs['vehicles']:
-                    vehicle_ids = obs['vehicles']['id']
-                    for i, veh_id in enumerate(vehicle_ids):
-                        # 随机加速度 [-3, 2] m/s²
-                        accel = np.random.uniform(-3.0, 2.0)
-                        # 随机换道概率 [0, 1]
-                        lane_change = np.random.uniform(0, 1)
-                        actions[str(veh_id)] = np.array([accel, lane_change])
+                obs = env.reset()
 
-                # 如果没有车辆，跳过这个step
-                if not actions:
-                    continue
+                for step in range(self.steps_per_episode):
+                    # 存储当前观测（在step之前存储）
+                    self.observations.append(obs)
 
-                next_obs, reward, done, info = env.step(actions)
+                    # 生成随机动作字典 {vehicle_id: [acceleration, lane_change]}
+                    actions = {}
+                    # 修正：obs格式是 {'vehicle_ids': [...], 'vehicle_states': {...}}
+                    if 'vehicle_ids' in obs and len(obs['vehicle_ids']) > 0:
+                        vehicle_ids = obs['vehicle_ids']
+                        # 只控制前3辆车（避免所有车辆都做随机动作导致混乱）
+                        for veh_id in vehicle_ids[:3]:
+                            # 随机加速度 [-3, 2] m/s²
+                            accel = np.random.uniform(-3.0, 2.0)
+                            # 随机换道概率 [0, 1]
+                            lane_change = np.random.uniform(0, 1)
+                            actions[str(veh_id)] = np.array([accel, lane_change])
 
-                # 存储数据
-                self.observations.append(obs)
-                self.next_observations.append(next_obs)
+                    # ⭐ 关键修复：即使没有车辆也要调用step()，推进仿真
+                    # 这让SUMO有机会生成新车辆
+                    next_obs, reward, done, info = env.step(actions)
 
-                if done:
-                    break
+                    # 存储下一个观测
+                    self.next_observations.append(next_obs)
 
-                obs = next_obs
+                    if done:
+                        break
 
-        env.close()
+                    obs = next_obs
+
+            except Exception as e:
+                print(f"[WARNING] Episode {episode} failed: {e}")
+            finally:
+                env.close()
 
     def __len__(self):
         return len(self.observations)
 
+    def _obs_to_tensor(self, obs: Dict[str, Any]) -> np.ndarray:
+        """
+        将观测字典转换为numpy数组
+
+        Args:
+            obs: 观测字典
+
+        Returns:
+            扁平化的观测数组
+        """
+        # 提取全局统计特征
+        global_stats = obs.get('global_stats', np.zeros(32))
+
+        # 提取车辆状态并填充到固定大小的数组
+        vehicle_states = obs.get('vehicle_states', {})
+        vehicle_ids = obs.get('vehicle_ids', [])
+
+        # 最多32辆车，每辆车9个特征 (s, d, vs, vd, speed, accel, lane_index, angle, in_bottleneck)
+        max_vehicles = 32
+        vehicle_features = np.zeros((max_vehicles, 9))
+
+        for i, veh_id in enumerate(vehicle_ids[:max_vehicles]):
+            if veh_id in vehicle_states:
+                state = vehicle_states[veh_id]
+                vehicle_features[i] = [
+                    state.get('s', 0.0),
+                    state.get('d', 0.0),
+                    state.get('vs', 0.0),
+                    state.get('vd', 0.0),
+                    state.get('speed', 0.0),
+                    state.get('acceleration', 0.0),
+                    state.get('lane_index', 0.0),
+                    state.get('angle', 0.0),
+                    1.0 if state.get('in_bottleneck', False) else 0.0
+                ]
+
+        # 展平车辆特征 (32 * 9 = 288)
+        vehicle_features_flat = vehicle_features.flatten()
+
+        # 拼接全局统计 (288 + 32 = 320，再加一个step特征 = 321)
+        step_feature = np.array([obs.get('step', 0) / 3600.0])  # 归一化step
+
+        obs_array = np.concatenate([
+            vehicle_features_flat,
+            global_stats,
+            step_feature
+        ])
+
+        return obs_array.astype(np.float32)
+
     def __getitem__(self, idx):
+        obs = self._obs_to_tensor(self.observations[idx])
+        next_obs = self._obs_to_tensor(self.next_observations[idx])
         return (
-            torch.from_numpy(self.observations[idx]).float(),
-            torch.from_numpy(self.next_observations[idx]).float()
+            torch.from_numpy(obs),
+            torch.from_numpy(next_obs)
         )
 
 

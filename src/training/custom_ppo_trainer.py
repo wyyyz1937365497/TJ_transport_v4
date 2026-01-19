@@ -329,10 +329,10 @@ class CustomPPOTrainer:
         收集rollout数据
 
         完整实现，包含：
-- 环境交互
-- Value function prediction
-- Action sampling
-- Data collection
+        - 环境交互
+        - Value function prediction
+        - Action sampling
+        - Data collection
         """
         start_time = time.perf_counter()
 

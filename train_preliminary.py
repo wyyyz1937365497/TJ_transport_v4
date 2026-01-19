@@ -116,6 +116,64 @@ def set_seed(seed: int):
 
 
 # =============================================================================
+# 检查点管理
+# =============================================================================
+def check_existing_checkpoints(config: Dict[str, Any], curriculum_levels: List[Dict]) -> Dict[str, Any]:
+    """
+    检查已有的检查点，自动推断训练状态
+
+    Returns:
+        {
+            'phase1_completed': bool,
+            'phase1_checkpoint': str or None,
+            'completed_levels': List[int],  # 已完成的级别 [1, 2, 3]
+            'next_level': int,  # 下一个要训练的级别（1-6，6表示全部完成）
+            'resume_from_level': int or None  # 可以从哪个级别恢复
+        }
+    """
+    checkpoint_dir = Path(config['paths']['checkpoint_dir']) / 'preliminary'
+
+    # 检查Phase 1
+    phase1_path = checkpoint_dir / 'phase1' / 'world_model_final.pth'
+    phase1_completed = phase1_path.exists()
+
+    # 检查Phase 2各级别
+    completed_levels = []
+    for level_config in curriculum_levels:
+        level = level_config['level']
+        level_checkpoint = checkpoint_dir / f'level{level}' / 'custom_ppo.zip'
+        if level_checkpoint.exists():
+            completed_levels.append(level)
+
+    # 推断下一个要训练的级别
+    if completed_levels:
+        next_level = max(completed_levels) + 1
+    else:
+        next_level = 1
+
+    # 检查是否可以恢复（需要上一级别的检查点）
+    resume_from_level = None
+    if next_level <= len(curriculum_levels):
+        if next_level == 1:
+            # Level 1需要Phase 1完成
+            if phase1_completed:
+                resume_from_level = 1
+        else:
+            # Level 2-5需要前一级别完成
+            if (next_level - 1) in completed_levels:
+                resume_from_level = next_level
+
+    return {
+        'phase1_completed': phase1_completed,
+        'phase1_checkpoint': str(phase1_path) if phase1_completed else None,
+        'completed_levels': completed_levels,
+        'next_level': next_level if next_level <= len(curriculum_levels) else None,
+        'resume_from_level': resume_from_level,
+        'all_completed': len(completed_levels) == len(curriculum_levels)
+    }
+
+
+# =============================================================================
 # Phase 1: 世界模型预训练
 # =============================================================================
 def train_phase1(config: Dict[str, Any], device: torch.device):
@@ -233,8 +291,39 @@ def train_phase2_level(
     if level == 1 and phase1_checkpoint is not None:
         print(f"[CHECKPOINT] 加载Phase 1预训练权重: {phase1_checkpoint}")
         phase1_state = torch.load(phase1_checkpoint, map_location=device)
-        # TODO: 提取并加载GNN和RSSM的权重
-        # 这里需要根据实际的checkpoint格式进行调整
+
+        # 提取模型权重
+        if 'model_state_dict' in phase1_state:
+            pretrained_state_dict = phase1_state['model_state_dict']
+        else:
+            pretrained_state_dict = phase1_state
+
+        # 获取当前策略的state_dict
+        current_state_dict = policy.state_dict()
+
+        # 只加载共享层的权重（perception_layer, prediction_layer, weight_gating）
+        # 过滤掉decision_layer, critic, action_projection等Phase 2特有的层
+        filtered_state_dict = {}
+        for name, param in pretrained_state_dict.items():
+            # 只加载Phase 1训练的层
+            if any(key in name for key in [
+                'perception_layer',      # GNN
+                'prediction_layer',      # RSSM
+                'weight_gating',         # 动态权重门控
+            ]):
+                if name in current_state_dict:
+                    if current_state_dict[name].shape == param.shape:
+                        filtered_state_dict[name] = param
+                        print(f"  [LOAD] {name}: {param.shape}")
+                    else:
+                        print(f"  [SKIP] {name}: shape mismatch ({param.shape} vs {current_state_dict[name].shape})")
+
+        # 加载过滤后的权重
+        if filtered_state_dict:
+            policy.load_state_dict(filtered_state_dict, strict=False)
+            print(f"  [OK] 成功加载 {len(filtered_state_dict)} 个预训练参数")
+        else:
+            print(f"  [WARNING] 没有找到可加载的预训练权重")
 
     # 加载上一级别权重（如果是Level 2-5）
     if prev_checkpoint is not None:
@@ -391,6 +480,18 @@ def main():
         help='计算设备（cuda:0, cpu等），默认使用配置文件中的设置'
     )
 
+    parser.add_argument(
+        '--auto-resume',
+        action='store_true',
+        help='自动从检查点恢复训练（跳过已完成的阶段）'
+    )
+
+    parser.add_argument(
+        '--force-retrain',
+        action='store_true',
+        help='强制重新训练所有阶段（忽略已有检查点）'
+    )
+
     args = parser.parse_args()
 
     # 加载配置
@@ -420,30 +521,81 @@ def main():
     print(f"\n[START] 训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     # ========================================================================
+    # 检查点检测（自动恢复功能）
+    # ========================================================================
+    if args.auto_resume:
+        print("\n" + "="*80)
+        print("[AUTO-RESUME] 检查已有训练进度...")
+        print("="*80)
+
+        checkpoint_status = check_existing_checkpoints(config, curriculum_levels)
+
+        print(f"\n检查点状态：")
+        print(f"  Phase 1: {'✓ 已完成' if checkpoint_status['phase1_completed'] else '✗ 未完成'}")
+        if checkpoint_status['phase1_completed']:
+            print(f"    检查点: {checkpoint_status['phase1_checkpoint']}")
+
+        print(f"\n  Phase 2 课程学习:")
+        for level in range(1, len(curriculum_levels) + 1):
+            status = '✓' if level in checkpoint_status['completed_levels'] else '✗'
+            print(f"    Level {level}: {status} {'已完成' if level in checkpoint_status['completed_levels'] else '未完成'}")
+
+        if checkpoint_status['all_completed']:
+            print(f"\n[SUCCESS] 所有阶段训练已完成！")
+            print(f"最终模型: {Path(config['paths']['checkpoint_dir']) / 'preliminary' / f'level{len(curriculum_levels)}' / 'custom_ppo.zip'}")
+            return
+
+        # 自动设置start_level
+        if checkpoint_status['resume_from_level'] is not None:
+            args.start_level = checkpoint_status['resume_from_level']
+            print(f"\n[INFO] 自动从Level {args.start_level}恢复训练")
+
+            # 如果start_level > 1，自动跳过Phase 1
+            if args.start_level > 1:
+                args.skip_phase1 = True
+                print(f"[INFO] 自动跳过Phase 1（已完成）")
+        else:
+            print(f"\n[WARNING] 无法自动恢复（检查点不完整）")
+            print(f"[INFO] 将从头开始训练\n")
+            args.start_level = 1
+
+        print("="*80 + "\n")
+
+    # ========================================================================
     # Phase 1: 世界模型预训练（可选）
     # ========================================================================
     phase1_checkpoint = None
 
-    if not args.skip_phase1:
+    if args.force_retrain:
+        print("\n[FORCE] 强制重新训练所有阶段\n")
+
+    if not args.skip_phase1 and not args.force_retrain:
         # 检查是否已有Phase 1检查点
         default_phase1_path = Path(config['paths']['checkpoint_dir']) / 'preliminary' / 'phase1' / 'world_model_final.pth'
 
-        if default_phase1_path.exists() and args.start_level > 1:
+        if default_phase1_path.exists():
             print(f"[CHECKPOINT] 发现已存在的Phase 1检查点: {default_phase1_path}")
-            user_input = input("是否使用已有检查点？[Y/n] ").strip().lower()
-            if user_input != 'n':
-                phase1_checkpoint = str(default_phase1_path)
-                print("[OK] 使用已有Phase 1检查点\n")
-            else:
-                print("[INFO] 将重新训练Phase 1\n")
+            if not args.auto_resume:  # auto_resume模式下已经询问过了
+                user_input = input("是否使用已有检查点？[Y/n] ").strip().lower()
+                if user_input != 'n':
+                    phase1_checkpoint = str(default_phase1_path)
+                    print("[OK] 使用已有Phase 1检查点\n")
+                else:
+                    print("[INFO] 将重新训练Phase 1\n")
 
         if phase1_checkpoint is None:
             phase1_checkpoint = train_phase1(config, device)
-    else:
+    elif not args.skip_phase1 and args.force_retrain:
+        # 强制重新训练Phase 1
+        phase1_checkpoint = train_phase1(config, device)
+    elif args.skip_phase1:
         print("\n[SKIP] 跳过Phase 1训练\n")
         if args.phase1_checkpoint is not None:
             phase1_checkpoint = args.phase1_checkpoint
             print(f"[CHECKPOINT] 使用指定的Phase 1检查点: {phase1_checkpoint}\n")
+        elif args.auto_resume and checkpoint_status['phase1_completed']:
+            phase1_checkpoint = checkpoint_status['phase1_checkpoint']
+            print(f"[CHECKPOINT] 自动使用Phase 1检查点: {phase1_checkpoint}\n")
 
     # ========================================================================
     # Phase 2: PPO课程学习训练
