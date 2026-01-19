@@ -34,54 +34,50 @@ from src.env.vec_env import create_parallel_envs
 from src.training.custom_ppo_trainer import CustomPPOTrainer
 
 
-# 课程级别配置（从配置文件读取）
-CURRICULUM_LEVELS = [
-    {
-        'level': 1,
-        'name': '基础场景',
-        'max_vehicles': 10,
-        'inflow_rate': 800,
-        'icv_ratio': 0.3,
-        'disturbance_level': 0.0,
-        'total_timesteps': 409600,  # ⭐ 100个updates (打牢基础)
-    },
-    {
-        'level': 2,
-        'name': '中等流量',
-        'max_vehicles': 15,
-        'inflow_rate': 1200,
-        'icv_ratio': 0.25,
-        'disturbance_level': 0.2,
-        'total_timesteps': 409600,  # ⭐ 100个updates
-    },
-    {
-        'level': 3,
-        'name': '高流量场景',
-        'max_vehicles': 20,
-        'inflow_rate': 1800,
-        'icv_ratio': 0.25,
-        'disturbance_level': 0.4,
-        'total_timesteps': 409600,  # ⭐ 100个updates
-    },
-    {
-        'level': 4,
-        'name': '极端场景',
-        'max_vehicles': 32,
-        'inflow_rate': 2400,
-        'icv_ratio': 0.15,
-        'disturbance_level': 0.7,
-        'total_timesteps': 655360,  # ⭐ 160个updates (最难场景)
-    },
-    {
-        'level': 5,
-        'name': '赛题场景',
-        'max_vehicles': 32,
-        'inflow_rate': 2000,
-        'icv_ratio': 0.2,
-        'disturbance_level': 0.5,
-        'total_timesteps': 655360,  # ⭐ 160个updates (减少，因基础已打好)
-    },
-]
+def load_curriculum_levels(config: dict):
+    """
+    ✅ 从配置文件加载课程级别配置
+
+    Args:
+        config: 配置字典
+
+    Returns:
+        课程级别列表
+    """
+    curriculum_config = config.get('training', {}).get('curriculum', {})
+
+    if not curriculum_config.get('enabled', False):
+        # 如果未启用课程学习，返回单个默认级别
+        return [{
+            'level': 1,
+            'name': '默认场景',
+            'max_vehicles': config.get('environment', {}).get('max_vehicles', 600),
+            'inflow_rate': config.get('environment', {}).get('inflow_rate', 9900),
+            'icv_ratio': config.get('environment', {}).get('icv_ratio', 0.25),
+            'disturbance_level': config.get('environment', {}).get('disturbance_level', 0.5),
+            'total_timesteps': curriculum_config.get('total_timesteps', 819200),
+        }]
+
+    # 从配置文件读取课程级别
+    levels_config = curriculum_config.get('levels', [])
+
+    if not levels_config:
+        raise ValueError("课程学习已启用，但配置文件中未找到levels配置！请检查configs/competition.yaml中的training.curriculum.levels配置。")
+
+    # 转换为脚本需要的格式
+    curriculum_levels = []
+    for level_config in levels_config:
+        curriculum_levels.append({
+            'level': level_config['level'],
+            'name': level_config['name'],
+            'max_vehicles': level_config['max_vehicles'],
+            'inflow_rate': level_config['inflow_rate'],
+            'icv_ratio': level_config['icv_ratio'],
+            'disturbance_level': level_config['disturbance_level'],
+            'total_timesteps': level_config['total_timesteps'],
+        })
+
+    return curriculum_levels
 
 
 def load_config(config_path: str = 'configs/competition.yaml') -> dict:
@@ -99,10 +95,12 @@ def train_stage(
 ):
     """训练指定阶段"""
 
-    stage_config = CURRICULUM_LEVELS[stage - 1]
+    # ✅ 从配置文件加载课程级别
+    curriculum_levels = load_curriculum_levels(config)
+    stage_config = curriculum_levels[stage - 1]
 
     print("\n" + "=" * 80)
-    print(f"[PHASE 2] Stage {stage}/{len(CURRICULUM_LEVELS)}: {stage_config['name']}")
+    print(f"[PHASE 2] Stage {stage}/{len(curriculum_levels)}: {stage_config['name']}")
     print("=" * 80)
 
     print(f"\n[CONFIG] {stage_config['name']}:")

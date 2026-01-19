@@ -1,0 +1,154 @@
+# 初赛轻量级训练配置 - Phase 1 Lite
+# 核心目标：快速训练（6-8小时），直接优化OCR
+
+# =============================================================================
+# 基础配置
+# =============================================================================
+device: cuda:0
+seed: 42
+
+# 路径配置
+paths:
+  checkpoint_dir: checkpoints/phase1_lite
+  log_dir: logs/phase1_lite
+  tensorboard_dir: runs/phase1_lite
+
+# =============================================================================
+# 环境配置
+# =============================================================================
+environment:
+  # SUMO配置
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
+
+  # 仿真参数（赛题场景）
+  max_vehicles: 600        # 赛题实际车辆数
+  inflow_rate: 9900       # 赛题实际流量
+  icv_ratio: 0.25         # 智能车渗透率
+  max_steps: 1800         # episode长度
+  warmup_steps: 150       # 预热时间
+
+  # 奖励配置（基础环境使用，训练时会用OCR奖励覆盖）
+  rewards:
+    speed_weight: 1.0
+    efficiency_weight: 2.0
+    safety_weight: 3.0
+    intervention_cost_weight: 1.5
+
+# =============================================================================
+# 模型配置 - 轻量级OCR-GNN
+# =============================================================================
+model:
+  # GNN配置
+  gnn:
+    node_dim: 9               # 车辆状态维度
+    hidden_dim: 64            # 隐藏层维度（降低以加速训练）
+    output_dim: 64            # 输出维度
+    num_layers: 3             # GNN层数（3层足够）
+    dropout: 0.1
+    top_k_ratio: 0.05         # ⭐ 只控制5%的车辆（关键优化）
+
+# =============================================================================
+# 训练配置（2个阶段）
+# =============================================================================
+training:
+  # ========== Stage 1: 行为克隆 ==========
+  stage1:
+    num_episodes: 50          # 数据收集episodes
+    epochs: 20                # 训练轮数
+    batch_size: 128           # 批大小
+    learning_rate: 0.001      # 学习率
+
+  # ========== Stage 2: PPO微调 ==========
+  stage2:
+    # 训练步数（大幅降低）
+    total_timesteps: 500000   # 50万步（原方案300万步）
+
+    # 并行环境
+    num_envs: 8               # 增加并行环境数
+    n_steps: 1024             # 每个环境收集的步数
+    batch_size: 256           # PPO batch size
+
+    # 学习率
+    learning_rate: 0.0003     # PPO学习率
+
+    # PPO超参数
+    gamma: 0.99               # 折扣因子
+    gae_lambda: 0.95          # GAE参数
+    clip_range: 0.2           # PPO裁剪参数
+    entropy_coef: 0.01        # 熵系数（降低以提高确定性）
+    value_loss_coef: 0.5      # 价值损失系数
+    max_grad_norm: 0.5        # 梯度裁剪
+
+    # KL散度控制
+    target_kl: 0.015          # KL散度目标
+
+    # 训练轮次
+    update_epochs: 10         # 每次更新使用的epoch数
+
+# =============================================================================
+# OCR奖励配置
+# =============================================================================
+ocr_rewards:
+  # 评测公式权重
+  k_penalty: 0.1             # 干预成本惩罚系数
+  w_efficiency: 0.7          # ⭐ 初赛效率权重（主要目标）
+  w_stability: 0.3           # 稳定性权重
+
+  # 干预成本权重
+  alpha: 1.0                 # 加速度指令权重
+  beta: 5.0                  # 换道指令权重（5倍成本）
+
+  # 基准统计（可选，如果没有则为None）
+  baseline_ocr: null
+  baseline_speed_std: null
+  baseline_avg_accel: null
+
+# =============================================================================
+# 稀疏控制器配置
+# =============================================================================
+sparse_controller:
+  enabled: true
+  controller_type: 'learned'  # 'rule' 或 'learned'
+
+  # 决策间隔（⭐ 关键优化：减少T_total）
+  decision_interval: 10       # 每10步决策一次（而非每步）
+
+  # Top-K参数（⭐ 关键优化：减少N_ICV）
+  top_k_ratio: 0.05          # 只控制5%车辆（vs 原方案25%）
+  min_k: 3                   # 至少控制3辆
+  max_k: 15                  # 最多控制15辆
+
+  # 基于规则的控制器参数（rule模式使用）
+  bottleneck_threshold: 0.7   # 瓶颈区域阈值
+  speed_threshold_ratio: 0.7  # 速度异常阈值
+  merge_zone_start: 0.5      # 汇流区起始位置
+  merge_zone_end: 0.8        # 汇流区结束位置
+  ttc_threshold: 3.0         # TTC阈值
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging:
+  tensorboard: true
+  log_interval: 100
+
+  # 要记录的指标
+  metrics:
+    - episode_reward
+    - episode_length
+    - ocr                    # OD完成率
+    - s_efficiency           # 效率得分
+    - s_stability            # 稳定性得分
+    - c_intervention         # 干预成本
+    - p_intervention         # 惩罚因子
+    - num_controlled_vehicles # 控制车辆数
+
+# =============================================================================
+# 高级配置
+# =============================================================================
+advanced:
+  mixed_precision: true      # 混合精度训练（加速）
+  gradient_checkpointing: false
+  amp: true                  # 自动混合精度

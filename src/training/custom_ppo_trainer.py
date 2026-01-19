@@ -435,7 +435,7 @@ class CustomPPOTrainer:
             return float(np.mean(values))
         return 0.0
 
-    def train(self) -> Dict[str, float]:
+    def train(self, update_idx: int = 0) -> Dict[str, float]:
         """
         更新策略网络
 
@@ -450,6 +450,9 @@ class CustomPPOTrainer:
      - Backward pass
      - Clip gradients
      - Optimizer step
+
+        Args:
+            update_idx: 当前update索引（用于KL早停退火）
 
         Returns:
             训练统计字典
@@ -568,14 +571,21 @@ class CustomPPOTrainer:
                 kl_div = self._compute_kl_penalty(log_probs, old_log_probs)
                 kl_divs.append(kl_div.item())
 
-                # ✅ KL散度早停（如果KL过大，提前终止epoch）
-                # ⭐ 方案A：使用非常宽松的KL阈值，让训练能够正常进行
-                # 设置为10.0，只有在极端情况下才会早停
+                # ✅ KL散度早停（⭐ 用户建议：前40个update禁用，让模型先稳定）
+                # 在训练早期（update_idx < 40），模型参数初始化后会有很大的策略变化
+                # 这是正常现象，不应该触发early stop
                 kl_threshold = 10.0
+                kl_warmup_updates = 40  # 前40个update禁用KL early stop
 
-                if kl_div.item() > kl_threshold:
-                    print(f"[EARLY STOP] KL divergence ({kl_div.item():.4f}) exceeds threshold ({kl_threshold:.4f}). Stopping epoch early.", flush=True)
-                    break
+                if update_idx >= kl_warmup_updates:
+                    # 只有在40个update后才启用KL early stop
+                    if kl_div.item() > kl_threshold:
+                        print(f"[EARLY STOP] Update {update_idx}: KL divergence ({kl_div.item():.4f}) exceeds threshold ({kl_threshold:.4f}). Stopping epoch early.", flush=True)
+                        break
+                else:
+                    # 前40个update：记录但不early stop（如果KL极高，发出警告）
+                    if kl_div.item() > 50.0:
+                        print(f"[KL WARMUP] Update {update_idx}: KL divergence ({kl_div.item():.4f}) is high (expected during warmup)", flush=True)
 
                 # Backward pass
                 backward_start = time.perf_counter()
@@ -778,8 +788,8 @@ class CustomPPOTrainer:
             # Rollout
             rollout_metrics = self.collect_rollouts()
 
-            # Train
-            train_metrics = self.train()
+            # Train（传递update索引用于KL退火）
+            train_metrics = self.train(update_idx=update)
 
             # 更新进度条显示的指标
             steps = (update + 1) * self.n_steps * self.env.num_envs

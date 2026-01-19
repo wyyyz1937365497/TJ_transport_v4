@@ -94,7 +94,34 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self.vehicle_travel_times = {}  # {vehicle_id: {'start': step, 'end': step}}
         self.vehicle_departure_times = {}  # {vehicle_id: departure_step}
 
-        # ✅ 新增：动态ICV管理状态
+        # ✅ 新增：智能ICV管理器（Top-K机制）
+        # 读取智能ICV配置
+        smart_icv_config = config.get('smart_icv', {})
+        use_smart_icv = smart_icv_config.get('enabled', False)
+
+        if use_smart_icv:
+            from src.env.smart_icv_manager import SmartICVManager
+
+            max_vehicles = config.get('max_vehicles', 512)
+
+            self.smart_icv_manager = SmartICVManager(
+                max_vehicles=max_vehicles,
+                default_top_k=smart_icv_config.get('default_top_k', 5),
+                emergency_top_k=smart_icv_config.get('emergency_top_k', 15),
+                elevated_top_k=smart_icv_config.get('elevated_top_k', 10),
+                intervention_threshold=smart_icv_config.get('intervention_threshold', 0.25),
+                decision_interval=smart_icv_config.get('decision_interval', 10),
+                ttc_threshold=smart_icv_config.get('ttc_threshold', 2.0),
+                thw_threshold=smart_icv_config.get('thw_threshold', 1.5),
+            )
+
+            print(f"[OK] 智能ICV管理器已启用（Top-K机制）")
+            print(f"     默认控制: {self.smart_icv_manager.default_top_k} 辆")
+            print(f"     紧急控制: {self.smart_icv_manager.emergency_top_k} 辆")
+        else:
+            self.smart_icv_manager = None
+
+        # 动态ICV管理状态（兼容旧版）
         self.current_icv_ids = set()  # 当前ICV车辆集合
         self.icv_scores = {}  # 当前ICV的重要性评分 {veh_id: score}
         self.icv_selection_step = 0  # 上次ICV选择的step
@@ -183,7 +210,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         valid_vehicle_ids = []
 
         # ✅ 智能ICV选择机制（基于规则的影响力评分 + 动态释放）
-        control_ratio = self.config.get('control_ratio', 0.25)
+        # ✅ 修复：使用icv_ratio而不是control_ratio（配置文件中使用icv_ratio）
+        control_ratio = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25))
         num_icv = max(1, int(len(all_vehicle_ids) * control_ratio))
 
         icv_ids = set()
@@ -217,9 +245,9 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
                     # 如果ICV数量不足，补充新的
                     if len(icv_ids) < num_icv:
-                        additional_needed = num_icv - len(icv_ids)
-                        remaining_vehicles = set(all_vehicle_ids) - icv_ids
-                        if remaining_vehicles:
+                        additional_needed = min(num_icv - len(icv_ids), len(set(all_vehicle_ids) - icv_ids))
+                        if additional_needed > 0:
+                            remaining_vehicles = set(all_vehicle_ids) - icv_ids
                             # 从剩余车辆中选择重要性最高的
                             additional_icv = self._intelligent_select_icv(
                                 list(remaining_vehicles),
@@ -228,6 +256,15 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                             )
                             icv_ids.update(additional_icv)
                             self.current_icv_ids = icv_ids
+
+                    # ✅ 关键修复：确保ICV数量不超过目标值（硬约束）
+                    if len(icv_ids) > num_icv:
+                        # 保留评分最高的num_icv个ICV
+                        icv_scores = {veh_id: self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+                                      for veh_id in icv_ids if veh_id in all_vehicle_ids}
+                        sorted_icvs = sorted(icv_scores.items(), key=lambda x: x[1], reverse=True)
+                        icv_ids = set([veh_id for veh_id, _ in sorted_icvs[:num_icv]])
+                        self.current_icv_ids = icv_ids
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
@@ -538,6 +575,9 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 remaining_icvs.update(new_icvs)
 
         # ========== 5. 更新状态 ==========
+        # ✅ 关键修复：确保ICV数量不超过目标值（硬约束）
+        remaining_icvs = set(list(remaining_icvs)[:num_icv])  # 强制裁剪到num_icv
+
         self.current_icv_ids = remaining_icvs
         self.icv_scores = {
             veh_id: current_scores.get(veh_id, 0)
@@ -549,7 +589,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         if self.current_step % 100 == 0:
             print(f"[ICV Update] Step {self.current_step}:")
             print(f"  - Released {len(low_importance_icvs)} low-importance ICVs")
-            print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv}")
+            print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv} (hard constraint applied)")
 
             if len(self.icv_scores) > 0:
                 scores_list = list(self.icv_scores.values())

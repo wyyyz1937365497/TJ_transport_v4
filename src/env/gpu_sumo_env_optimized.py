@@ -129,15 +129,33 @@ class GPUSumoEnvironmentOptimized:
         cmd = [
             sumo_binary,
             "-c", self.sumo_cfg,
-            "--no-step-log",  # 禁用步骤日志
-            "--no-warnings",   # 禁用警告
+            "--no-step-log",  # 禁用步骤日志（训练优化）
+            "--no-warnings",   # 禁用警告（训练优化）
         ]
 
-        # 如果使用libsumo，添加额外优化选项
+        # ✅ 关键修复：添加与官方SUMO配置文件一致的参数
+        # 确保训练环境与评测环境完全一致
         if LIBSUMO_AVAILABLE:
             cmd.extend([
-                "--collision.check-junctions", "false",  # 禁用路口碰撞检测（加速）
-                "--collision.action", "warn",            # 碰撞时仅警告
+                # ========== 碰撞检测配置（必须与sumo.sumocfg一致）==========
+                "--collision.check-junctions", "true",   # ✅ 启用路口碰撞检测（官方配置）
+                "--collision.action", "warn",             # ✅ 碰撞时警告（官方配置）
+                "--collision.stoptime", "5",              # ✅ 碰撞停止时间5秒（官方配置）
+                "--collision.mingap-factor", "0",         # ✅ 严格碰撞检测（官方配置）
+
+                # ========== 路由处理配置（必须与sumo.sumocfg一致）==========
+                "--time-to-teleport", "600",              # ✅ Teleport等待时间600秒（官方配置）
+                "--ignore-route-errors", "true",          # ✅ 忽略路由错误（官方配置）
+            ])
+        else:
+            # TraCI模式：也添加相同的参数以确保一致性
+            cmd.extend([
+                "--collision.check-junctions", "true",
+                "--collision.action", "warn",
+                "--collision.stoptime", "5",
+                "--collision.mingap-factor", "0",
+                "--time-to-teleport", "600",
+                "--ignore-route-errors", "true",
             ])
 
         return cmd

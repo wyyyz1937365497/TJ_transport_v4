@@ -79,9 +79,13 @@ class GymSumoEnv(gym.Env):
 
     def _define_spaces(self):
         """定义观测空间和动作空间"""
+        # ✅ 使用配置文件中的max_vehicles，而不是MAX_VEHICLES常量
+        # 这样可以支持不同课程级别的不同车辆数
+        max_vehicles = self.config.get('max_vehicles', MAX_VEHICLES)
+
         # 计算总特征维度
         total_features = (
-            MAX_VEHICLES * FEATURES_PER_VEHICLE +  # 车辆状态特征
+            max_vehicles * FEATURES_PER_VEHICLE +  # 车辆状态特征
             32 +                                     # 全局统计特征（比赛专用）
             1                                        # 车辆数量
         )
@@ -95,14 +99,14 @@ class GymSumoEnv(gym.Env):
         )
 
         # 动作空间：控制多个车辆的加速度和换道
-        # 扁平化为 MAX_VEHICLES * 2 维向量以兼容 SB3
+        # 扁平化为 max_vehicles * 2 维向量以兼容 SB3
         self.action_space = gym.spaces.Box(
-            low=np.array([DEFAULT_MAX_DECEL, 0.0] * MAX_VEHICLES, dtype=np.float32),
-            high=np.array([DEFAULT_MAX_ACCEL, 1.0] * MAX_VEHICLES, dtype=np.float32),
+            low=np.array([DEFAULT_MAX_DECEL, 0.0] * max_vehicles, dtype=np.float32),
+            high=np.array([DEFAULT_MAX_ACCEL, 1.0] * max_vehicles, dtype=np.float32),
             dtype=np.float32
         )
 
-        self.max_vehicles = MAX_VEHICLES
+        self.max_vehicles = max_vehicles  # ✅ 保存为实例变量
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """

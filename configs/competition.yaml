@@ -36,12 +36,22 @@ environment:
   net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
   route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.rou.xml
 
-  # 基础参数（会被课程学习覆盖）
-  max_vehicles: 32
-  inflow_rate: 2000
-  icv_ratio: 0.25  # 智能车渗透率（25%，符合赛题）
-  max_steps: 1800  # 缩短episode长度（3600 → 1800），加快训练
-  warmup_steps: 150  # 减少预热时间（300 → 150）
+  # ⚠️ 重要：SUMO仿真参数（由代码自动添加，确保与官方配置文件sumo.sumocfg一致）
+  # 这些参数在gpu_sumo_env_optimized.py中设置，保证训练环境与评测环境完全一致
+  # - collision.check-junctions: true   (启用路口碰撞检测，官方配置)
+  # - collision.action: warn             (碰撞时警告，官方配置)
+  # - collision.stoptime: 5              (碰撞停止时间5秒，官方配置)
+  # - collision.mingap-factor: 0         (严格碰撞检测，官方配置)
+  # - time-to-teleport: 600              (teleport等待时间600秒，官方配置)
+  # - ignore-route-errors: true          (忽略路由错误，官方配置)
+
+  # 基础参数（✅ 2024-01-19 更新：适配MAX_VEHICLES=512）
+  # 注意：这些是默认值，会被课程学习配置覆盖
+  max_vehicles: 600       # ✅ 赛题场景的实际车辆数（400-600辆范围）
+  inflow_rate: 9900       # ✅ 赛题实际流量（正向2900+反向1000+支路6000）
+  icv_ratio: 0.25         # ✅ 智能车渗透率（25%，符合赛题要求）
+  max_steps: 1800         # 缩短episode长度（3600 → 1800），加快训练
+  warmup_steps: 150       # 减少预热时间（300 → 150）
 
   # 奖励配置
   rewards:
@@ -57,30 +67,30 @@ environment:
 # 模型配置 - v4.0架构
 # =============================================================================
 model:
-  # GNN配置
+  # GNN配置（✅ 方案A-阶段1优化：2024-01-19）
   gnn:
     node_dim: 9
     edge_dim: 4
-    hidden_dim: 64
+    hidden_dim: 128        # ✅ 64 → 128 (2倍容量)
     output_dim: 256
-    num_layers: 3
-    heads: 4
+    num_layers: 4          # ✅ 3 → 4 (增加1层)
+    heads: 8               # ✅ 4 → 8 (2倍注意力头)
     dropout: 0.1
 
-  # 世界模型配置
+  # 世界模型配置（✅ 方案A-阶段1优化：2024-01-19）
   world_model:
     hidden_dim: 128
-    latent_dim: 64
-    future_steps: 5
-    num_layers: 2
+    latent_dim: 128        # ✅ 64 → 128 (2倍latent space)
+    future_steps: 10       # ✅ 5 → 10 (预测更远未来)
+    num_layers: 3          # ✅ 2 → 3 (增加1层)
     dropout: 0.1
 
-  # 控制器配置
+  # 控制器配置（✅ 方案A-阶段1优化：2024-01-19）
   controller:
     global_dim: 32
-    hidden_dim: 128
+    hidden_dim: 256        # ✅ 128 → 256 (2倍容量)
     action_dim: 2
-    top_k: 5  # 默认控制5辆车
+    top_k: 10              # ✅ 5 → 10 (控制更多车辆)
     dropout: 0.2
 
   # 图构建配置
@@ -101,6 +111,75 @@ training:
     auto_advance: true  # 自动晋级
     min_episodes_per_level: 10  # 测试模式：每个级别只需10个episodes（约12.6k步）
     min_reward_threshold: -1000  # 测试模式：降低奖励阈值，更容易晋级
+
+    # ========== 课程级别配置（✅ 2024-01-19 更新：适配MAX_VEHICLES=512）==========
+    # 所有训练阶段（Phase 1和Phase 2）使用统一的课程配置
+    # 设计理念：
+    # - max_vehicles: SUMO仿真中的实际车辆数（≤512）
+    # - inflow_rate: 流量输入（veh/h），逐渐增加到赛题场景的9900 veh/h
+    # - icv_ratio: ICV渗透率，赛题要求25%
+    # - episodes: Phase 1数据收集的episodes数（每个级别）
+    # - total_timesteps: Phase 2训练的步数（每个级别）
+    levels:
+      - level: 1
+        name: "基础场景"
+        description: "低流量、高渗透率、无扰动"
+        max_vehicles: 50        # ✅ 从10提升到50
+        inflow_rate: 1200       # ✅ 从800提升到1200
+        icv_ratio: 0.30         # 30% ICV → 15辆可控
+        disturbance_level: 0.0
+        episodes: 100            # Phase 1数据收集episodes
+        total_timesteps: 409600  # Phase 2训练步数（100个updates）
+        success_threshold: 0.7
+        min_reward: -100
+
+      - level: 2
+        name: "中等流量"
+        description: "中等流量、适中渗透率、弱扰动"
+        max_vehicles: 150       # ✅ 从15提升到150
+        inflow_rate: 3000       # ✅ 从1200提升到3000
+        icv_ratio: 0.25         # 25% ICV → 38辆可控
+        disturbance_level: 0.2
+        episodes: 150
+        total_timesteps: 409600  # 100个updates
+        success_threshold: 0.6
+        min_reward: -200
+
+      - level: 3
+        name: "高流量场景"
+        description: "高流量、标准渗透率、中等扰动"
+        max_vehicles: 300       # ✅ 从20提升到300
+        inflow_rate: 6000       # ✅ 从1800提升到6000
+        icv_ratio: 0.25         # 25% ICV → 75辆可控
+        disturbance_level: 0.4
+        episodes: 200
+        total_timesteps: 614400  # 150个updates
+        success_threshold: 0.5
+        min_reward: -300
+
+      - level: 4
+        name: "极端场景"
+        description: "极高流量、低渗透率、强扰动"
+        max_vehicles: 450       # ✅ 从32提升到450
+        inflow_rate: 8000       # ✅ 从2400提升到8000
+        icv_ratio: 0.20         # 20% ICV → 90辆可控（降低渗透率，增加难度）
+        disturbance_level: 0.7
+        episodes: 250
+        total_timesteps: 819200  # 200个updates
+        success_threshold: 0.4
+        min_reward: -400
+
+      - level: 5
+        name: "赛题场景"
+        description: "真实比赛条件、突发扰动"
+        max_vehicles: 600       # ✅ 从32提升到600（达到赛题实际的400-600辆范围）
+        inflow_rate: 9900       # ✅ 从2000提升到9900（赛题实际流量）
+        icv_ratio: 0.25         # 25% ICV → 150辆可控（赛题要求）
+        disturbance_level: 0.5
+        episodes: 300
+        total_timesteps: 819200  # 200个updates
+        success_threshold: 0.5
+        min_reward: -350
 
   # ========== 优先经验回放配置 ==========
   prioritized_replay:
@@ -129,7 +208,14 @@ training:
 
   # ========== Phase 2: 带安全屏障的PPO训练 ==========
   phase2:
-    total_timesteps: 2000000  # 增加到200万步，确保5个级别都能学到，Level 5能充分学习
+    # ✅ 总训练步数（2024-01-19 更新）
+    # Level 1: 409,600步 (100个updates) - 50辆，基础场景
+    # Level 2: 409,600步 (100个updates) - 150辆，中等流量
+    # Level 3: 614,400步 (150个updates) - 300辆，高流量场景
+    # Level 4: 819,200步 (200个updates) - 450辆，极端场景
+    # Level 5: 819,200步 (200个updates) - 600辆，赛题场景
+    # 总计：3,072,000步（约3.07M步）
+    total_timesteps: 3072000
 
     # ⚡ 性能优化配置（⭐ 性能优化版 - 2024更新）
     num_envs: 4  # ⭐ 增加到4个并行环境（原来是1）
@@ -144,7 +230,7 @@ training:
     gamma: 0.99  # 折扣因子
     gae_lambda: 0.95  # GAE参数
     clip_range: 0.2  # ⭐ PPO裁剪参数（与代码中的clip_epsilon一致）
-    entropy_coef: 0.1  # ⭐ 提高熵系数10倍（0.01→0.1，增强探索）
+    entropy_coef: 0.01  # ✅ 降低熵系数（0.1→0.01，提高确定性）
     value_loss_coef: 0.5  # 价值损失系数
     max_grad_norm: 0.5  # 梯度裁剪
 
@@ -221,3 +307,37 @@ advanced:
 
   # 自动混合精度（AMP）
   amp: true  # 启用PyTorch AMP
+
+# =============================================================================
+# 智能ICV管理配置（Top-K机制）⭐ v4.0新增
+# =============================================================================
+smart_icv:
+  enabled: false  # ⭐ 是否启用智能ICV管理（默认关闭，待验证后启用）
+
+  # Top-K参数（按需干预）
+  default_top_k: 5      # 默认控制5辆（平峰期，远小于25%）
+  elevated_top_k: 10    # 升级控制10辆（检测到拥堵风险）
+  emergency_top_k: 15   # 紧急控制15辆（检测到高危事件）
+
+  # 约束条件
+  intervention_threshold: 0.25  # ICV渗透率上限（赛题要求≤30%，我们设置更保守的25%）
+
+  # 决策机制
+  decision_interval: 10  # 默认决策周期（10步）
+  event_triggered: true  # 启用事件触发（检测到高危立即介入）
+
+  # 安全阈值
+  ttc_threshold: 2.0    # TTC高危阈值（秒）- 小于2秒触发紧急制动
+  thw_threshold: 1.5    # THW高危阈值（秒）- 小于1.5秒触发警告
+
+  # 两级安全屏障
+  safety_barrier_level1: true   # Level 1: 规则卫士（每步检查动作范围）
+  safety_barrier_level2: true   # Level 2: 紧急避险（TTC<2.0s强制制动）
+
+  # 影响力评分权重
+  influence_weights:
+    risk_weight: 0.4       # 风险指标（TTC/THW）权重 - 最高优先级
+    location_weight: 0.3   # 位置权重（瓶颈区域）权重
+    speed_weight: 0.15     # 速度权重（异常车辆）权重
+    lane_weight: 0.10      # 车道权重（关键车道）权重
+    dynamic_weight: 0.05   # 动态权重（急加减速）权重

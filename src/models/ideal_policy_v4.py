@@ -216,9 +216,18 @@ class IdealTrafficPolicyV4(nn.Module):
         # 从配置中提取参数
         model_config = config.get('model', {})
         self.top_k = model_config.get('controller', {}).get('top_k', 5)
-        self.max_vehicles = config.get('environment', {}).get('max_vehicles', 32)
+
+        # ✅ 从obs_dim动态推断max_vehicles
+        # obs_dim = max_vehicles * 9 + 32 + 1
+        # 因此：max_vehicles = (obs_dim - 32 - 1) / 9
+        inferred_max_vehicles = (obs_dim - 32 - 1) // 9
+        # 如果推断成功（>0），使用推断值；否则使用config的值
+        self.max_vehicles = inferred_max_vehicles if inferred_max_vehicles > 0 else config.get('environment', {}).get('max_vehicles', 32)
+
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+
+        print(f"[MODEL] max_vehicles={self.max_vehicles} (inferred from obs_dim={obs_dim})")
 
         # ============================================================
         # 1. 感知层：风险敏感GNN
@@ -349,7 +358,8 @@ class IdealTrafficPolicyV4(nn.Module):
         提取特征（完整v4.0架构）
 
         Args:
-            observations: [batch_size, 321] 扁平化观测
+            observations: [batch_size, max_vehicles*9 + 32 + 1] 扁平化观测
+                         例如：max_vehicles=512时，维度为4641（4608+32+1）
 
         Returns:
             features_dict: 包含所有中间特征的字典
@@ -357,12 +367,14 @@ class IdealTrafficPolicyV4(nn.Module):
         batch_size = observations.size(0)
         device = observations.device
 
-        # 解析扁平化观测: [B, 288(vehicles) + 32(global) + 1(num)]
-        vehicle_features = observations[:, :288]  # [B, 288]
-        global_stats = observations[:, 288:320]   # [B, 32]
-        num_vehicles = observations[:, 320:321]   # [B, 1]
+        # 解析扁平化观测: [B, max_vehicles*9(vehicles) + 32(global) + 1(num)]
+        # ✅ self.max_vehicles已经在__init__中从obs_dim动态推断
+        vehicle_dim = self.max_vehicles * 9
+        vehicle_features = observations[:, :vehicle_dim]  # [B, max_vehicles * 9]
+        global_stats = observations[:, vehicle_dim:vehicle_dim + 32]   # [B, 32]
+        num_vehicles = observations[:, vehicle_dim + 32:vehicle_dim + 33]   # [B, 1]
 
-        # 重塑车辆状态: [B, 32, 9]
+        # 重塑车辆状态: [B, max_vehicles, 9]
         vehicle_states_reshaped = vehicle_features.view(
             batch_size, self.max_vehicles, 9
         )
@@ -672,6 +684,11 @@ class IdealTrafficPolicyV4(nn.Module):
         """
         batch_size = observations.size(0)
         device = observations.device
+        obs_dim = observations.size(1)
+
+        # ✅ 动态推断实际的max_vehicles（从观测维度）
+        # 这确保模型能处理不同课程级别的不同车辆数
+        actual_max_vehicles = (obs_dim - 32 - 1) // 9
 
         # 1. 提取特征（完整v4.0架构）
         features_dict = self.extract_features(observations)
@@ -729,44 +746,54 @@ class IdealTrafficPolicyV4(nn.Module):
             # 但我们需要原始的vehicle_states来获取is_icv
 
             # 从observations中提取is_icv标志
-            # vehicle_features: [batch, max_vehicles * 9]
-            vehicle_features = observations[:, :self.max_vehicles * 9]  # [batch, 288]
-            vehicle_features_reshaped = vehicle_features.view(batch_size, self.max_vehicles, 9)  # [batch, max_vehicles, 9]
+            # vehicle_features: [batch, actual_max_vehicles * 9]
+            vehicle_features = observations[:, :actual_max_vehicles * 9]
+            vehicle_features_reshaped = vehicle_features.view(batch_size, actual_max_vehicles, 9)
 
             # 取第一个batch的is_icv标志（索引8）
-            is_icv = vehicle_features_reshaped[0, :, 8]  # [max_vehicles]
+            is_icv_full = vehicle_features_reshaped[0, :, 8]  # [actual_max_vehicles]
 
-            # 使用影响力评分作为动作权重
-            importance = features_dict['importance_scores'][:self.max_vehicles].squeeze(-1)
+            # 使用影响力评分作为动作权重（暂时保存，后面会根据actual_num_vehicles调整）
+            importance = features_dict['importance_scores'][:actual_max_vehicles].squeeze(-1)
         else:
             # 单样本模式
             num_veh = safe_item(features_dict['num_vehicles'])
             vehicle_ids = [f"veh_{i}" for i in range(num_veh)]
 
             # 从observations中提取is_icv标志
-            vehicle_features = observations[:self.max_vehicles * 9].view(self.max_vehicles, 9)
-            is_icv = vehicle_features[:, 8]  # [max_vehicles]
+            vehicle_features = observations[:actual_max_vehicles * 9].view(actual_max_vehicles, 9)
+            is_icv_full = vehicle_features[:, 8]  # [actual_max_vehicles]
 
-            importance = features_dict['importance_scores'][:self.max_vehicles].squeeze(-1)
+            # 使用影响力评分作为动作权重（暂时保存，后面会根据actual_num_vehicles调整）
+            importance = features_dict['importance_scores'][:actual_max_vehicles].squeeze(-1)
+
+        # ✅ 关键修复：使用实际车辆数而不是actual_max_vehicles
+        # node_embeddings的实际节点数可能小于actual_max_vehicles（因为场景中车辆还未完全加载）
+        # 同时也要确保不超过观测空间的维度
+        actual_num_vehicles = min(num_veh, node_embeddings.size(0), actual_max_vehicles)
+
+        # ✅ 根据actual_num_vehicles裁剪is_icv
+        is_icv = is_icv_full[:actual_num_vehicles]
+        importance = importance[:actual_num_vehicles]
 
         # 为所有车辆生成动作（使用重要性加权）
         # 融合特征用于动作生成
         fused = torch.cat([
-            node_embeddings[:self.max_vehicles],
-            z_flow[:self.max_vehicles],
-            z_risk[:self.max_vehicles]
-        ], dim=-1)
+            node_embeddings[:actual_num_vehicles],
+            z_flow[:actual_num_vehicles],
+            z_risk[:actual_num_vehicles]
+        ], dim=-1)  # [actual_num_vehicles, feature_dim]
 
         # 检查是否有NaN或Inf，如果有则替换为零
         fused = torch.nan_to_num(fused, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 检查是否全为零（没有车辆或无效数据）
         if fused.abs().sum() < 1e-6:
-            # ✅ 返回零动作（max_vehicles*2维：512辆车 × 2维动作 = 1024维）
-            action_mean = torch.zeros(batch_size, self.max_vehicles * 2, device=device)
+            # ✅ 返回零动作（actual_max_vehicles*2维）
+            action_mean = torch.zeros(batch_size, actual_max_vehicles * 2, device=device)
         else:
             # ✅ 修复：为每辆车生成2维动作 [acceleration, lane_change]
-            action_features = self.action_projection(fused)  # [max_vehicles, 2]
+            action_features = self.action_projection(fused)  # [actual_num_vehicles, 2]
 
             # 检查投影后的NaN
             action_features = torch.nan_to_num(action_features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -774,7 +801,7 @@ class IdealTrafficPolicyV4(nn.Module):
             # ✅ 修复：将tanh输出[-1,1]映射到正确的动作范围
             # 加速度：[-1, 1] → [-3.0, 2.0]（DEFAULT_MAX_DECEL 到 DEFAULT_MAX_ACCEL）
             # 换道：[-1, 1] → [0.0, 1.0]
-            action_raw = torch.tanh(action_features)  # [max_vehicles, 2]
+            action_raw = torch.tanh(action_features)  # [actual_num_vehicles, 2]
 
             # 第1维：加速度 [-1, 1] → [-3.0, 2.0]
             # 公式：output = (input + 1) / 2 * (high - low) + low
@@ -784,20 +811,20 @@ class IdealTrafficPolicyV4(nn.Module):
             # 公式：output = (input + 1) / 2
             lane_change = (action_raw[:, 1:2] + 1.0) / 2.0
 
-            actions = torch.cat([accel, lane_change], dim=-1)  # [max_vehicles, 2]
+            actions = torch.cat([accel, lane_change], dim=-1)  # [actual_num_vehicles, 2]
 
             # ✅ 修复：应用ICV掩码 - 只为ICV车辆生成有效动作
             # 非ICV车辆的动作置零（环境不会使用这些动作）
-            icv_mask = is_icv.unsqueeze(-1).expand_as(actions)  # [max_vehicles, 2]
+            icv_mask = is_icv.unsqueeze(-1).expand_as(actions)  # [actual_num_vehicles, 2]
             actions = actions * icv_mask
 
             # ✅ 新增：动态干预机制 - 根据干预必要性调整动作强度
             # 计算全局干预必要性评分
             if batch_size > 1:
-                global_stats_batch = observations[:, self.max_vehicles * 9:self.max_vehicles * 9 + 32]  # [batch, 32] (全局统计维度固定32)
+                global_stats_batch = observations[:, actual_max_vehicles * 9:actual_max_vehicles * 9 + 32]  # [batch, 32] (全局统计维度固定32)
                 global_stats_single = global_stats_batch[0:1]  # [1, 32]
             else:
-                global_stats_single = observations[self.max_vehicles * 9:self.max_vehicles * 9 + 32].unsqueeze(0)  # [1, 32] (全局统计维度固定32)
+                global_stats_single = observations[actual_max_vehicles * 9:actual_max_vehicles * 9 + 32].unsqueeze(0)  # [1, 32] (全局统计维度固定32)
 
             # 使用GNN全局嵌入 + 全局统计预测干预必要性
             global_embedding = features_dict['global_embedding']  # [1 or batch, hidden_dim]
@@ -827,43 +854,56 @@ class IdealTrafficPolicyV4(nn.Module):
 
             if self._step_count % 100 == 0:
                 # ✅ 修复：统计实际车辆数（位置非零的车辆）
-                # vehicle_features: [max_vehicles, 9]，第一列是s坐标
+                # vehicle_features: [actual_max_vehicles, 9]，第一列是s坐标
                 if batch_size > 1:
-                    vehicle_features = observations[:, :self.max_vehicles * 9].view(batch_size, self.max_vehicles, 9)
+                    vehicle_features = observations[:, :actual_max_vehicles * 9].view(batch_size, actual_max_vehicles, 9)
                     actual_vehicles = (vehicle_features[0, :, 0].abs() > 1e-6).sum().item()  # s坐标非零
                 else:
-                    vehicle_features = observations[:self.max_vehicles * 9].view(self.max_vehicles, 9)
+                    vehicle_features = observations[:actual_max_vehicles * 9].view(actual_max_vehicles, 9)
                     actual_vehicles = (vehicle_features[:, 0].abs() > 1e-6).sum().item()
 
-                icv_count = is_icv.sum().item()
+                icv_count = is_icv[:actual_num_vehicles].sum().item()
                 print(f"[INTERVENTION] Necessity: {intervention_necessity.item():.3f}, Scale: {intervention_scale:.3f}")
-                print(f"  Actual vehicles: {actual_vehicles}, ICV count: {icv_count} ({icv_count/max(actual_vehicles,1)*100:.1f}%), Obs space: {self.max_vehicles}")
+                print(f"  Actual vehicles: {actual_num_vehicles}/{actual_max_vehicles}, ICV count: {icv_count} ({icv_count/max(actual_num_vehicles,1)*100:.1f}%)")
 
-            # ✅ 修复：展平为max_vehicles*2维向量（512辆车 × 2维动作 = 1024维）
-            # 只取前max_vehicles辆车的动作
-            actions_clipped = actions[:self.max_vehicles, :]  # [max_vehicles, 2] → [512, 2]
+            # ✅ 修复：展平为actual_max_vehicles*2维向量（环境期望的维度）
+            # actions: [actual_num_vehicles, 2]，需要padding到 [actual_max_vehicles, 2]
+            if actual_num_vehicles < actual_max_vehicles:
+                # Padding零
+                actions_padded = torch.zeros(actual_max_vehicles, 2, device=device)
+                actions_padded[:actual_num_vehicles, :] = actions
+                actions_clipped = actions_padded
+            else:
+                actions_clipped = actions[:actual_max_vehicles, :]
 
-            # 展平：[512, 2] → [1024]
-            action_flat = actions_clipped.flatten()  # [1024]
-
-            # 确保是max_vehicles*2维
-            expected_dim = self.max_vehicles * 2
-            if action_flat.size(0) < expected_dim:
-                # 如果不足expected_dim维，padding零
-                action_flat = torch.cat([
-                    action_flat,
-                    torch.zeros(expected_dim - action_flat.size(0), device=device)
-                ])
+            # 展平：[actual_max_vehicles, 2] → [actual_max_vehicles * 2]
+            action_flat = actions_clipped.flatten()
 
             # 为batch中的每个样本复制相同的动作
-            action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, 1024]
+            action_mean = action_flat.unsqueeze(0).expand(batch_size, -1)  # [batch_size, actual_max_vehicles * 2]
 
         # 动作分布（使用可学习的log_std参数）
-        # 确保log_std形状与action_mean匹配
-        if action_mean.dim() == 2:
-            log_std = self.log_std.unsqueeze(0).expand_as(action_mean)
+        # ✅ 动态调整log_std维度以匹配actual_max_vehicles
+        expected_action_dim = actual_max_vehicles * 2
+        actual_action_dim = action_mean.size(-1)
+
+        # 如果self.log_std维度不匹配，进行裁剪或padding
+        if self.log_std.size(0) != expected_action_dim:
+            if self.log_std.size(0) > expected_action_dim:
+                # 裁剪
+                log_std = self.log_std[:expected_action_dim]
+            else:
+                # Padding
+                log_std = torch.cat([
+                    self.log_std,
+                    torch.full((expected_action_dim - self.log_std.size(0),), np.log(0.1), device=self.log_std.device, dtype=self.log_std.dtype)
+                ])
         else:
             log_std = self.log_std
+
+        # 确保log_std形状与action_mean匹配
+        if action_mean.dim() == 2:
+            log_std = log_std.unsqueeze(0).expand_as(action_mean)
 
         # ✅ 数值稳定性：裁剪log_std范围（防止std过大或过小）
         # log_std在[-5, 2]范围内 → std在[0.007, 7.4]范围内
