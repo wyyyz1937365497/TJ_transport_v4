@@ -1,19 +1,35 @@
 """
-训练模块包
+训练增强模块包
 
 包含：
-1. WorldModelTrainer - Phase 1 世界模型预训练
-2. CustomPPOTrainer - Phase 2 PPO训练器（GPU优化）
-3. PhaseCheckpointManager - 阶段检查点管理器
+1. 课程学习（Curriculum Learning）
+2. 优先经验回放（Prioritized Experience Replay）
+3. 失败案例库（Failure Case Bank）
+4. 集成训练管理器
 """
 
-from .world_model_train_v4 import WorldModelTrainer
-from .custom_ppo_trainer import CustomPPOTrainer, GPURolloutBuffer
-from .checkpoint_manager import PhaseCheckpointManager
+from .train_enhancements import (
+    CurriculumManager,
+    PrioritizedReplayBuffer,
+    FailureCaseBank,
+    EnhancedTrainingManager,
+    DifficultyLevel,
+    Transition,
+    FailureCase,
+    create_enhanced_training_manager,
+    save_failure_cases,
+    load_failure_cases
+)
 
 __all__ = [
-    'WorldModelTrainer',
-    'CustomPPOTrainer',
-    'GPURolloutBuffer',
-    'PhaseCheckpointManager',
+    'CurriculumManager',
+    'PrioritizedReplayBuffer',
+    'FailureCaseBank',
+    'EnhancedTrainingManager',
+    'DifficultyLevel',
+    'Transition',
+    'FailureCase',
+    'create_enhanced_training_manager',
+    'save_failure_cases',
+    'load_failure_cases'
 ]
