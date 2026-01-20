@@ -1,4 +1,4 @@
-# 项目结构说明（清理后 v5.0）
+# 项目结构说明（v5.0 清理版）
 
 ## 📁 根目录
 
@@ -20,21 +20,24 @@ TJ_transport_v4/
 ### 🧠 模型 (`src/models/`)
 ```
 src/models/
-├── v5_lightweight.py          # ⭐ v5轻量级OCR-GNN（主模型）
-├── ideal_policy_v4.py         # v4理想策略（遗留，向后兼容）
-└── v4_architecture.py         # v4架构模块（遗留）
+├── __init__.py                 # 模块导出
+└── v5_lightweight.py          # ⭐ v5轻量级OCR-GNN（唯一模型）
 ```
+
+**特点：** 只保留v5轻量级架构，删除所有v4遗留代码
 
 ### 🎮 环境 (`src/env/`)
 ```
 src/env/
-├── competition_env.py         # ⭐ 比赛环境（主环境）
+├── __init__.py                 # 环境模块导出
+├── competition_env.py         # 比赛专用环境（Frenet坐标系）
 ├── gpu_sumo_env_optimized.py  # GPU优化的SUMO环境
+├── gym_wrapper.py             # Gymnasium包装器
 ├── sparse_controller.py       # ⭐ v5稀疏控制器
-├── gym_wrapper.py             # Gym包装器
-├── smart_icv_manager.py       # Smart ICV管理器（遗留，可选）
 └── vec_env.py                # 向量化环境
 ```
+
+**特点：** 删除smart_icv_manager（v4遗留），专注sparse_controller
 
 ### 🏋️ 训练 (`src/training/`)
 ```
@@ -43,9 +46,10 @@ src/training/
 ├── custom_ppo_trainer.py     # PPO训练器
 ├── checkpoint_manager.py     # Checkpoint管理
 ├── train_enhancements.py     # 训练增强功能
-├── world_model_train_v4.py   # v4世界模型训练（遗留）
 └── multi_gpu_utils.py        # 多GPU工具
 ```
+
+**特点：** 删除world_model_train_v4（v4世界模型）
 
 ### 🛠️ 工具 (`src/utils/`)
 ```
@@ -60,9 +64,11 @@ src/utils/
 
 ```
 configs/
-├── phase1_lite.yaml          # ⭐ v5轻量级配置（主配置）
-└── competition.yaml          # v4比赛配置（遗留）
+├── phase1_lite.yaml          # ⭐ v5轻量级配置（唯一配置）
+└── competition_preliminary.yaml  # Preliminary阶段配置（可选）
 ```
+
+**特点：** 删除competition.yaml（v4配置）
 
 ---
 
@@ -70,9 +76,9 @@ configs/
 
 ```
 docs/
-├── 赛题.md                     # ⭐ 赛题背景和挑战
-├── 交通工程赛道-评测公式.md     # ⭐ 官方评测公式
-└── 理想架构.md                 # ⭐ 架构设计思路
+├── 赛题.md                     # 赛题背景和挑战
+├── 交通工程赛道-评测公式.md     # 官方评测公式
+└── 理想架构.md                 # 架构设计思路
 ```
 
 ---
@@ -108,34 +114,51 @@ selected_ids, info = policy.select_vehicles(obs)
 
 | 模块 | 文件数 | 核心文件 |
 |------|--------|----------|
-| **模型** | 3个 | v5_lightweight.py |
+| **模型** | 2个（1个模型） | v5_lightweight.py |
 | **环境** | 6个 | competition_env.py, sparse_controller.py |
 | **训练** | 5个 | ocr_rewards.py, custom_ppo_trainer.py |
 | **工具** | 2个 | helpers.py |
-| **总计** | 19个 | 5个核心文件 |
+| **总计** | 15个 | 3个核心文件 |
+
+**清理前后对比：**
+- 删除了4个v4遗留文件
+- 项目结构更加清晰，专注v5轻量级架构
 
 ---
 
 ## 🔄 版本对比
 
-### v4 遗留文件（保留但标记为遗留）
+### ❌ 已删除的v4文件
+
+**模型：**
 - `src/models/ideal_policy_v4.py` - v4理想策略
 - `src/models/v4_architecture.py` - v4架构模块
-- `src/env/smart_icv_manager.py` - Smart ICV（可选功能）
+
+**环境：**
+- `src/env/smart_icv_manager.py` - Smart ICV（v4遗留）
+
+**训练：**
 - `src/training/world_model_train_v4.py` - 世界模型训练
+
+**配置：**
 - `configs/competition.yaml` - v4配置
 
-**原因：** 向后兼容，避免破坏现有代码
+**原因：** v5架构专为初赛优化，更快、更轻、更高效，不再需要v4的复杂架构
 
-### v5 核心文件（推荐使用）
-- `src/models/v5_lightweight.py` ⭐
-- `src/env/sparse_controller.py` ⭐
-- `src/training/ocr_rewards.py` ⭐
-- `train_phase1_lite.py` ⭐
-- `test_v5_architecture.py` ⭐
-- `configs/phase1_lite.yaml` ⭐
+### ✅ v5 核心文件（推荐使用）
 
-**原因：** 专为初赛优化，更快、更轻、更高效
+- `src/models/v5_lightweight.py` - 轻量级OCR-GNN（23K参数）
+- `src/env/sparse_controller.py` - 稀疏控制器（5%车辆）
+- `src/training/ocr_rewards.py` - OCR奖励计算
+- `train_phase1_lite.py` - 2阶段训练脚本
+- `test_v5_architecture.py` - 综合测试脚本
+- `configs/phase1_lite.yaml` - 优化配置
+
+**优势：**
+- 训练时间：6-8小时（vs v4的3天）
+- 参数量：23K（vs v4的数百万）
+- 直接优化OCR（非速度/吞吐量）
+- 稀疏控制（5%车辆 vs 25%）
 
 ---
 
@@ -155,4 +178,4 @@ selected_ids, info = policy.select_vehicles(obs)
 
 ---
 
-**总结：** 项目结构清晰，核心文件突出，便于维护和扩展。
+**总结：** 项目已完成v4清理，结构清晰，专注v5轻量级架构，便于维护和扩展。

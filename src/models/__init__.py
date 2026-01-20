@@ -1,44 +1,24 @@
 """
-神经网络模型模块（已移除SB3依赖）
+神经网络模型模块（v5轻量级架构）
 
 主要组件：
-- v4_architecture.py: 核心架构模块（GNN、RSSM、控制器等）
-- ideal_policy_v4.py: 独立PPO策略网络（无SB3依赖）
+- v5_lightweight.py: 轻量级OCR-GNN策略网络（专为初赛优化）
 """
 
-from .v4_architecture import (
-    RiskSensitiveGNN,
-    MultiScaleRSSM,
-    EnhancedDynamicWeightGating,
-    EnhancedInfluenceBasedController,
-    LagrangianOptimizer,
-    IdealTrafficControllerV4
-)
-
-from .ideal_policy_v4 import (
-    IdealTrafficPolicyV4,
-    DiagonalGaussianDistribution,
-    compute_risk_features_jit,
-    safe_item,
-    create_policy_v4,
-    create_ideal_traffic_policy_v4  # 兼容工厂函数（返回类）
+from .v5_lightweight import (
+    LightweightGraphConvolution,
+    VehicleInfluenceScorer,
+    LightweightOCRGNN,
+    LightweightPolicyV5,
+    create_lightweight_policy_v5,
 )
 
 # 导出所有模块
 __all__ = [
-    # 核心架构
-    'RiskSensitiveGNN',
-    'MultiScaleRSSM',
-    'EnhancedDynamicWeightGating',
-    'EnhancedInfluenceBasedController',
-    'LagrangianOptimizer',
-    'IdealTrafficControllerV4',
-
-    # PPO策略网络
-    'IdealTrafficPolicyV4',
-    'DiagonalGaussianDistribution',
-    'compute_risk_features_jit',
-    'safe_item',
-    'create_policy_v4',
-    'create_ideal_traffic_policy_v4',  # 兼容性别名
+    # 轻量级OCR-GNN
+    'LightweightGraphConvolution',
+    'VehicleInfluenceScorer',
+    'LightweightOCRGNN',
+    'LightweightPolicyV5',
+    'create_lightweight_policy_v5',
 ]
