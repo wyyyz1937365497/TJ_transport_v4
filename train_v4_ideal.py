@@ -131,8 +131,12 @@ class Phase1WorldModelTrainer:
 
         print(f"[OK] Collected {len(data['observations'])} samples")
         if len(data['observations']) > 0:
-            print(f"    Observation shape: {data['observations'][0].vehicle_states.shape if hasattr(data['observations'][0], 'vehicle_states') else 'N/A'}")
-            print(f"    Next observation shape: {data['next_observations'][0].vehicle_states.shape if hasattr(data['next_observations'][0], 'vehicle_states') else 'N/A'}")
+            obs = data['observations'][0]
+            if hasattr(obs, 'vehicle_states'):
+                # vehicle_states is a list, so we print its length
+                print(f"    Observation info: {len(obs.vehicle_states)} vehicles in first sample")
+            else:
+                print("    Observation info: N/A")
 
         # 3. 训练循环
         optimizer = torch.optim.Adam(
@@ -288,6 +292,11 @@ class Phase1WorldModelTrainer:
 
         # 计算每个worker的episodes
         num_workers = min(self.num_workers, cpu_count())
+        # SAFETY LIMIT: Prevent running out of memory on Mac
+        if num_workers > 4:
+            print(f"[WARNING] Reducing workers from {num_workers} to 4 to save memory on Mac")
+            num_workers = 4
+            
         episodes_per_worker = self.num_episodes // num_workers
         remainder = self.num_episodes % num_workers
 
@@ -475,8 +484,8 @@ class Phase1WorldModelTrainer:
             all_risk_features.append(risk_features)
 
             # 4. 目标值
-            next_speed = self._extract_next_speed(next_trans)
-            next_position = self._extract_next_position(next_trans)
+            next_speed = self._extract_next_speed(obs_trans, next_trans)
+            next_position = self._extract_next_position(obs_trans, next_trans)
             conflict_label = self._compute_conflict_label(obs_trans, next_trans)
 
             all_next_speeds.append(next_speed)
@@ -631,27 +640,56 @@ class Phase1WorldModelTrainer:
 
     def _extract_next_speed(
         self,
-        trans: TrafficTransition
+        obs_trans: TrafficTransition,
+        next_trans: TrafficTransition
     ) -> torch.Tensor:
-        """提取下一步的速度 [N, 1]"""
-        speeds = trans.speeds.copy()
-        speeds = np.maximum(speeds, 0.0)  # 确保非负
+        """提取下一步的速度 [N, 1] - 对齐到当前观测的车辆"""
+        num_veh = obs_trans.num_vehicles
+        if num_veh == 0:
+            return torch.zeros((0, 1), dtype=torch.float32)
 
-        # 归一化
-        speeds_normalized = (speeds / 30.0).astype(np.float32)
+        # 创建查找表
+        next_speed_map = {
+            vid: spd for vid, spd in zip(next_trans.vehicle_ids, next_trans.speeds)
+        }
+        
+        speeds_normalized = np.zeros(num_veh, dtype=np.float32)
+        
+        for i, vid in enumerate(obs_trans.vehicle_ids):
+            if vid in next_speed_map:
+                # 归一化
+                speeds_normalized[i] = max(next_speed_map[vid], 0.0) / 30.0
+            else:
+                # 车辆消失，使用当前速度作为替补(假设不变)或者0
+                # 这里使用当前速度避免产生巨大的MSE Loss
+                speeds_normalized[i] = max(obs_trans.speeds[i], 0.0) / 30.0
 
         return torch.from_numpy(speeds_normalized).unsqueeze(-1)
 
     def _extract_next_position(
         self,
-        trans: TrafficTransition
+        obs_trans: TrafficTransition,
+        next_trans: TrafficTransition
     ) -> torch.Tensor:
-        """提取下一步的位置 [N, 2]"""
-        num_veh = trans.num_vehicles
+        """提取下一步的位置 [N, 2] - 对齐到当前观测的车辆"""
+        num_veh = obs_trans.num_vehicles
+        if num_veh == 0:
+            return torch.zeros((0, 2), dtype=torch.float32)
 
+        # 创建查找表
+        next_s_map = {vid: s for vid, s in zip(next_trans.vehicle_ids, next_trans.s_coords)}
+        next_d_map = {vid: d for vid, d in zip(next_trans.vehicle_ids, next_trans.d_coords)}
+        
         positions = np.zeros((num_veh, 2), dtype=np.float32)
-        positions[:, 0] = trans.s_coords / 1000.0  # s
-        positions[:, 1] = trans.d_coords / 10.0     # d
+        
+        for i, vid in enumerate(obs_trans.vehicle_ids):
+            if vid in next_s_map:
+                positions[i, 0] = next_s_map[vid] / 1000.0
+                positions[i, 1] = next_d_map[vid] / 10.0
+            else:
+                # 消失，使用当前位置
+                positions[i, 0] = obs_trans.s_coords[i] / 1000.0
+                positions[i, 1] = obs_trans.d_coords[i] / 10.0
 
         return torch.from_numpy(positions)
 
@@ -670,8 +708,20 @@ class Phase1WorldModelTrainer:
         if num_veh == 0:
             return torch.zeros((0, 1), dtype=torch.float32)
 
-        # 计算加速度变化
-        accel_change = next_trans.accels[:num_veh] - obs_trans.accels[:num_veh]
+        # 创建下一帧的加速度查找表 {id: accel}
+        next_accel_map = {
+            vid: acc for vid, acc in zip(next_trans.vehicle_ids, next_trans.accels)
+        }
+        
+        accel_change = np.zeros(num_veh, dtype=np.float32)
+        
+        # 对当前的每辆车，查找下一帧的加速度
+        for i, vid in enumerate(obs_trans.vehicle_ids):
+            if vid in next_accel_map:
+                accel_change[i] = next_accel_map[vid] - obs_trans.accels[i]
+            else:
+                # 车辆消失，假设没有急剧变化（或者设为0）
+                accel_change[i] = 0.0
 
         # 急刹检测：加速度变化 < -2.0 m/s²
         conflict_label = (accel_change < -2.0).astype(np.float32)
@@ -1231,12 +1281,20 @@ def load_config(config_path: str) -> Dict[str, Any]:
             config = json.load(f)
 
     # 设置设备
-    if config.get('device', 'cuda') == 'cuda' and not torch.cuda.is_available():
-        print("[WARNING] CUDA not available, using CPU")
-        config['device'] = 'cpu'
-
+    device_req = config.get('device', 'cuda')
+    if device_req == 'cuda' and not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            print("[INFO] CUDA not available, switching to MPS")
+            config['device'] = 'mps'
+        else:
+            print("[WARNING] CUDA/MPS not available, using CPU")
+            config['device'] = 'cpu'
+    
     return config
 
 
 if __name__ == '__main__':
+    # Force line buffering to see output immediately
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
     main()

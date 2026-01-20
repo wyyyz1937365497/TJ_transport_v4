@@ -100,7 +100,15 @@ class RiskSensitiveGNN(nn.Module):
         )
 
         # 层次化池化
-        self.local_pool = nn.Linear(hidden_dim * (num_heads if self.use_pyg else 1), hidden_dim)
+        # GATConv output size = heads * (hidden_dim // heads) ≈ hidden_dim
+        # So input to local_pool should be hidden_dim
+        gnn_output_dim = hidden_dim 
+        if self.use_pyg:
+            # check if hidden_dim is divisible by num_heads to be exact
+            effective_out_channels = hidden_dim // num_heads
+            gnn_output_dim = effective_out_channels * num_heads
+            
+        self.local_pool = nn.Linear(gnn_output_dim, hidden_dim)
         self.global_pool = nn.Linear(hidden_dim, output_dim)
 
         # 关键性评分头（用于Top-K选择）

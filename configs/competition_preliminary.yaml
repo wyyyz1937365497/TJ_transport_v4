@@ -5,9 +5,9 @@
 # =============================================================================
 # 基础设置
 # =============================================================================
-device: cuda  # cuda, cpu, auto
+device: mps # cuda, mps, cpu, auto
 seed: 42
-precision: bf16  # bf16, fp16, fp32 - bf16在精度和速度间平衡
+precision: fp32 # bf16, fp16, fp32 - bf16在精度和速度间平衡
 
 # =============================================================================
 # 项目路径配置
@@ -25,12 +25,12 @@ paths:
 environment:
   # 比赛官方环境配置
   sumo_cfg: 仿真环境_初赛_1.0/仿真环境-初赛/sumo.sumocfg
-  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml  # 用于Frenet系统
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml # 用于Frenet系统
   route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.xml
 
   # 仿真参数
-  step_length: 0.1  # 仿真步长（秒）- 标准SUMO步长
-  max_steps: 3600   # 每个episode最大步数（1小时仿真）
+  step_length: 0.1 # 仿真步长（秒）- 标准SUMO步长
+  max_steps: 1000   # (Debugging) Reduced from 3600 for quick test
 
   # 比赛约束：ICV控制比例严格25%
   control_ratio: 0.25
@@ -39,7 +39,7 @@ environment:
   use_gui: false
 
   # 并行配置（根据硬件调整）
-  num_parallel_workers: 8  # 建议值：4-16，越多越快但内存占用越大
+  num_parallel_workers: 2  # (Debugging) Reduced from 8 for Mac safety
 
 # =============================================================================
 # 模型架构 - 针对初赛优化
@@ -47,46 +47,46 @@ environment:
 model:
   # 图神经网络（GNN）- 交通交互感知
   gnn:
-    node_dim: 9        # 9维Frenet特征（s,d,vs,vd,speed,accel,lane,angle,is_icv）
-    edge_dim: 4        # 边特征（距离、相对速度等）
-    hidden_dim: 64     # 隐藏层维度
-    output_dim: 256    # GNN输出维度
-    num_layers: 3      # GNN层数 - 3层平衡性能和效率
-    heads: 4           # GAT注意力头数
-    dropout: 0.1       # Dropout率
-    use_batch_norm: true  # 使用批归一化提升稳定性
+    node_dim: 9 # 9维Frenet特征（s,d,vs,vd,speed,accel,lane,angle,is_icv）
+    edge_dim: 4 # 边特征（距离、相对速度等）
+    hidden_dim: 64 # 隐藏层维度
+    output_dim: 256 # GNN输出维度
+    num_layers: 3 # GNN层数 - 3层平衡性能和效率
+    heads: 4 # GAT注意力头数
+    dropout: 0.1 # Dropout率
+    use_batch_norm: true # 使用批归一化提升稳定性
 
   # 世界模型（World Model）- 5步前瞻预测
   world_model:
-    input_dim: 256     # GNN输出维度
-    hidden_dim: 128    # LSTM隐藏层维度
-    future_steps: 5    # 预测未来步数 - 5步平衡前瞻性和准确性
-    num_layers: 2      # LSTM层数
-    bidirectional: false  # 单向LSTM
+    input_dim: 256 # GNN输出维度
+    hidden_dim: 128 # LSTM隐藏层维度
+    future_steps: 5 # 预测未来步数 - 5步平衡前瞻性和准确性
+    num_layers: 2 # LSTM层数
+    bidirectional: false # 单向LSTM
     dropout: 0.1
 
   # 影响力驱动控制器（Influence-Driven Controller）
   controller:
-    gnn_dim: 256       # GNN嵌入维度
-    world_dim: 256     # World Model输出维度
-    global_dim: 32     # 全局交通特征维度（32维比赛专用统计）
-    hidden_dim: 128    # 控制器隐藏层维度
-    action_dim: 2      # 动作维度（加速度、换道概率）
-    top_k: 5           # 每步选择Top-5最具影响力的ICV车辆
+    gnn_dim: 256 # GNN嵌入维度
+    world_dim: 256 # World Model输出维度
+    global_dim: 32 # 全局交通特征维度（32维比赛专用统计）
+    hidden_dim: 128 # 控制器隐藏层维度
+    action_dim: 2 # 动作维度（加速度、换道概率）
+    top_k: 5 # 每步选择Top-5最具影响力的ICV车辆
     dropout: 0.2
 
   # 双模式安全屏障（Safety Shield）
   safety:
-    ttc_threshold: 2.0      # 碰撞时间阈值（秒）- 2.0秒平衡安全和效率
-    thw_threshold: 1.5      # 头车时间间隔阈值（秒）
-    max_accel: 2.0          # 最大加速度（m/s²）
-    max_decel: -3.0         # 最大减速度（m/s²）
-    emergency_decel: -5.0   # 紧急减速度（m/s²）
+    ttc_threshold: 2.0 # 碰撞时间阈值（秒）- 2.0秒平衡安全和效率
+    thw_threshold: 1.5 # 头车时间间隔阈值（秒）
+    max_accel: 2.0 # 最大加速度（m/s²）
+    max_decel: -3.0 # 最大减速度（m/s²）
+    emergency_decel: -5.0 # 紧急减速度（m/s²）
 
   # 动态图构建
   graph:
-    interaction_radius: 100.0  # 交互半径（米）- 100米捕捉合流区域交互
-    max_neighbors: 8           # 最大邻居数
+    interaction_radius: 100.0 # 交互半径（米）- 100米捕捉合流区域交互
+    max_neighbors: 8 # 最大邻居数
     lane_change_distance: 50.0 # 变道影响距离（米）
 
 # =============================================================================
@@ -96,64 +96,64 @@ training:
   # 阶段1: World Model预训练 - 学习交通动态模式
   phase1:
     enabled: true
-    num_episodes: 50  # 50 episodes充分学习交通动态
-    epochs: 30        # 30轮训练确保收敛
-    batch_size: 256   # 大批次提升稳定性
-    learning_rate: 1.0e-4  # 标准学习率
+    num_episodes: 10 # (Debug) 50 -> 10 episodes充分学习交通动态
+    epochs: 10 # (Debug) 30 -> 10 轮训练确保收敛
+    batch_size: 64 # (Debug) 256 -> 64 大批次提升稳定性
+    learning_rate: 1.0e-4 # 标准学习率
     weight_decay: 1.0e-5
-    data_collection_timeout: 300  # 数据收集超时（5分钟）
-    num_parallel_workers: 8       # 并行数据收集
-    use_mixed_precision: true     # 启用混合精度加速
-    gradient_clip: 1.0            # 梯度裁剪
-    warmup_epochs: 5              # 学习率warmup
+    data_collection_timeout: 300 # 数据收集超时（5分钟）
+    num_parallel_workers: 2 # (Debug) 8 -> 2 并行数据收集
+    use_mixed_precision: true # 启用混合精度加速
+    gradient_clip: 1.0 # 梯度裁剪
+    warmup_epochs: 5 # 学习率warmup
     phase1_model_path: "checkpoints/competition/world_model_phase1.pth"
 
   # 阶段2: PPO训练 - 主要策略学习阶段
   phase2:
     enabled: true
-    num_envs: 8        # 8个并行环境加速训练
-    total_timesteps: 200000  # 20万步充分训练（提升至10万）
+    num_envs: 8 # 8个并行环境加速训练
+    total_timesteps: 200000 # 20万步充分训练（提升至10万）
     learning_rate: 3.0e-4
-    gamma: 0.99        # 折扣因子 - 0.99重视长期奖励
-    gae_lambda: 0.95   # GAE参数
-    clip_epsilon: 0.2  # PPO裁剪参数
-    entropy_coef: 0.01  # 熵系数 - 0.01平衡探索和利用
-    value_loss_coef: 0.5  # 价值损失系数
-    update_epochs: 10  # 每次更新轮数
-    batch_size: 256    # PPO批次大小（增大提升稳定性）
-    n_steps: 4096      # 每次rollout步数（增大提升样本效率）
+    gamma: 0.99 # 折扣因子 - 0.99重视长期奖励
+    gae_lambda: 0.95 # GAE参数
+    clip_epsilon: 0.2 # PPO裁剪参数
+    entropy_coef: 0.01 # 熵系数 - 0.01平衡探索和利用
+    value_loss_coef: 0.5 # 价值损失系数
+    update_epochs: 10 # 每次更新轮数
+    batch_size: 256 # PPO批次大小（增大提升稳定性）
+    n_steps: 4096 # 每次rollout步数（增大提升样本效率）
     phase2_model_path: "checkpoints/competition/ppo_phase2.pth"
 
   # 阶段3: 端到端微调 - 联合优化所有模块
   phase3:
     enabled: true
-    total_timesteps: 100000  # 10万步精细调优（提升至5万）
-    learning_rate: 1.0e-5    # 小学习率微调
-    freeze_bn: true          # 冻结BatchNorm层保持稳定性
+    total_timesteps: 100000 # 10万步精细调优（提升至5万）
+    learning_rate: 1.0e-5 # 小学习率微调
+    freeze_bn: true # 冻结BatchNorm层保持稳定性
     phase3_model_path: "checkpoints/competition/e2e_phase3.pth"
 
   # 阶段4: 约束优化训练（拉格朗日乘子法）- 满足成本约束
   phase4:
     enabled: true
-    total_timesteps: 100000  # 10万步约束优化（提升至5万）
-    cost_limit: 0.1          # 成本上限 - 严格满足比赛约束
-    learning_rate: 1.0e-4    # 约束优化学习率
-    lagrangian_multiplier_init: 0.1  # 拉格朗日乘子初始值
+    total_timesteps: 100000 # 10万步约束优化（提升至5万）
+    cost_limit: 0.1 # 成本上限 - 严格满足比赛约束
+    learning_rate: 1.0e-4 # 约束优化学习率
+    lagrangian_multiplier_init: 0.1 # 拉格朗日乘子初始值
     final_model_path: "checkpoints/competition/final_model_competition.pth"
 
 # =============================================================================
 # 评估配置 - 比赛格式
 # =============================================================================
 evaluation:
-  num_episodes: 10  # 10个episode评估（更稳定）
-  generate_xlsx: true  # 生成比赛要求的XLSX格式结果
-  save_detailed_logs: true  # 保存详细日志
+  num_episodes: 10 # 10个episode评估（更稳定）
+  generate_xlsx: true # 生成比赛要求的XLSX格式结果
+  save_detailed_logs: true # 保存详细日志
 
 # =============================================================================
 # 可视化与监控
 # =============================================================================
 wandb:
-  enabled: true  # 启用WandB监控训练过程
+  enabled: true # 启用WandB监控训练过程
   project: tj-transport-competition
   entity: null
   run_name: preliminary_v1
@@ -162,7 +162,7 @@ wandb:
 logging:
   log_every_n_steps: 10
   val_check_interval: 100
-  save_top_k: 5  # 保存前5个checkpoint
+  save_top_k: 5 # 保存前5个checkpoint
   profiler: null
 
 # =============================================================================
@@ -170,30 +170,30 @@ logging:
 # =============================================================================
 competition:
   # 启用优化的Frenet坐标系统（基于net.xml）
-  use_accurate_frenet: true  # 精度提升10倍
+  use_accurate_frenet: true # 精度提升10倍
 
   # 启用预测-决策闭环
   enable_prediction_loop: true
 
   # 预测融合权重
   prediction_weights:
-    risk_vehicle_boost: 1.3      # 风险车辆影响力+30%
-    recommended_vehicle_boost: 1.2  # 推荐车辆影响力+20%
-    congestion_threshold: 0.7    # 拥堵概率阈值
-    feature_enhancement_risk: 0.2  # 风险车辆特征+20%
-    feature_enhancement_congestion: 0.1  # 拥堵特征+10%
+    risk_vehicle_boost: 1.3 # 风险车辆影响力+30%
+    recommended_vehicle_boost: 1.2 # 推荐车辆影响力+20%
+    congestion_threshold: 0.7 # 拥堵概率阈值
+    feature_enhancement_risk: 0.2 # 风险车辆特征+20%
+    feature_enhancement_congestion: 0.1 # 拥堵特征+10%
 
   # 瓶颈区域针对性优化
   bottleneck_optimization:
     enabled: true
-    junctions: ["J14", "J15", "J17"]  # 关键瓶颈路口
-    priority_multiplier: 1.5        # 瓶颈区域车辆优先级×1.5
+    junctions: ["J14", "J15", "J17"] # 关键瓶颈路口
+    priority_multiplier: 1.5 # 瓶颈区域车辆优先级×1.5
 
   # 干预成本控制（严格按照比赛标准）
   intervention_cost:
-    alpha: 1.0   # 加速度成本系数
-    beta: 5.0    # 换道成本系数（换道是高风险操作）
-    cost_penalty_factor: 0.01  # 成本惩罚因子
+    alpha: 1.0 # 加速度成本系数
+    beta: 5.0 # 换道成本系数（换道是高风险操作）
+    cost_penalty_factor: 0.01 # 成本惩罚因子
 
 # =============================================================================
 # 训练优化技巧
@@ -202,7 +202,7 @@ training_tricks:
   # 学习率调度
   use_lr_scheduler: true
   lr_scheduler:
-    type: cosine  # cosine, linear, step
+    type: cosine # cosine, linear, step
     warmup_steps: 1000
     min_lr: 1.0e-6
 
@@ -211,7 +211,7 @@ training_tricks:
   max_grad_norm: 1.0
 
   # 经验回放（可选）
-  use_experience_replay: false  # PPO通常不需要
+  use_experience_replay: false # PPO通常不需要
 
   # 课程学习（可选）
   curriculum_learning:

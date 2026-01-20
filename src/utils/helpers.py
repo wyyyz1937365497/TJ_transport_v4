@@ -128,7 +128,7 @@ def get_device(
     获取计算设备
 
     Args:
-        prefer_cuda: 是否优先使用CUDA
+        prefer_cuda: 是否优先使用GPU (CUDA/MPS)
         cuda_id: CUDA设备ID
 
     Returns:
@@ -137,6 +137,9 @@ def get_device(
     if prefer_cuda and torch.cuda.is_available():
         device = torch.device(f'cuda:{cuda_id}')
         print(f"✅ 使用CUDA: {torch.cuda.get_device_name(cuda_id)}")
+    elif prefer_cuda and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print(f"✅ 使用MPS (Apple Silicon)")
     else:
         device = torch.device('cpu')
         print(f"✅ 使用CPU")
