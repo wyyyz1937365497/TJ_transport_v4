@@ -7,10 +7,17 @@
 
 import gymnasium as gym
 import numpy as np
+import multiprocessing as mp
 from typing import Dict, Any, List, Optional
 from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from .gym_wrapper import GymSumoEnv, make_gym_env
+
+# 设置spawn模式以避免CUDA fork问题
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # 已经设置过了
 
 
 class ParallelSumoEnvs:
@@ -66,11 +73,12 @@ class ParallelSumoEnvs:
             环境工厂函数
         """
         def _init():
-            # 创建环境（GPU加速版，SUMO自动分配端口）
+            # 子进程中使用CPU模式，避免CUDA fork问题
+            # 神经网络评分器会自动降级为规则评分
             env = make_gym_env(
                 config=self.config,
                 seed=seed,
-                device=self.device
+                device='cpu'  # 强制使用CPU，避免CUDA fork错误
             )
 
             return env
@@ -98,7 +106,15 @@ class ParallelSumoEnvs:
             vec_env = SyncVectorEnv(env_fns)
         else:
             # 多个环境使用AsyncVectorEnv（并行多进程）
-            vec_env = AsyncVectorEnv(env_fns)
+            # 使用spawn context避免CUDA fork问题
+            # 使用different observation_mode支持动态观测空间
+            ctx = mp.get_context('spawn')
+            vec_env = AsyncVectorEnv(
+                env_fns, 
+                shared_memory=False,
+                context=ctx,
+                observation_mode='different'  # 支持动态观测空间
+            )
 
         # 注意：Gymnasium不使用VecMonitor，而是使用RecordVideo或其他监控方式
         # 如果需要监控，可以添加wrapper

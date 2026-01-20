@@ -54,7 +54,8 @@
       "Bash(bash:*)",
       "Bash(wc:*)",
       "Bash(done:*)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(top:*)"
     ]
   }
 }

@@ -298,14 +298,16 @@ class GraphAttentionScoring(nn.Module):
 
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
-
-        # 多头注意力
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        self.head_dim = hidden_dim // num_heads
+        
+        # Q, K, V投影（支持动态序列长度）
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
 
         # 输出投影
         self.output_proj = nn.Sequential(
@@ -326,14 +328,31 @@ class GraphAttentionScoring(nn.Module):
             node_embeddings: 节点嵌入 [N, hidden_dim]
 
         Returns:
-            scores: 重要性评分 [N, 1]
+            scores: 重要性评分 [N]
         """
-        # 自注意力（每个车辆"关注"所有其他车辆）
-        attn_output, attn_weights = self.attention(
-            node_embeddings,
-            node_embeddings,
-            node_embeddings
-        )
+        N = node_embeddings.size(0)
+        
+        # 投影到Q, K, V
+        Q = self.q_proj(node_embeddings)  # [N, hidden_dim]
+        K = self.k_proj(node_embeddings)  # [N, hidden_dim]
+        V = self.v_proj(node_embeddings)  # [N, hidden_dim]
+        
+        # 重塑为多头 [N, num_heads, head_dim]
+        Q = Q.view(N, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N, head_dim]
+        K = K.view(N, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N, head_dim]
+        V = V.view(N, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N, head_dim]
+        
+        # 计算注意力分数
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [num_heads, N, N]
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # 应用注意力
+        attn_output = torch.matmul(attn_weights, V)  # [num_heads, N, head_dim]
+        
+        # 合并多头
+        attn_output = attn_output.transpose(0, 1).contiguous().view(N, self.hidden_dim)  # [N, hidden_dim]
+        attn_output = self.out_proj(attn_output)
 
         # 聚合注意力信息
         scores = self.output_proj(attn_output)  # [N, 1]

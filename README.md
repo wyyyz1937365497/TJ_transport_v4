@@ -8,6 +8,7 @@
 - ⚡ **[训练快速参考卡](docs/训练快速参考卡.md)** - 一页纸快速参考
 - 🧠 **[智能选择器集成指南](docs/智能选择器集成指南.md)** - 架构设计和集成说明
 - 🏆 **[官方环境优化分析](docs/官方环境优化分析.md)** - 基于官方参数的优化策略
+- 🚄 **[并行数据收集优化说明](docs/并行数据收集优化说明.md)** - 16并行环境加速训练 (NEW)
 
 ## 🎯 核心特性
 
@@ -26,18 +27,22 @@
 
 ## 🚀 快速开始
 
-### 推荐：智能车辆选择训练流程
+### 推荐：智能车辆选择训练流程（16并行环境加速）
 
 ```bash
 # 1. 激活环境
 conda activate sumo
 cd /home/wyyyz/TJ_transport_v4
 
-# 2. Stage 1: 启发式引导 (2-3小时)
-python train_smart_selector.py --config configs/phase1_lite.yaml --device cuda
+# 2. Stage 1 + Stage 2: 完整训练 (~5小时，16并行环境)
+python train_phase1_lite.py --config configs/phase1_lite.yaml --stage all --device cuda
 
-# 3. Stage 2: PPO微调 (3-4小时)
-python train_phase1_lite.py --config configs/phase1_lite.yaml --stage 2 --device cuda
+# 或者分阶段执行：
+# Stage 1: 行为克隆 (1.5-2小时，16并行环境加速)
+python train_phase1_lite.py --config configs/phase1_lite.yaml --stage stage1 --device cuda
+
+# Stage 2: PPO微调 (3-4小时)
+python train_phase1_lite.py --config configs/phase1_lite.yaml --stage stage2 --device cuda
 
 # 4. 评估
 python evaluate.py --config configs/phase1_lite.yaml \

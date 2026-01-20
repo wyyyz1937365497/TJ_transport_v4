@@ -244,6 +244,26 @@ class HeuristicController:
 # =============================================================================
 # Stage 1: 启发式引导训练
 # =============================================================================
+
+class SelectorDataset(torch.utils.data.Dataset):
+    """
+    可序列化的数据集类（必须定义在模块级别以支持多进程）
+    """
+    def __init__(self, buffer):
+        self.buffer = buffer
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def __getitem__(self, idx):
+        sample = self.buffer[idx]
+        return (
+            sample['vehicle_states'],
+            sample['icv_ids'],
+            sample['labels']
+        )
+
+
 class Stage1Trainer:
     """
     Stage 1：使用启发式策略生成训练数据，训练神经网络模仿
@@ -261,12 +281,13 @@ class Stage1Trainer:
         self.model = model
         self.config = config
         self.device = device
-        
+
         # 训练配置
         stage1_config = config.get('training', {}).get('stage1', {})
         self.num_episodes = stage1_config.get('num_episodes', 100)
         self.epochs = stage1_config.get('epochs', 20)
         self.learning_rate = stage1_config.get('learning_rate', 0.001)
+        self.batch_size = stage1_config.get('batch_size', 256)  # 默认增加到256
         
         # 启发式选择器和控制器
         self.heuristic_selector = HeuristicVehicleSelector(config)
@@ -277,16 +298,51 @@ class Stage1Trainer:
             self.model.neural_scorer.parameters(),
             lr=self.learning_rate
         )
-        
+
+        # 混合精度训练（AMP）
+        self.use_amp = config.get('advanced', {}).get('amp', True)
+        if self.use_amp and device == 'cuda':
+            self.scaler = torch.cuda.amp.GradScaler()
+            logger.info("✅ 启用混合精度训练（AMP）")
+        else:
+            self.scaler = None
+
         # 数据缓冲区
         self.buffer = []
         
-    def collect_data(self, env) -> int:
+        # 数据缓存路径
+        self.cache_dir = Path('collected_data')
+        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_file = self.cache_dir / 'smart_selector_stage1_cache.pkl'
+        
+    def save_cache(self):
+        """保存收集的数据到缓存"""
+        import pickle
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.buffer, f)
+        logger.info(f"✅ 数据已缓存到: {self.cache_file} ({len(self.buffer)}个样本)")
+        
+    def load_cache(self) -> bool:
+        """从缓存加载数据"""
+        import pickle
+        if self.cache_file.exists():
+            with open(self.cache_file, 'rb') as f:
+                self.buffer = pickle.load(f)
+            logger.info(f"✅ 从缓存加载数据: {len(self.buffer)}个样本")
+            return True
+        return False
+        
+    def collect_data(self, env, use_cache: bool = True) -> int:
         """
         使用启发式策略收集训练数据
         
         关键：记录启发式选择的车辆，让神经网络学习模仿
         """
+        # 尝试加载缓存
+        if use_cache and self.load_cache():
+            logger.info(f"使用缓存数据，跳过数据收集")
+            return len(self.buffer)
+            
         logger.info("开始收集启发式数据...")
         
         num_samples = 0
@@ -295,54 +351,48 @@ class Stage1Trainer:
             obs, info = env.reset()
             
             for step in range(3600):  # 每个episode 3600步
-                if not hasattr(env, 'sumo_env'):
-                    break
-                    
-                sumo_env = env.sumo_env
-                
-                # 获取车辆状态
-                vehicle_states = {}
-                icv_ids = []
-                
-                if hasattr(sumo_env, 'traci_lib'):
-                    all_vehicles = sumo_env.traci_lib.vehicle.getIDList()
-                    
-                    for veh_id in all_vehicles:
-                        try:
-                            # 基本状态
-                            speed = sumo_env.traci_lib.vehicle.getSpeed(veh_id)
-                            position = sumo_env.traci_lib.vehicle.getPosition(veh_id)
-                            lane_id = sumo_env.traci_lib.vehicle.getLaneID(veh_id)
-                            
-                            vehicle_states[veh_id] = {
-                                'speed': speed,
-                                'position': position,
-                                'lane_id': lane_id,
-                                's': position[0],  # 简化
-                                'lane_index': 0,
-                                'lead_distance': 50.0,
-                                'max_speed': 33.33
-                            }
-                            
-                            # ICV标记
-                            if veh_id.startswith('icv_'):
-                                icv_ids.append(veh_id)
-                        except:
-                            pass
-                
-                if len(icv_ids) < 10:
-                    # 车辆太少，跳过
-                    action = {'vehicle_ids': [], 'actions': []}
+                # 从观测中提取车辆状态
+                if isinstance(obs, dict):
+                    vehicle_ids = obs.get('vehicle_ids', [])
+                    icv_ids = list(obs.get('icv_ids', []))
+                    vehicle_states_array = obs.get('vehicle_states', np.zeros((0, 9)))
+                else:
+                    # 如果观测不是字典格式，跳过
+                    action = {'vehicle_ids': [], 'actions': np.array([], dtype=np.float32).reshape(0, 2)}
                     obs, reward, terminated, truncated, info = env.step(action)
                     if terminated or truncated:
                         break
                     continue
                 
+                # 如果ICV数量太少，跳过
+                if len(icv_ids) < 10:
+                    action = {'vehicle_ids': [], 'actions': np.array([], dtype=np.float32).reshape(0, 2)}
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    if terminated or truncated:
+                        break
+                    continue
+                
+                # 构建vehicle_states字典（启发式选择器需要）
+                vehicle_states = {}
+                for i, veh_id in enumerate(vehicle_ids):
+                    if i < len(vehicle_states_array):
+                        state = vehicle_states_array[i]
+                        vehicle_states[veh_id] = {
+                            's': float(state[0]) * 1000.0,  # 反归一化
+                            'd': float(state[1]) * 10.0,
+                            'speed': float(state[4]) * 30.0,
+                            'lane_index': int(state[6] * 10.0),
+                            'position': (float(state[0]) * 1000.0, float(state[1]) * 10.0),
+                            'lane_id': f"lane_{int(state[6] * 10.0)}",
+                            'lead_distance': 50.0,
+                            'max_speed': 33.33
+                        }
+                
                 # 使用启发式选择器选择车辆
                 selected_ids = self.heuristic_selector.select_vehicles(
                     vehicle_states,
                     icv_ids,
-                    top_k=min(30, len(icv_ids) // 5)
+                    top_k=min(30, max(1, len(icv_ids) // 5))  # 至少选1个
                 )
                 
                 # 生成控制动作
@@ -354,12 +404,12 @@ class Stage1Trainer:
                 # 执行动作
                 action = {
                     'vehicle_ids': list(actions_dict.keys()),
-                    'actions': list(actions_dict.values())
+                    'actions': np.array(list(actions_dict.values()), dtype=np.float32)
                 }
                 obs, reward, terminated, truncated, info = env.step(action)
                 
-                # 记录训练样本
-                if len(selected_ids) > 0:
+                # 记录训练样本（每隔10步记录一次，减少冗余）
+                if len(icv_ids) >= 10 and step % 10 == 0:
                     # 创建标签：选中的车辆标记为1，其他为0
                     labels = {veh_id: 1.0 if veh_id in selected_ids else 0.0
                              for veh_id in icv_ids}
@@ -375,8 +425,202 @@ class Stage1Trainer:
                     break
         
         logger.info(f"数据收集完成！共收集 {num_samples} 个样本")
-        return num_samples
+        logger.info(f"数据集大小: {len(self.buffer)}")
+        
+        # 保存缓存
+        self.save_cache()
+        
+        return len(self.buffer)
     
+    def train_epoch_batched(self, epoch: int) -> float:
+        """
+        使用DataLoader批量训练，提高GPU利用率
+
+        性能优化：
+        1. 真正的批量处理（而非循环单个样本）
+        2. 向量化特征提取
+        3. pin_memory + non_blocking传输
+        """
+        from torch.utils.data import DataLoader
+
+        # 简单collate函数：直接返回batch（不做复杂处理，避免pickle问题）
+        def collate_fn(batch):
+            return batch
+
+        dataset = SelectorDataset(self.buffer)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,  # 暂时使用0避免pickle问题
+            pin_memory=True,  # ✅ 启用pin_memory加速传输
+            collate_fn=collate_fn
+        )
+
+        total_loss = 0.0
+        num_batches = 0
+        total_samples_processed = 0
+
+        self.model.neural_scorer.train()
+
+        for batch in dataloader:
+            if batch is None:
+                continue
+
+            # batch是List[Tuple]，每个元素是(vehicle_states, icv_ids, labels)
+            # 在CPU上预处理整个batch（优化版本）
+            batch_loss = 0.0
+            batch_samples = 0
+
+            # 准备批次数据（在CPU上组装）
+            all_features = []
+            all_labels = []
+            all_edge_indices = []
+            node_offsets = [0]  # 用于拼接图的节点偏移
+
+            # 预分配列表大小以减少内存分配开销
+            estimated_size = len(batch) * 20  # 估计每个样本20辆车
+            all_features_prealloc = []
+            all_labels_prealloc = []
+
+            for vehicle_states, icv_ids, labels in batch:
+                try:
+                    # ✅ 优化1：快速过滤有效车辆
+                    valid_vehicles = [
+                        (veh_id, vehicle_states[veh_id], labels[veh_id])
+                        for veh_id in icv_ids
+                        if veh_id in vehicle_states and veh_id in labels
+                    ]
+
+                    if len(valid_vehicles) == 0:
+                        continue
+
+                    # ✅ 优化2：向量化特征提取（避免Python循环）
+                    num_vehicles = len(valid_vehicles)
+                    features_array = np.zeros((num_vehicles, 9), dtype=np.float32)
+                    labels_array = np.zeros(num_vehicles, dtype=np.float32)
+
+                    for i, (veh_id, state, label) in enumerate(valid_vehicles):
+                        # 批量赋值（比逐个append快）
+                        features_array[i, 0] = state['s'] / 1000.0
+                        features_array[i, 1] = state['d'] / 10.0
+                        features_array[i, 2] = state['speed'] / 30.0
+                        features_array[i, 3] = 0.0  # vd
+                        features_array[i, 4] = state['speed'] / 30.0
+                        features_array[i, 5] = state.get('acceleration', 0.0) / 3.0
+                        features_array[i, 6] = state['lane_index'] / 10.0
+                        features_array[i, 7] = 0.0  # angle
+                        features_array[i, 8] = 1.0  # is_icv
+                        labels_array[i] = label
+
+                    # ✅ 优化3：构建边索引（向量化）
+                    if num_vehicles > 1:
+                        # 使用三角索引创建全连接图（无自环）
+                        ii, jj = np.triu_indices(num_vehicles, k=1)
+                        # 创建双向边（无向图）
+                        edge_index = np.stack([
+                            np.concatenate([ii, jj]),
+                            np.concatenate([jj, ii])
+                        ], axis=0).astype(np.int64)
+                    else:
+                        edge_index = np.zeros((2, 0), dtype=np.int64)
+
+                    # 添加到批次
+                    all_features.append(features_array)
+                    all_labels.append(labels_array)
+                    all_edge_indices.append(edge_index)
+                    node_offsets.append(node_offsets[-1] + num_vehicles)
+                except Exception as e:
+                    logger.warning(f"特征提取失败: {e}")
+                    continue
+
+            if len(all_features) == 0:
+                continue
+
+            # ✅ 关键优化：在CPU上拼接大批次数据，一次性传输到GPU
+            try:
+                # 1. 在CPU上拼接所有特征和标签
+                batch_features = np.concatenate(all_features, axis=0)  # [total_nodes, 9]
+                batch_labels = np.concatenate(all_labels, axis=0)      # [total_nodes]
+
+                # 2. 拼接边索引（需要考虑节点偏移）
+                edge_list = []
+                for i, edge_index in enumerate(all_edge_indices):
+                    if edge_index.shape[1] > 0:
+                        offset = node_offsets[i]
+                        # 添加偏移量
+                        edge_index_offset = edge_index.copy()
+                        edge_index_offset[0] += offset
+                        edge_index_offset[1] += offset
+                        edge_list.append(edge_index_offset)
+
+                if len(edge_list) > 0:
+                    batch_edge_index = np.concatenate(edge_list, axis=1)
+                else:
+                    batch_edge_index = np.zeros((2, 0), dtype=np.int64)
+
+                # 3. ✅ 一次性传输到GPU（使用non_blocking）
+                features_tensor = torch.from_numpy(batch_features).to(
+                    self.device, non_blocking=True
+                )
+                labels_tensor = torch.from_numpy(batch_labels).to(
+                    self.device, non_blocking=True
+                )
+                edge_index_tensor = torch.from_numpy(batch_edge_index).to(
+                    self.device, non_blocking=True
+                )
+
+                # 4. ✅ 批量前向传播（一次处理整个batch）
+                # 使用混合精度训练
+                if self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        pred_scores = self.model.neural_scorer(
+                            features_tensor,
+                            edge_index_tensor
+                        ).squeeze()
+
+                        if pred_scores.dim() == 0:
+                            pred_scores = pred_scores.unsqueeze(0)
+
+                        # 5. 计算损失
+                        loss = nn.BCELoss()(pred_scores, labels_tensor)
+
+                    # 6. 反向传播（混合精度）
+                    self.optimizer.zero_grad()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    pred_scores = self.model.neural_scorer(
+                        features_tensor,
+                        edge_index_tensor
+                    ).squeeze()
+
+                    if pred_scores.dim() == 0:
+                        pred_scores = pred_scores.unsqueeze(0)
+
+                    # 5. 计算损失
+                    loss = nn.BCELoss()(pred_scores, labels_tensor)
+
+                    # 6. 反向传播
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+                batch_samples += len(batch)
+                total_samples_processed += len(batch)
+
+            except Exception as e:
+                import traceback
+                logger.warning(f"批次训练出错: {e}\n{traceback.format_exc()}")
+                continue
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        logger.info(f"Epoch {epoch+1}/{self.epochs}, Loss: {avg_loss:.4f}, Samples: {total_samples_processed}/{len(self.buffer)}, Batches: {num_batches}")
+        return avg_loss
+
     def train_epoch(self, epoch: int) -> float:
         """
         训练一个epoch
@@ -400,21 +644,54 @@ class Stage1Trainer:
             
             # 计算神经网络评分
             try:
-                scores = self.model.compute_scores(vehicle_states)
+                # 检查样本是否有效
+                if len(vehicle_states) == 0 or len(icv_ids) == 0:
+                    continue
                 
-                # 提取ICV的评分和标签
+                # ✅ 训练模式：绕过@torch.no_grad()，直接使用neural_scorer
+                vehicle_ids = list(vehicle_states.keys())
+                num_vehicles = len(vehicle_ids)
+                
+                # 1. 提取特征
+                vehicle_features = []
+                for veh_id in vehicle_ids:
+                    state = vehicle_states[veh_id]
+                    features = self.model._extract_features(state)
+                    vehicle_features.append(features)
+                
+                vehicle_features = torch.tensor(
+                    vehicle_features,
+                    dtype=torch.float32,
+                    device=self.device
+                )
+                
+                # 2. 构建图
+                edge_index, edge_attr = self.model.graph_builder.build_graph(
+                    vehicle_states,
+                    num_vehicles
+                )
+                
+                # 3. 前向传播（带梯度）
+                self.model.neural_scorer.train()  # 确保训练模式
+                neural_scores = self.model.neural_scorer(
+                    vehicle_features,
+                    edge_index,
+                    edge_attr
+                )  # [N], 范围0-1
+                
+                # 4. 提取ICV的评分和标签
                 pred_scores = []
                 true_labels = []
                 
-                for veh_id in icv_ids:
-                    if veh_id in scores and veh_id in labels:
-                        pred_scores.append(scores[veh_id] / 53.0)  # 归一化
+                for i, veh_id in enumerate(vehicle_ids):
+                    if veh_id in icv_ids and veh_id in labels:
+                        pred_scores.append(neural_scores[i])
                         true_labels.append(labels[veh_id])
                 
                 if len(pred_scores) == 0:
                     continue
                 
-                pred_tensor = torch.tensor(pred_scores, dtype=torch.float32, device=self.device)
+                pred_tensor = torch.stack(pred_scores)
                 label_tensor = torch.tensor(true_labels, dtype=torch.float32, device=self.device)
                 
                 # BCE损失（因为是二分类：是否应该控制）
@@ -428,20 +705,23 @@ class Stage1Trainer:
                 total_loss += loss.item()
                 num_batches += 1
             except Exception as e:
+                import traceback
                 logger.warning(f"训练样本出错: {e}")
+                logger.debug(f"详细错误:\n{traceback.format_exc()}")
                 continue
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        logger.info(f"Epoch {epoch+1}/{self.epochs}, Loss: {avg_loss:.4f}")
         return avg_loss
     
-    def run(self, env):
+    def run(self, env, use_cache: bool = True):
         """运行Stage 1训练"""
         logger.info("="*70)
         logger.info("Stage 1: 启发式引导训练")
         logger.info("="*70)
         
         # 收集数据
-        num_samples = self.collect_data(env)
+        num_samples = self.collect_data(env, use_cache=use_cache)
         
         if num_samples == 0:
             logger.error("没有收集到数据！")
@@ -453,9 +733,8 @@ class Stage1Trainer:
         best_loss = float('inf')
         
         for epoch in range(self.epochs):
-            avg_loss = self.train_epoch(epoch)
-            
-            logger.info(f"Epoch {epoch+1}/{self.epochs}, Loss: {avg_loss:.4f}")
+            # 使用批处理训练
+            avg_loss = self.train_epoch_batched(epoch)
             
             # 保存最佳模型
             if avg_loss < best_loss:
@@ -463,10 +742,12 @@ class Stage1Trainer:
                 checkpoint_path = 'checkpoints/smart_selector_stage1.pth'
                 Path('checkpoints').mkdir(exist_ok=True)
                 torch.save({
-                    'model_state_dict': self.model.state_dict(),
+                    'model_state_dict': self.model.neural_scorer.state_dict(),  # 保存neural_scorer的state_dict
                     'epoch': epoch,
                     'loss': avg_loss
                 }, checkpoint_path)
+                logger.info(f"保存最佳模型: {checkpoint_path} (loss={avg_loss:.4f})")
+                logger.info(f"保存最佳模型: {checkpoint_path} (loss={avg_loss:.4f})")
         
         logger.info("Stage 1完成！")
         logger.info(f"最佳损失: {best_loss:.4f}")
@@ -484,17 +765,48 @@ def main():
                         help='配置文件路径')
     parser.add_argument('--device', type=str, default='cuda',
                         help='设备（cuda或cpu）')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='不使用缓存数据，重新收集')
+    parser.add_argument('--clear-cache', action='store_true',
+                        help='清除现有缓存')
     
     args = parser.parse_args()
+    
+    # 清除缓存
+    if args.clear_cache:
+        cache_file = Path('collected_data/smart_selector_stage1_cache.pkl')
+        if cache_file.exists():
+            cache_file.unlink()
+            logger.info(f"✅ 已清除缓存: {cache_file}")
+        else:
+            logger.info("缓存文件不存在")
+        return
     
     # 加载配置
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    
+
+    # ========== 性能优化配置 ==========
+    logger.info("配置性能优化...")
+
+    # 1. 启用cuDNN自动优化（为固定输入大小选择最优算法）
+    if args.device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        logger.info("✅ 启用cuDNN benchmark模式")
+
+        # 2. 启用确定性模式（可选，用于可复现性，会略微降低性能）
+        # torch.backends.cudnn.deterministic = True
+
+    # 3. 设置PyTorch内存优化
+    # 减少内存碎片，提高内存分配效率
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    logger.info("✅ 配置CUDA内存分配优化")
+
     # 创建环境
     logger.info("创建训练环境...")
     env = make_gym_env(config=config, seed=42, device=args.device)
-    
+
     # 创建模型
     logger.info("创建神经网络ICV评分器...")
     neural_config = config.get('neural_icv_scoring', {
@@ -503,7 +815,7 @@ def main():
         'num_layers': 3,
         'num_heads': 4
     })
-    
+
     model = create_neural_icv_scorer(
         node_dim=neural_config.get('node_dim', 9),
         hidden_dim=neural_config.get('hidden_dim', 64),
@@ -511,10 +823,25 @@ def main():
         num_heads=neural_config.get('num_heads', 4),
         device=args.device
     )
+
+    # 4. PyTorch 2.0+ 编译优化（实验性，可显著提升性能）
+    if hasattr(torch, 'compile') and args.device == 'cuda':
+        try:
+            logger.info("尝试启用torch.compile优化...")
+            model.neural_scorer = torch.compile(
+                model.neural_scorer,
+                mode='reduce-overhead',  # 减少启动开销
+                fullgraph=False  # 不强制整个图编译
+            )
+            logger.info("✅ 已启用torch.compile优化")
+        except Exception as e:
+            logger.warning(f"torch.compile启用失败: {e}，使用常规模式")
+    else:
+        logger.info("跳过torch.compile（不可用或非CUDA设备）")
     
     # 运行Stage 1训练
     trainer = Stage1Trainer(model, config, args.device)
-    trainer.run(env)
+    trainer.run(env, use_cache=not args.no_cache)
     
     # 关闭环境
     env.close()

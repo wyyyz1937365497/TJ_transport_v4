@@ -1,3 +1,6 @@
 {
-    "git.allowForcePush": true
+    "git.allowForcePush": true,
+    "chat.tools.terminal.autoApprove": {
+        "nvidia-smi": true
+    }
 }

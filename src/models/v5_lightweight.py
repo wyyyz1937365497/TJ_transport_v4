@@ -37,18 +37,38 @@ class LightweightGraphConvolution(nn.Module):
         nn.init.xavier_uniform_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [N, in_features] 节点特征
-            adj: [N, N] 邻接矩阵（可以是注意力权重）
+            edge_index: [2, E] 边索引（COO格式）
 
         Returns:
             out: [N, out_features] 更新后的节点特征
         """
-        # 消息传递：聚合邻居信息
-        # adj[i, j] 表示节点j对节点i的影响权重
-        messages = torch.bmm(adj.unsqueeze(0), x.unsqueeze(0)).squeeze(0)
+        N = x.size(0)
+        
+        # 如果没有边，直接线性变换
+        if edge_index.shape[1] == 0:
+            out = self.linear(x)
+            out = self.norm(out)
+            out = F.relu(out)
+            out = self.dropout(out)
+            return out
+        
+        # 使用edge_index进行消息传递（scatter-gather）
+        row, col = edge_index  # row: 目标节点, col: 源节点
+        
+        # 聚合邻居消息（简单的求和聚合）
+        messages = torch.zeros_like(x)
+        for i in range(edge_index.shape[1]):
+            src = col[i]
+            dst = row[i]
+            messages[dst] += x[src]  # 将源节点的特征累加到目标节点
+        
+        # 归一化（除以入度）
+        degree = torch.bincount(row, minlength=N).float().clamp(min=1).unsqueeze(1)
+        messages = messages / degree
 
         # 线性变换
         out = self.linear(messages)
