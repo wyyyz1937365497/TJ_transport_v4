@@ -2,6 +2,13 @@
 
 基于世界模型的分层多智能体交通控制系统，专为初赛设计。
 
+## 📚 训练文档
+
+- 🚀 **[完整训练流程指南](docs/完整训练流程指南.md)** - 详细的步骤说明和故障排查
+- ⚡ **[训练快速参考卡](docs/训练快速参考卡.md)** - 一页纸快速参考
+- 🧠 **[智能选择器集成指南](docs/智能选择器集成指南.md)** - 架构设计和集成说明
+- 🏆 **[官方环境优化分析](docs/官方环境优化分析.md)** - 基于官方参数的优化策略
+
 ## 🎯 核心特性
 
 ### 架构设计
@@ -19,12 +26,34 @@
 
 ## 🚀 快速开始
 
-### 安装依赖
+### 推荐：智能车辆选择训练流程
+
+```bash
+# 1. 激活环境
+conda activate sumo
+cd /home/wyyyz/TJ_transport_v4
+
+# 2. Stage 1: 启发式引导 (2-3小时)
+python train_smart_selector.py --config configs/phase1_lite.yaml --device cuda
+
+# 3. Stage 2: PPO微调 (3-4小时)
+python train_phase1_lite.py --config configs/phase1_lite.yaml --stage 2 --device cuda
+
+# 4. 评估
+python evaluate.py --config configs/phase1_lite.yaml \
+  --checkpoint checkpoints/phase1_lite/best_model.pth --num-episodes 20
+```
+
+**详细说明**：参见 [完整训练流程指南](docs/完整训练流程指南.md)
+
+---
+
+### 传统训练流程（v4.0原方案）
+
+#### 安装依赖
 ```bash
 pip install -r requirements.txt
 ```
-
-### 完整训练流程
 
 #### 一键训练（推荐）
 ```bash

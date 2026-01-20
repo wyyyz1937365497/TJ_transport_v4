@@ -42,7 +42,7 @@ from src.models.neural_vehicle_scorer import (
 )
 from src.env.gym_wrapper import make_gym_env
 from src.env.vehicle_scoring import (
-    HeuristicVehicleSelector as BaseHeuristicSelector,
+    RuleBasedScorer,
     UnifiedVehicleScorer,
     create_vehicle_scorer_from_config
 )

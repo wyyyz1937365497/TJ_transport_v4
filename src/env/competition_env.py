@@ -535,9 +535,14 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         # ========== 调试信息（可选） ==========
         if self.current_step % 100 == 0:
+            total_vehicles = len(all_vehicle_ids)
+            icv_ratio = (len(remaining_icvs) / total_vehicles * 100) if total_vehicles > 0 else 0.0
+            target_ratio = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25)) * 100
+            
             print(f"[ICV Update] Step {self.current_step}:")
             print(f"  - Released {len(low_importance_icvs)} low-importance ICVs (Bottom-K)")
-            print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv} (hard constraint applied)")
+            print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv} (target: {target_ratio:.0f}% of total)")
+            print(f"  - Total vehicles: {total_vehicles}, Actual ICV ratio: {icv_ratio:.1f}%")
 
             if len(current_scores) > 0:
                 scores_list = list(current_scores.values())
