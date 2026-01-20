@@ -30,7 +30,7 @@ environment:
 
   # 仿真参数
   step_length: 0.1 # 仿真步长（秒）- 标准SUMO步长
-  max_steps: 1000   # (Debugging) Reduced from 3600 for quick test
+  max_steps: 1000 # (Debugging) Reduced from 3600 for quick test
 
   # 比赛约束：ICV控制比例严格25%
   control_ratio: 0.25
@@ -39,7 +39,7 @@ environment:
   use_gui: false
 
   # 并行配置（根据硬件调整）
-  num_parallel_workers: 2  # (Debugging) Reduced from 8 for Mac safety
+  num_parallel_workers: 2 # (Debugging) Reduced from 8 for Mac safety
 
 # =============================================================================
 # 模型架构 - 针对初赛优化
