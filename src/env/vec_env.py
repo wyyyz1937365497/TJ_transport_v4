@@ -1,7 +1,8 @@
 """
-并行环境管理器 - 不依赖SB3的并行环境
+并行环境管理器 - 原生Gymnasium并行环境
 
-使用Gymnasium的并行环境功能，无需Stable-Baselines3
+使用Gymnasium的VectorEnv实现真正的并行
+每个SUMO实例在独立进程中运行，自动处理端口分配
 """
 
 import gymnasium as gym
@@ -14,16 +15,16 @@ from .gym_wrapper import GymSumoEnv, make_gym_env
 
 class ParallelSumoEnvs:
     """
-    SUMO并行环境管理器（无SB3依赖）
+    SUMO并行环境管理器
 
-    使用Gymnasium的VectorEnv实现真正的并行，
-    每个SUMO实例在独立进程中运行，自动处理端口分配。
+    使用Gymnasium的VectorEnv实现真正的并行
+    每个SUMO实例在独立进程中运行，自动处理端口分配
 
     特性：
     - 自动端口分配（避免冲突）
     - 每个环境独立进程
     - 标准Gymnasium接口
-    - 无需Stable-Baselines3
+    - GPU加速支持
     - 自动错误恢复
     """
 
@@ -78,13 +79,13 @@ class ParallelSumoEnvs:
 
     def _make_vec_env(self, monitor_dir: Optional[str] = None):
         """
-        创建向量化环境（使用Gymnasium，无SB3依赖）
+        创建向量化环境（使用Gymnasium VectorEnv）
 
         Args:
             monitor_dir: 监控目录（暂不支持，Gymnasium使用RecordVideo）
 
         Returns:
-            VectorEnv实例
+            VectorEnv实例（SyncVectorEnv或AsyncVectorEnv）
         """
         # 创建环境函数列表
         env_fns = [
@@ -189,7 +190,7 @@ def create_parallel_envs(
     device: str = 'cuda'
 ) -> ParallelSumoEnvs:
     """
-    创建并行SUMO环境的便捷函数（无SB3依赖）
+    创建并行SUMO环境的便捷函数
 
     Args:
         config: SUMO配置

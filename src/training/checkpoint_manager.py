@@ -53,7 +53,7 @@ class PhaseCheckpointManager:
         },
         'phase2': {
             'name': 'PPO策略训练',
-            'checkpoint_name': 'shielded_ppo.zip',
+            'checkpoint_name': 'ppo_policy.pth',
             'required_for': ['phase3', 'phase4']
         },
         'phase3': {
@@ -154,27 +154,18 @@ class PhaseCheckpointManager:
         if additional_data:
             save_data.update(additional_data)
 
-        # 根据阶段类型保存
-        if phase == 'phase2':
-            # Phase 2 使用 Stable-Baselines3 的保存格式
-            if hasattr(model, 'save'):
-                model.save(str(checkpoint_path))
-                print(f"[OK] Phase {phase} saved to: {checkpoint_path}")
-            else:
-                raise ValueError("Phase 2 model must have .save() method (Stable-Baselines3)")
+        # 统一使用 PyTorch 标准格式保存所有阶段
+        if optimizer is not None:
+            save_data['optimizer_state_dict'] = optimizer.state_dict()
+
+        # 保存模型
+        if hasattr(model, 'state_dict'):
+            save_data['model_state_dict'] = model.state_dict()
         else:
-            # 其他阶段使用 PyTorch 标准格式
-            if optimizer is not None:
-                save_data['optimizer_state_dict'] = optimizer.state_dict()
+            raise ValueError(f"Model for {phase} must have state_dict() method")
 
-            # 保存模型
-            if hasattr(model, 'state_dict'):
-                save_data['model_state_dict'] = model.state_dict()
-            else:
-                raise ValueError(f"Model for {phase} must have state_dict() method")
-
-            torch.save(save_data, checkpoint_path)
-            print(f"[OK] Phase {phase} saved to: {checkpoint_path}")
+        torch.save(save_data, checkpoint_path)
+        print(f"[OK] Phase {phase} saved to: {checkpoint_path}")
 
         # 保存元数据
         self._save_metadata(phase, metrics)
@@ -206,31 +197,22 @@ class PhaseCheckpointManager:
 
         print(f"[LOAD] Loading {phase} from: {checkpoint_path}")
 
-        if phase == 'phase2':
-            # Phase 2 使用 Stable-Baselines3 的加载格式
-            if hasattr(model, 'load'):
-                model = model.load(checkpoint_path, device=device)
-                print(f"[OK] Phase {phase} loaded successfully")
-                return {'model': model}
-            else:
-                raise ValueError("Phase 2 model must have .load() method")
+        # 统一使用 PyTorch 标准格式加载所有阶段
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # 加载模型权重
+        if hasattr(model, 'load_state_dict'):
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[OK] Phase {phase} model weights loaded")
         else:
-            # 其他阶段使用 PyTorch 标准格式
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            raise ValueError(f"Model for {phase} must have load_state_dict() method")
 
-            # 加载模型权重
-            if hasattr(model, 'load_state_dict'):
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"[OK] Phase {phase} model weights loaded")
-            else:
-                raise ValueError(f"Model for {phase} must have load_state_dict() method")
+        # 加载优化器
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"[OK] Phase {phase} optimizer loaded")
 
-            # 加载优化器
-            if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print(f"[OK] Phase {phase} optimizer loaded")
-
-            return checkpoint
+        return checkpoint
 
     def _save_metadata(self, phase: str, metrics: Optional[Dict[str, Any]]):
         """保存阶段元数据"""

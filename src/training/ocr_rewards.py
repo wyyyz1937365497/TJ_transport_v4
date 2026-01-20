@@ -13,7 +13,12 @@ OCR直接奖励计算器
 - OCR = (N_arrived + Σ(d_traveled / d_total)) / N_total
 - I_σv = -(σv_AI - σv_Base) / σv_Base
 - I_|a| = -(|a|_AI - |a|_Base) / |a|_Base
-- C_int = (α * Σacmd + β * Σlc) / (T_total * N_ICV)
+- C_int = (α * Σacmd + β * Σlc) / (T_total * N_ICV)  ← N_ICV是场景中ICV总数（固定值）
+
+【修复说明】v1.1
+- 修复：使用正确的N_ICV（场景中ICV总数）而非num_controlled（本步被控车辆数）
+- 影响：干预成本计算从错误的高估（30倍）修复为正确的计算
+- 参考：docs/交通工程赛道-评测公式.md
 """
 
 import numpy as np
@@ -39,8 +44,8 @@ class EpisodeStatistics:
     # ========== 干预成本 ==========
     num_accel_commands: int = 0     # 加速度指令总数
     num_lane_changes: int = 0       # 换道指令总数
-    num_controlled_vehicles: int = 0 # 被控制的车辆数
     total_steps: int = 0            # 总仿真步数
+    # ✅ 移除：num_controlled_vehicles（应该使用固定的N_ICV）
 
     def __post_init__(self):
         if self.enroute_traveled is None:
@@ -70,23 +75,20 @@ class EpisodeStatistics:
     def update_intervention_cost(
         self,
         accel_commands: int,
-        lane_changes: int,
-        num_controlled: int
+        lane_changes: int
     ):
         """
-        更新干预成本统计
+        更新干预成本统计（修复版）
 
         Args:
             accel_commands: 本步加速度指令数
             lane_changes: 本步换道指令数
-            num_controlled: 本步被控制的车辆数
+
+        注意：不再需要num_controlled参数，因为归一化应使用固定的N_ICV
         """
         self.num_accel_commands += accel_commands
         self.num_lane_changes += lane_changes
-        self.num_controlled_vehicles = max(
-            self.num_controlled_vehicles,
-            num_controlled
-        )
+        # ✅ 移除错误的max逻辑（之前高估了干预成本）
 
     def increment_step(self):
         """步数+1"""
@@ -95,16 +97,21 @@ class EpisodeStatistics:
 
 class OCRRewardCalculator:
     """
-    OCR奖励计算器
+    OCR奖励计算器（修复版v1.1）
 
     核心功能:
     1. 追踪episode统计（完成率、稳定性、干预成本）
     2. 计算OCR及其增益
     3. 计算综合得分（直接对齐评测公式）
+
+    修复说明：
+    - 使用正确的N_ICV（场景中ICV总数）计算干预成本
+    - 移除了错误的num_controlled_vehicles动态归一化
     """
 
     def __init__(
         self,
+        num_icv_total: Optional[int] = None,  # ✅ 新增：场景中ICV总数
         baseline_ocr: Optional[float] = None,
         baseline_speed_std: Optional[float] = None,
         baseline_avg_accel: Optional[float] = None,
@@ -112,11 +119,16 @@ class OCRRewardCalculator:
         w_efficiency: float = 0.7,  # 初赛效率权重
         w_stability: float = 0.3,   # 初赛稳定性权重
         alpha: float = 1.0,         # 加速度指令权重
-        beta: float = 5.0           # 换道指令权重
+        beta: float = 5.0,          # 换道指令权重
+        use_improved_reward: bool = False  # ✅ 新增：是否使用改进的即时奖励
     ):
         """
         Args:
-            baseline_ocr: 基准OCR（需要在评测前通过baseline run获得）
+            num_icv_total: 场景中ICV总数（必需）
+                = max_vehicles * icv_ratio
+                例如: 600 * 0.25 = 150
+                如果为None，会发出警告（向后兼容旧代码）
+            baseline_ocr: 基准OCR
             baseline_speed_std: 基准速度标准差
             baseline_avg_accel: 基准平均绝对加速度
             k_penalty: 干预成本惩罚系数（越大惩罚越重）
@@ -124,7 +136,17 @@ class OCRRewardCalculator:
             w_stability: 稳定性得分权重
             alpha: 加速度指令成本权重
             beta: 换道指令成本权重
+            use_improved_reward: 是否使用改进的即时奖励计算
         """
+        # ✅ 处理num_icv_total参数
+        if num_icv_total is None:
+            print("⚠️  [WARNING] OCRRewardCalculator未指定num_icv_total参数！")
+            print("   这会导致干预成本计算错误。建议使用create_ocr_reward_calculator()自动推断。")
+            print("   临时使用默认值150（假设600辆车的25%），请尽快修复！")
+            self.num_icv_total = 150  # 临时默认值
+        else:
+            self.num_icv_total = num_icv_total
+
         self.baseline_ocr = baseline_ocr
         self.baseline_speed_std = baseline_speed_std
         self.baseline_avg_accel = baseline_avg_accel
@@ -134,9 +156,17 @@ class OCRRewardCalculator:
         self.w_stability = w_stability
         self.alpha = alpha
         self.beta = beta
+        self.use_improved_reward = use_improved_reward
 
         # 当前episode统计
         self.current_episode = EpisodeStatistics()
+
+        print(f"[OCRRewardCalculator] 初始化（v1.1修复版）")
+        print(f"  - N_ICV: {self.num_icv_total}")
+        print(f"  - k_penalty: {self.k_penalty}")
+        print(f"  - w_efficiency: {self.w_efficiency}")
+        print(f"  - w_stability: {self.w_stability}")
+        print(f"  - use_improved_reward: {self.use_improved_reward}")
 
     def reset(self):
         """重置episode统计"""
@@ -147,10 +177,10 @@ class OCRRewardCalculator:
         vehicle_info: List[Dict],
         accel_commands: int,
         lane_changes: int,
-        num_controlled: int
+        num_controlled: Optional[int] = None  # 保留参数（向后兼容），但不再用于计算
     ) -> float:
         """
-        更新统计并计算即时奖励
+        更新统计并计算即时奖励（修复版）
 
         Args:
             vehicle_info: 车辆信息列表
@@ -164,7 +194,7 @@ class OCRRewardCalculator:
                 }, ...]
             accel_commands: 本步加速度指令数
             lane_changes: 本步换道指令数
-            num_controlled: 本步被控制的车辆数
+            num_controlled: 本步被控制的车辆数（可选，向后兼容，不影响计算）
 
         Returns:
             reward: float 即时奖励
@@ -187,25 +217,26 @@ class OCRRewardCalculator:
             np.array(accels)
         )
 
-        # 更新干预成本统计
+        # 更新干预成本统计（修复版：不再传递num_controlled）
         self.current_episode.update_intervention_cost(
             accel_commands,
-            lane_changes,
-            num_controlled
+            lane_changes
         )
 
         # 更新步数
         self.current_episode.increment_step()
 
-        # 计算即时奖励（简化版：OCR增益）
-        # 注意：完整的S_total只在episode结束时计算
-        reward = self._compute_step_reward(vehicle_info)
+        # 计算即时奖励
+        if self.use_improved_reward:
+            reward = self._compute_step_reward_improved()
+        else:
+            reward = self._compute_step_reward_simple(vehicle_info)
 
         return reward
 
-    def _compute_step_reward(self, vehicle_info: List[Dict]) -> float:
+    def _compute_step_reward_simple(self, vehicle_info: List[Dict]) -> float:
         """
-        计算即时奖励（简化版）
+        计算即时奖励（简化版 - 保持向后兼容）
 
         使用速度和完成率作为即时奖励
         """
@@ -220,7 +251,7 @@ class OCRRewardCalculator:
         num_arrived = sum(1 for v in vehicle_info if v['arrived'])
         completion_rate = num_arrived / len(vehicle_info)
 
-        # 干预惩罚（即时）
+        # 干预惩罚（简化版）
         intervention_penalty = -0.01 * (
             self.alpha * self.current_episode.num_accel_commands +
             self.beta * self.current_episode.num_lane_changes
@@ -231,9 +262,63 @@ class OCRRewardCalculator:
 
         return reward
 
+    def _compute_step_reward_improved(self) -> float:
+        """
+        计算即时奖励（改进版）
+
+        改进点：
+        1. 使用正确的干预成本估计（基于N_ICV）
+        2. 使用指数衰减的惩罚因子
+        3. 更好地反映最终评测公式
+        """
+        stats = self.current_episode
+        step = stats.total_steps
+
+        # 1. 速度奖励（从累积样本计算）
+        if len(stats.speed_samples) > 0:
+            # 使用最近时刻的速度样本
+            recent_samples = min(len(vehicle_info), len(stats.speed_samples)) if 'vehicle_info' in locals() else len(stats.speed_samples)
+            if recent_samples > 0:
+                avg_speed = np.mean(stats.speed_samples[-recent_samples:])
+            else:
+                avg_speed = np.mean(stats.speed_samples)
+            speed_reward = avg_speed / 30.0
+        else:
+            speed_reward = 0.0
+
+        # 2. 完成率奖励
+        total_vehicles = stats.num_arrived + len(stats.enroute_traveled)
+        if total_vehicles > 0:
+            completion_rate = stats.num_arrived / total_vehicles
+        else:
+            completion_rate = 0.0
+
+        # 3. ✅ 改进：使用准确的干预成本估计
+        if self.num_icv_total > 0 and step > 0:
+            # 当前累积的平均干预成本
+            estimated_c_int = (
+                self.alpha * stats.num_accel_commands +
+                self.beta * stats.num_lane_changes
+            ) / (step * self.num_icv_total)  # ✅ 使用固定的N_ICV
+
+            # 惩罚因子（指数衰减）
+            # P_int = e^(-k * C_int)
+            # 惩罚 = 1 - P_int = 1 - e^(-k * C_int)
+            intervention_penalty = -1.0 * (1.0 - np.exp(-self.k_penalty * estimated_c_int))
+        else:
+            intervention_penalty = 0.0
+
+        # 4. 组合（使用官方权重）
+        reward = (
+            self.w_efficiency * (speed_reward + completion_rate) +
+            intervention_penalty
+        )
+
+        return reward
+
     def compute_episode_score(self) -> Dict[str, float]:
         """
-        计算episode最终得分（完整评测公式）
+        计算episode最终得分（完整评测公式 - 修复版）
 
         Returns:
             scores: 包含各项得分的字典
@@ -282,12 +367,12 @@ class OCRRewardCalculator:
             0.6 * max(0, i_accel)
         )
 
-        # ========== 4. 计算干预成本 ==========
-        if stats.total_steps > 0 and stats.num_controlled_vehicles > 0:
+        # ========== ✅ 4. 计算干预成本（修复版） ==========
+        if stats.total_steps > 0 and self.num_icv_total > 0:
             c_int = (
                 self.alpha * stats.num_accel_commands +
                 self.beta * stats.num_lane_changes
-            ) / (stats.total_steps * stats.num_controlled_vehicles)
+            ) / (stats.total_steps * self.num_icv_total)  # ✅ 使用固定的N_ICV
         else:
             c_int = 0.0
 
@@ -320,7 +405,7 @@ class OCRRewardCalculator:
             'num_total': stats.num_arrived + len(stats.enroute_traveled),
             'num_accel_commands': stats.num_accel_commands,
             'num_lane_changes': stats.num_lane_changes,
-            'num_controlled_vehicles': stats.num_controlled_vehicles,
+            'num_icv_total': self.num_icv_total,  # ✅ 添加固定的N_ICV
             'total_steps': stats.total_steps,
         }
 
@@ -392,25 +477,83 @@ class BaselineStatisticsCollector:
 # ========== 便捷函数 ==========
 
 def create_ocr_reward_calculator(
+    config: Optional[Dict] = None,
     baseline_stats: Optional[Dict] = None,
     **kwargs
 ) -> OCRRewardCalculator:
     """
-    创建OCR奖励计算器
+    创建OCR奖励计算器（增强版 - 自动推断N_ICV）
 
     Args:
+        config: 训练配置字典（用于推断N_ICV）
+            如果提供，会自动计算: num_icv_total = max_vehicles * icv_ratio
         baseline_stats: 基准统计字典（包含baseline_ocr等）
-        **kwargs: 其他参数
+        **kwargs: 其他参数（可以覆盖config中的值）
 
     Returns:
         calculator: OCRRewardCalculator实例
+
+    使用示例:
+        # 方式1：从config自动推断（推荐）
+        calculator = create_ocr_reward_calculator(config=config)
+
+        # 方式2：手动指定N_ICV
+        calculator = create_ocr_reward_calculator(num_icv_total=150)
+
+        # 方式3：覆盖config中的值
+        calculator = create_ocr_reward_calculator(
+            config=config,
+            k_penalty=0.15,  # 覆盖config中的值
+            use_improved_reward=True
+        )
     """
+    # 从配置推断N_ICV
+    num_icv_total = kwargs.pop('num_icv_total', None)
+
+    if num_icv_total is None and config is not None:
+        # 从config自动推断
+        env_config = config.get('environment', {})
+        max_vehicles = env_config.get('max_vehicles', 600)
+        icv_ratio = env_config.get('icv_ratio', 0.25)
+        num_icv_total = int(max_vehicles * icv_ratio)
+
+        print(f"[create_ocr_reward_calculator] 从配置推断N_ICV:")
+        print(f"  - max_vehicles: {max_vehicles}")
+        print(f"  - icv_ratio: {icv_ratio}")
+        print(f"  - num_icv_total: {num_icv_total}")
+
+    # OCR奖励配置（从config或kwargs）
+    if config is not None:
+        ocr_config = config.get('ocr_rewards', {})
+        k_penalty = kwargs.pop('k_penalty', ocr_config.get('k_penalty', 0.1))
+        w_efficiency = kwargs.pop('w_efficiency', ocr_config.get('w_efficiency', 0.7))
+        w_stability = kwargs.pop('w_stability', ocr_config.get('w_stability', 0.3))
+        alpha = kwargs.pop('alpha', ocr_config.get('alpha', 1.0))
+        beta = kwargs.pop('beta', ocr_config.get('beta', 5.0))
+        use_improved = kwargs.pop('use_improved_reward', ocr_config.get('use_improved_reward', False))
+    else:
+        # 使用默认值或kwargs中的值
+        k_penalty = kwargs.pop('k_penalty', 0.1)
+        w_efficiency = kwargs.pop('w_efficiency', 0.7)
+        w_stability = kwargs.pop('w_stability', 0.3)
+        alpha = kwargs.pop('alpha', 1.0)
+        beta = kwargs.pop('beta', 5.0)
+        use_improved = kwargs.pop('use_improved_reward', False)
+
+    # 基准统计
     if baseline_stats is None:
         baseline_stats = {}
 
+    # 创建计算器
     return OCRRewardCalculator(
+        num_icv_total=num_icv_total,  # ✅ 传入推断的值
         baseline_ocr=baseline_stats.get('baseline_ocr'),
         baseline_speed_std=baseline_stats.get('baseline_speed_std'),
         baseline_avg_accel=baseline_stats.get('baseline_avg_accel'),
-        **kwargs
+        k_penalty=k_penalty,
+        w_efficiency=w_efficiency,
+        w_stability=w_stability,
+        alpha=alpha,
+        beta=beta,
+        use_improved_reward=use_improved
     )

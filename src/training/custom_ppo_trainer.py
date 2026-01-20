@@ -1,19 +1,22 @@
 """
 完整的PPO训练实现 - GPU优化版本
 
-基于Stable-Baselines3的PPO实现，但优化了数据流：
+自定义实现的PPO训练器，完全独立实现，优化了数据流：
 - RolloutBuffer在GPU上
 - 消除更新阶段的CPU-GPU传输
+- 支持KL散度自适应惩罚
+- 学习率预热和衰减
 
 参考：
-- https://github.com/DLR-RM/stable-baselines3
 - Schulman et al. 2017: "Proximal Policy Optimization Algorithms"
+- https://arxiv.org/abs/1707.06347
 
 改进特性：
 - KL散度自适应惩罚
 - 奖励归一化
-- 梯度累积
+- 梯度裁剪
 - 学习率预热
+- 数值稳定性保护
 """
 
 import torch

@@ -1,5 +1,5 @@
 """
-优化的Gymnasium环境包装器 - 无需SB3兼容
+优化的Gymnasium环境包装器
 
 关键优化：
 1. 使用Dict空间代替Box - 无需padding和扁平化
@@ -25,7 +25,7 @@ from ..constants import (
 
 class GymSumoEnv(gym.Env):
     """
-    优化的Gymnasium SUMO环境（无需SB3兼容）
+    优化的Gymnasium SUMO环境
 
     核心优化：
     - 使用Dict观测空间，动态维度，无需padding

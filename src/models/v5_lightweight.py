@@ -63,30 +63,29 @@ class LightweightGraphConvolution(nn.Module):
 
 class VehicleInfluenceScorer(nn.Module):
     """
-    车辆影响力评分模块
+    车辆影响力评分模块（统一ICV评分系统）
 
-    基于可解释特征计算每辆车对OCR的潜在贡献：
-    - 位置权重：瓶颈区域的车辆更重要
-    - 速度权重：异常速度（慢车）影响后车
-    - 车道权重：汇流区车辆需要协调
-    - 邻居数：周围车辆多则影响力大
+    完全基于神经网络学习车辆影响力，无需手工规则：
+    - 使用GNN嵌入学习车辆交互模式
+    - 自动学习关键特征（位置、速度、车道等）
+    - 数据驱动的评分机制
     """
 
     def __init__(self, node_dim: int, hidden_dim: int = 64):
         super().__init__()
 
-        # 可学习的特征融合权重
+        # 统一的神经网络评分器
         self.feature_fusion = nn.Sequential(
             nn.Linear(node_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 32),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()  # 输出[0, 1]的影响力评分
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1)
         )
-
-        # 可学习的手工特征权重（4个维度）
-        self.handcrafted_weights = nn.Parameter(torch.ones(4) / 4)  # 初始化为均匀权重
 
     def forward(
         self,
@@ -94,7 +93,7 @@ class VehicleInfluenceScorer(nn.Module):
         gnn_embeddings: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        计算车辆影响力评分
+        计算车辆影响力评分（统一神经网络评分）
 
         Args:
             vehicle_states: [N, 9] 原始车辆状态
@@ -102,67 +101,22 @@ class VehicleInfluenceScorer(nn.Module):
             gnn_embeddings: [N, dim] GNN输出的嵌入
 
         Returns:
-            influence_scores: [N, 1] 影响力评分
+            influence_scores: [N, 1] 影响力评分（归一化到[0, 1]）
             debug_info: 调试信息字典
         """
-        N = vehicle_states.size(0)
-        device = vehicle_states.device
-
-        # ========== 1. 提取可解释特征 ==========
-        s = vehicle_states[:, 0]          # 纵向位置 [0, 1]
-        lanes = vehicle_states[:, 6]      # 车道索引
-        speeds = vehicle_states[:, 4]     # 速度 [0, 1]
-
-        # 特征1：位置权重（瓶颈区域优先）
-        # 主线末端(s > 0.7)且非匝道(lane < 3)的车辆权重更高
-        in_bottleneck = ((s > 0.7) & (lanes < 3)).float()
-
-        # 特征2：速度异常（慢车优先）
-        # 使用softmax归一化，慢车获得高分
-        speed_scores = F.softmax(-speeds / (speeds.std() + 1e-6), dim=0)
-
-        # 特征3：汇流区域（车道协调）
-        # 匝道车道(lane >= 3)的车辆在汇流区重要
-        in_merge_zone = (s > 0.5) & (s < 0.8) & (lanes >= 3)
-        merge_score = in_merge_zone.float()
-
-        # 特征4：密度影响（周围车辆数）
-        # 这里简化处理：假设所有车都有影响力，后续可以通过邻居数计算
-
-        # 手工特征矩阵 [N, 4]
-        handcrafted_features = torch.stack([
-            in_bottleneck,
-            speed_scores,
-            merge_score,
-            torch.ones(N, device=device)  # 邻居数占位
-        ], dim=1)
-
-        # ========== 2. 学习特征融合 ==========
+        # ========== 统一的神经网络评分 ==========
         # 将GNN嵌入映射为影响力评分
-        learned_influence = self.feature_fusion(gnn_embeddings)  # [N, 1]
+        influence_scores = self.feature_fusion(gnn_embeddings)  # [N, 1]
 
-        # ========== 3. 组合评分（可解释 + 可学习）==========
-        # 归一化手工特征权重
-        weights = F.softmax(self.handcrafted_weights, dim=0)
-
-        # 计算手工特征得分
-        handcrafted_influence = (handcrafted_features * weights).sum(dim=1, keepdim=True)  # [N, 1]
-
-        # 组合：70%学习 + 30%手工（可调整）
-        final_influence = 0.7 * learned_influence + 0.3 * handcrafted_influence
-
-        # 归一化到[0, 1]
-        final_influence = torch.sigmoid(final_influence)
+        # 使用sigmoid归一化到[0, 1]
+        influence_scores = torch.sigmoid(influence_scores)
 
         debug_info = {
-            'learned_influence': learned_influence,
-            'handcrafted_influence': handcrafted_influence,
-            'in_bottleneck': in_bottleneck,
-            'speed_scores': speed_scores,
-            'merge_score': merge_score,
+            'raw_scores': influence_scores,
+            'gnn_embeddings_norm': gnn_embeddings.norm(dim=-1),
         }
 
-        return final_influence, debug_info
+        return influence_scores, debug_info
 
 
 class LightweightOCRGNN(nn.Module):
@@ -249,12 +203,41 @@ class LightweightOCRGNN(nn.Module):
         构建邻接矩阵（基于空间距离）
 
         Args:
-            vehicle_states: [N, 9] 车辆状态（可能包含padding）
+            vehicle_states: [B, N, 9] 或 [N, 9] 车辆状态
             num_vehicles: 实际车辆数
             interaction_radius: 相互作用半径（归一化距离）
 
         Returns:
-            adj: [N, N] 邻接矩阵（行归一化）
+            adj: [B, N, N] 或 [N, N] 邻接矩阵（行归一化）
+        """
+        # 检查输入维度
+        if vehicle_states.dim() == 2:
+            # 单个样本 [N, 9]
+            return self._build_adjacency_matrix_single(
+                vehicle_states, num_vehicles, interaction_radius
+            )
+        else:
+            # 批量 [B, N, 9]
+            return self._build_adjacency_matrix_batch(
+                vehicle_states, num_vehicles, interaction_radius
+            )
+
+    def _build_adjacency_matrix_single(
+        self,
+        vehicle_states: torch.Tensor,
+        num_vehicles: int,
+        interaction_radius: float
+    ) -> torch.Tensor:
+        """
+        构建单个样本的邻接矩阵
+
+        Args:
+            vehicle_states: [N, 9] 车辆状态
+            num_vehicles: 实际车辆数
+            interaction_radius: 相互作用半径
+
+        Returns:
+            adj: [N, N] 邻接矩阵
         """
         N = vehicle_states.size(0)
         device = vehicle_states.device
@@ -294,6 +277,62 @@ class LightweightOCRGNN(nn.Module):
 
         return adj
 
+    def _build_adjacency_matrix_batch(
+        self,
+        vehicle_states: torch.Tensor,
+        num_vehicles: int,
+        interaction_radius: float
+    ) -> torch.Tensor:
+        """
+        批量构建邻接矩阵（高效实现）
+
+        Args:
+            vehicle_states: [B, N, 9] 车辆状态
+            num_vehicles: 实际车辆数
+            interaction_radius: 相互作用半径
+
+        Returns:
+            adj: [B, N, N] 邻接矩阵
+        """
+        B, N, _ = vehicle_states.shape
+        device = vehicle_states.device
+
+        # 提取位置信息 [B, N]
+        s = vehicle_states[:, :, 0]  # 纵向位置
+        d = vehicle_states[:, :, 1]  # 横向位置
+        lanes = vehicle_states[:, :, 6].long()  # 车道索引
+
+        # ========== 批量计算距离矩阵 [B, N, N] ==========
+        s_diff = s.unsqueeze(2) - s.unsqueeze(1)  # [B, N, N]
+        d_diff = d.unsqueeze(2) - d.unsqueeze(1)  # [B, N, N]
+        lane_diff = (lanes.unsqueeze(2) - lanes.unsqueeze(1)).abs()  # [B, N, N]
+
+        # 空间距离
+        dist_sq = s_diff ** 2 + d_diff ** 2  # [B, N, N]
+
+        # ========== 批量构建掩码 ==========
+        # 掩码：只连接同车道或相邻车道
+        lane_mask = (lane_diff <= 1).float()  # [B, N, N]
+
+        # 掩码：只连接半径内的车辆
+        dist_mask = (dist_sq < interaction_radius ** 2).float()  # [B, N, N]
+
+        # 掩码：排除自连接
+        not_self = 1.0 - torch.eye(N, device=device).unsqueeze(0)  # [B, N, N]
+
+        # 组合掩码
+        mask = lane_mask * dist_mask * not_self  # [B, N, N]
+
+        # 掩码padding的车辆（位置为0的车辆）
+        valid_mask = (s > 0).float().unsqueeze(2)  # [B, N, 1]
+        mask = mask * valid_mask * valid_mask.transpose(1, 2)
+
+        # 归一化：每一行和为1（消息传递的权重）
+        row_sum = mask.sum(dim=2, keepdim=True)  # [B, N, 1]
+        adj = mask / (row_sum + 1e-6)  # [B, N, N]
+
+        return adj
+
     def forward(
         self,
         vehicle_states: torch.Tensor,
@@ -301,7 +340,7 @@ class LightweightOCRGNN(nn.Module):
         return_debug_info: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        前向传播
+        前向传播（优化版：批量处理，每个样本独立Top-K）
 
         Args:
             vehicle_states: [batch_size, max_vehicles, 9] 车辆状态
@@ -310,11 +349,12 @@ class LightweightOCRGNN(nn.Module):
 
         Returns:
             outputs: 包含以下字段的字典
-                - top_k_indices: Top-K车辆的索引
-                - top_k_actions: Top-K车辆的动作
-                - top_k_mask: Top-K掩码
-                - value: 价值估计
-                - influence_scores: 影响力评分
+                - top_k_indices: [B, k] Top-K车辆的索引（每个样本独立）
+                - top_k_actions: [B, N, 2] Top-K车辆的动作
+                - top_k_mask: [B, N] Top-K掩码
+                - value: [B, 1] 价值估计
+                - influence_scores: [B, N, 1] 影响力评分（每个样本独立）
+                - node_embeddings: [B, N, hidden_dim] 节点嵌入
         """
         batch_size = vehicle_states.size(0)
         max_vehicles = vehicle_states.size(1)
@@ -323,46 +363,63 @@ class LightweightOCRGNN(nn.Module):
         # ========== 1. 输入嵌入 ==========
         h = self.input_embedding(vehicle_states)  # [B, N, hidden_dim]
 
-        # ========== 2. 构建邻接矩阵 ==========
-        # 为了效率，只对第一个样本建图，然后batch复用
+        # ========== 2. 批量构建邻接矩阵 ==========
+        # ✅ 修复：为每个样本独立构建邻接矩阵
         adj = self._build_adjacency_matrix(
-            vehicle_states[0],  # [N, 9]
+            vehicle_states,  # [B, N, 9]
             num_vehicles
-        )  # [N, N]
+        )  # [B, N, N]
 
-        # 扩展到batch
-        adj_batch = adj.unsqueeze(0).expand(batch_size, -1, -1)  # [B, N, N]
-
-        # ========== 3. GNN层（消息传递）==========
+        # ========== 3. 批量GNN层（消息传递）==========
+        # ✅ 修复：使用批量矩阵运算，而不是逐batch循环
         for gnn_layer in self.gnn_layers:
-            # 逐batch应用GNN（避免内存爆炸）
-            batch_outputs = []
-            for b in range(batch_size):
-                h_b = gnn_layer(h[b], adj_batch[b])  # [N, hidden_dim]
-                batch_outputs.append(h_b)
-            h = torch.stack(batch_outputs, dim=0)  # [B, N, hidden_dim]
+            # 批量消息传递：h [B, N, D] @ adj [B, N, N] -> [B, N, D]
+            messages = torch.bmm(adj, h)  # [B, N, hidden_dim]
 
-        # ========== 4. 计算影响力评分 ==========
-        # 只对第一个样本计算（batch中所有样本使用相同的Top-K选择）
-        influence_scores, debug_info = self.influence_scorer(
-            vehicle_states[0],  # [N, 9]
-            h[0]  # [N, hidden_dim]
-        )  # [N, 1]
+            # 线性变换（逐样本应用）
+            B, N, D = h.shape
+            messages_flat = messages.view(B * N, D)  # [B*N, D]
+            out_flat = gnn_layer.linear(messages_flat)  # [B*N, D]
+            out = out_flat.view(B, N, D)  # [B, N, D]
 
-        # ========== 5. Top-K选择 ==========
+            # 归一化和激活
+            out = gnn_layer.norm(out)
+            out = F.relu(out)
+            out = gnn_layer.dropout(out)
+
+            h = out  # [B, N, hidden_dim]
+
+        # ========== 4. 批量计算影响力评分 ==========
+        # ✅ 修复：为每个样本独立计算影响力评分
+        influence_scores_list = []
+        debug_info_list = []
+
+        for b in range(batch_size):
+            scores, debug = self.influence_scorer(
+                vehicle_states[b],  # [N, 9]
+                h[b]  # [N, hidden_dim]
+            )  # [N, 1]
+            influence_scores_list.append(scores)
+            debug_info_list.append(debug)
+
+        # 堆叠为batch
+        influence_scores = torch.stack(influence_scores_list, dim=0)  # [B, N, 1]
+
+        # ========== 5. 批量Top-K选择 ==========
+        # ✅ 修复：每个样本独立选择Top-K车辆
         k = max(1, int(num_vehicles * self.top_k_ratio))
 
-        # 选择影响力最高的K辆车
+        # 对每个样本选择Top-K
+        # influence_scores: [B, N, 1] -> [B, N]
         top_k_scores, top_k_indices = torch.topk(
-            influence_scores.squeeze(), k=k, dim=0
-        )  # [k]
+            influence_scores.squeeze(-1),  # [B, N]
+            k=k,
+            dim=1  # 沿N维选择
+        )  # [B, k], [B, k]
 
-        # 创建Top-K掩码（用于后续动作选择）
-        top_k_mask = torch.zeros(max_vehicles, device=device)
-        top_k_mask[top_k_indices] = 1.0
-
-        # 扩展到batch
-        top_k_mask_batch = top_k_mask.unsqueeze(0).expand(batch_size, -1)  # [B, N]
+        # 创建批量Top-K掩码
+        top_k_mask_batch = torch.zeros(batch_size, max_vehicles, device=device)
+        top_k_mask_batch.scatter_(1, top_k_indices, 1.0)  # [B, N]
 
         # ========== 6. 策略输出（只对Top-K车辆）==========
         # 所有车的策略输出
@@ -391,17 +448,17 @@ class LightweightOCRGNN(nn.Module):
 
         # ========== 8. 准备输出 ==========
         outputs = {
-            'top_k_indices': top_k_indices,  # [k]
-            'top_k_actions': top_k_actions,  # [B, N, 2]
-            'top_k_mask': top_k_mask_batch,  # [B, N]
-            'value': value,  # [B, 1]
-            'influence_scores': influence_scores,  # [N, 1]
-            'node_embeddings': h,  # [B, N, hidden_dim]
+            'top_k_indices': top_k_indices,  # [B, k] ✅ 每个样本独立
+            'top_k_actions': top_k_actions,   # [B, N, 2]
+            'top_k_mask': top_k_mask_batch,   # [B, N]
+            'value': value,                   # [B, 1]
+            'influence_scores': influence_scores,  # [B, N, 1] ✅ 每个样本独立
+            'node_embeddings': h,             # [B, N, hidden_dim]
         }
 
         if return_debug_info:
-            outputs['debug_info'] = debug_info
-            outputs['adjacency_matrix'] = adj
+            outputs['debug_info'] = debug_info_list  # ✅ 返回所有样本的调试信息
+            outputs['adjacency_matrix'] = adj  # [B, N, N]
 
         return outputs
 
@@ -614,23 +671,25 @@ class LightweightPolicyV5(nn.Module):
                 return_debug_info=True
             )
 
-            # 提取Top-K索引
-            top_k_indices = gnn_outputs['top_k_indices'].cpu().numpy()
-            influence_scores = gnn_outputs['influence_scores'].cpu().numpy()
-            debug_info = gnn_outputs.get('debug_info', {})
+            # ✅ 修复：top_k_indices现在是 [B, k]，batch_size=1时需要 squeeze(0)
+            top_k_indices = gnn_outputs['top_k_indices'][0].cpu().numpy()  # [k]
+            influence_scores = gnn_outputs['influence_scores'][0].cpu().numpy()  # [N, 1]
+            debug_info_list = gnn_outputs.get('debug_info', [])
 
             info = {
                 'selected_indices': top_k_indices.tolist(),
-                'influence_scores': influence_scores.tolist(),
+                'influence_scores': influence_scores.squeeze(-1).tolist(),  # [N]
                 'num_vehicles': num_vehicles,
                 'k': len(top_k_indices),
             }
 
-            # 添加调试信息
-            if 'learned_influence' in debug_info:
-                info['learned_influence'] = debug_info['learned_influence'].cpu().numpy().tolist()
-            if 'handcrafted_influence' in debug_info:
-                info['handcrafted_influence'] = debug_info['handcrafted_influence'].cpu().numpy().tolist()
+            # 添加调试信息（统一神经网络评分）
+            if debug_info_list and len(debug_info_list) > 0:
+                debug = debug_info_list[0]  # 只取第一个样本的debug信息
+                if 'raw_scores' in debug:
+                    info['raw_scores'] = debug['raw_scores'].cpu().numpy().tolist()
+                if 'gnn_embeddings_norm' in debug:
+                    info['gnn_embeddings_norm'] = debug['gnn_embeddings_norm'].cpu().numpy().tolist()
 
         return top_k_indices.tolist(), info
 
