@@ -60,32 +60,19 @@ training:
     learning_rate: 0.001      # 学习率
     num_envs: 8               # 并行环境数（加速数据收集）
 
-  # ========== Stage 2: PPO微调 ==========
+  # ========== Stage 2: 强化学习微调 ==========
   stage2:
-    # 训练步数（大幅降低）
-    total_timesteps: 500000   # 50万步（原方案300万步）
-
-    # 并行环境
-    num_envs: 8               # 增加并行环境数
-    n_steps: 1024             # 每个环境收集的步数
-    batch_size: 256           # PPO batch size
-
+    # 训练episodes
+    num_episodes: 50          # 训练episodes数
+    
     # 学习率
-    learning_rate: 0.0003     # PPO学习率
-
-    # PPO超参数
-    gamma: 0.99               # 折扣因子
-    gae_lambda: 0.95          # GAE参数
-    clip_range: 0.2           # PPO裁剪参数
-    entropy_coef: 0.01        # 熵系数（降低以提高确定性）
-    value_loss_coef: 0.5      # 价值损失系数
-    max_grad_norm: 0.5        # 梯度裁剪
-
-    # KL散度控制
-    target_kl: 0.015          # KL散度目标
-
-    # 训练轮次
-    update_epochs: 10         # 每次更新使用的epoch数
+    learning_rate: 0.0001     # 策略梯度学习率（比Stage 1更小）
+    
+    # 折扣因子
+    gamma: 0.99               # 奖励折扣因子
+    
+    # 梯度裁剪
+    max_grad_norm: 1.0        # 梯度裁剪阈值
 
 # =============================================================================
 # OCR奖励配置
@@ -146,6 +133,19 @@ neural_icv_scoring:
 
   # 预训练权重（可选）
   checkpoint_path: null      # 预训练权重路径，null表示从头训练
+
+# =============================================================================
+# 启发式车辆选择器配置（用于Stage 1数据生成）
+# =============================================================================
+heuristic_selector:
+  # 瓶颈区域定义（Frenet纵向坐标）
+  bottleneck_s_min: 1000.0   # 瓶颈区域起点（米）
+  bottleneck_s_max: 2000.0   # 瓶颈区域终点（米）
+  
+  # 控制策略参数
+  max_accel: 2.0             # 最大加速度 (m/s²)
+  max_decel: -4.0            # 最大减速度 (m/s²)
+  safe_time_gap: 1.5         # 安全时间间隔 (秒)
 
 # =============================================================================
 # 神经网络ICV评分器训练配置

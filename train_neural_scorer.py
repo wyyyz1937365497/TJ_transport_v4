@@ -161,7 +161,8 @@ class PretrainTrainer:
             obs, info = env.reset()
 
             for step in range(1000):  # 每个episode最多1000步
-                action = env.action_space.sample()
+                # 使用空动作（不控制任何车辆）
+                action = {'vehicle_ids': [], 'actions': []}
                 obs, reward, terminated, truncated, info = env.step(action)
 
                 # 获取当前时刻的车辆状态和规则评分
@@ -392,8 +393,8 @@ class FinetuneTrainer:
                     'neural_scores': neural_scores,
                 })
 
-            # 执行动作
-            action = env.action_space.sample()
+            # 执行动作（使用空动作，不控制任何车辆）
+            action = {'vehicle_ids': [], 'actions': []}
             obs, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
 

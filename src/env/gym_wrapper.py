@@ -257,8 +257,8 @@ class GymSumoEnv(gym.Env):
         # ✅ 返回结构化Dict（无需扁平化和concatenate）
         return {
             'vehicle_states': vehicle_features_array,  # (N, 9) 动态维度，无padding
-            'vehicle_ids': np.array(vehicle_ids, dtype=np.int32),  # (N,) 动态长度
-            'icv_ids': np.array(list(icv_ids), dtype=np.int32),  # (N_icv,) 动态长度
+            'vehicle_ids': np.array(vehicle_ids, dtype=object),  # (N,) 字符串ID数组
+            'icv_ids': np.array(list(icv_ids), dtype=object),  # (N_icv,) 字符串ID数组
             'global_stats': global_stats_flat.astype(np.float32),  # (32,) 固定
             'step': observation.get('step', self.sumo_env.current_step)
         }

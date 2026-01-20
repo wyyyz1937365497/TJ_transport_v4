@@ -127,6 +127,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         # 动态ICV管理状态
         self.controlled_icv_ids = set()  # 当前受控ICV车辆集合
         self.icv_control_step = {}  # 每个ICV车辆的控制开始时间 {veh_id: start_step}
+        self.last_icv_reevaluate_step = 0  # 上次重新评估ICV的步数
         self.icv_reevaluate_interval = 10  # 每10步重新评估一次ICV组成
 
         # ✅ 使用统一的车辆评分器
@@ -164,6 +165,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         # 重置动态ICV状态
         self.controlled_icv_ids = set()
         self.icv_control_step = {}
+        self.last_icv_reevaluate_step = 0
 
         return obs
 
@@ -227,7 +229,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             # ✅ 动态ICV管理：定期重新评估ICV组成
             should_reevaluate = (
                 self.current_step == 0 or  # episode开始
-                (self.current_step - self.icv_control_step) >= self.icv_reevaluate_interval  # 超过间隔
+                (self.current_step - self.last_icv_reevaluate_step) >= self.icv_reevaluate_interval  # 超过间隔
             )
 
             if should_reevaluate and len(self.controlled_icv_ids) > 0:
@@ -237,6 +239,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                     traci_lib,
                     num_icv
                 )
+                self.last_icv_reevaluate_step = self.current_step  # 更新评估时间
             else:
                 # 初始选择或保持不变
                 if len(self.controlled_icv_ids) == 0:
