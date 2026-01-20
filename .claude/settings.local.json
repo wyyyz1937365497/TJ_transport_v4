@@ -51,7 +51,9 @@
       "Bash(xargs:*)",
       "Bash(git commit:*)",
       "Bash(git rm:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(wc:*)",
+      "Bash(done:*)"
     ]
   }
 }

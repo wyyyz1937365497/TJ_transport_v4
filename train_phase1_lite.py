@@ -26,6 +26,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from src.env.gym_wrapper import GymSumoEnv
+from src.env.vec_env import ParallelSumoEnvs
 from src.models.v5_lightweight import create_lightweight_policy_v5
 from src.training.ocr_rewards import create_ocr_reward_calculator
 from src.env.sparse_controller import create_sparse_controller
@@ -77,6 +78,8 @@ def stage1_behavior_cloning(
 
     从人类驾驶数据（IDM模型）学习基础驾驶行为
     无需强化学习，快速收敛
+
+    使用并行环境加速数据收集
     """
     print("\n" + "=" * 70)
     print("Stage 1: 行为克隆 (从IDM模型学习)")
@@ -87,6 +90,7 @@ def stage1_behavior_cloning(
     batch_size = stage1_config['batch_size']
     learning_rate = stage1_config['learning_rate']
     num_epochs = stage1_config['epochs']
+    num_envs = stage1_config.get('num_envs', 8)  # 并行环境数（从配置读取，默认为8）
 
     # 优化器
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
@@ -94,28 +98,56 @@ def stage1_behavior_cloning(
     # 损失函数
     criterion = nn.MSELoss()
 
-    # 收集数据
-    print(f"\n收集数据 ({num_episodes} episodes)...")
+    # ========== 使用并行环境收集数据 ==========
+    print(f"\n创建并行环境 ({num_envs}个环境)...")
+    parallel_envs = ParallelSumoEnvs(
+        config=config,
+        num_envs=num_envs,
+        seed=config.get('seed', 42),
+        device=config.get('device', 'cuda:0')
+    )
+
+    print(f"\n并行收集数据 ({num_episodes} episodes, {num_envs}个并行环境)...")
     observations = []
     actions = []
 
-    for episode in tqdm(range(num_episodes), desc="收集数据"):
-        obs, info = env.reset()
-        done = False
+    episode_count = 0
+    current_obs = parallel_envs.reset()
 
-        while not done:
-            # 获取专家动作（IDM模型）
-            expert_action = info.get('expert_action', None)
-
-            if expert_action is not None:
-                observations.append(obs.copy())
-                actions.append(expert_action.copy())
-
+    with tqdm(total=num_episodes, desc="收集数据") as pbar:
+        while episode_count < num_episodes:
             # 随机动作（探索）
-            action = env.action_space.sample()
+            actions_list = [parallel_envs.action_space.sample() for _ in range(num_envs)]
+            actions_array = np.stack(actions_list)
 
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
+            # 执行一步
+            obs, rewards, dones, infos = parallel_envs.step(actions_array)
+
+            # 收集数据
+            for env_idx in range(num_envs):
+                # 检查是否有专家动作（IDM模型）
+                info = infos[env_idx] if isinstance(infos, list) else infos
+                expert_action = info.get('expert_action', None) if isinstance(info, dict) else None
+
+                if expert_action is not None:
+                    observations.append(current_obs[env_idx].copy())
+                    actions.append(expert_action.copy())
+
+                # 检查episode是否结束
+                done = dones[env_idx]
+                if done:
+                    episode_count += 1
+                    pbar.update(1)
+                    pbar.set_postfix({'episodes': episode_count})
+
+            current_obs = obs
+
+            # 提前退出
+            if episode_count >= num_episodes:
+                break
+
+    # 关闭并行环境
+    parallel_envs.close()
 
     print(f"收集到 {len(observations)} 个样本")
 

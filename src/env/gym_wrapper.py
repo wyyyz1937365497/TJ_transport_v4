@@ -320,4 +320,22 @@ def make_gym_env(
     Returns:
         GymSumoEnv实例
     """
-    return GymSumoEnv(config=config, seed=seed, device=device)
+    # ✅ 修复：配置合并和路径转换（与train_phase1_lite.py中的create_environment保持一致）
+    # 提取 environment 配置并与顶层配置合并
+    env_config = config.get('environment', {})
+
+    # 将相对路径转换为绝对路径（基于项目根目录）
+    if 'sumo_config' in env_config:
+        import os
+        from pathlib import Path
+
+        sumo_config = env_config['sumo_config']
+        if not os.path.isabs(sumo_config):
+            # 转换为绝对路径
+            project_root = Path(__file__).parent.parent.parent.resolve()
+            env_config['sumo_config'] = str(project_root / sumo_config)
+
+    # 合并配置：environment 配置覆盖顶层配置（如果存在）
+    merged_config = {**config, **env_config}
+
+    return GymSumoEnv(config=merged_config, seed=seed, device=device)

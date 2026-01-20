@@ -127,6 +127,37 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self.icv_selection_step = 0  # 上次ICV选择的step
         self.icv_reevaluate_interval = 10  # 每10步重新评估一次ICV组成
 
+        # ✅ 新增：神经网络ICV评分器（可选）
+        neural_icv_config = config.get('neural_icv_scoring', {})
+        use_neural_icv = neural_icv_config.get('enabled', False)
+
+        if use_neural_icv:
+            try:
+                from src.models.neural_vehicle_scorer import create_neural_icv_scorer
+
+                self.neural_scorer = create_neural_icv_scorer(
+                    node_dim=neural_icv_config.get('node_dim', 9),
+                    hidden_dim=neural_icv_config.get('hidden_dim', 64),
+                    num_layers=neural_icv_config.get('num_layers', 3),
+                    num_heads=neural_icv_config.get('num_heads', 4),
+                    checkpoint_path=neural_icv_config.get('checkpoint_path', None),
+                    device=device
+                )
+
+                self.use_neural_scoring = True
+                print(f"[OK] 神经网络ICV评分器已启用（纯GNN模式）")
+                print(f"     隐藏层维度: {neural_icv_config.get('hidden_dim', 64)}")
+                print(f"     GNN层数: {neural_icv_config.get('num_layers', 3)}")
+                print(f"     注意力头数: {neural_icv_config.get('num_heads', 4)}")
+            except Exception as e:
+                print(f"[WARN] 神经网络评分器初始化失败: {e}")
+                print(f"       回退到规则评分")
+                self.neural_scorer = None
+                self.use_neural_scoring = False
+        else:
+            self.neural_scorer = None
+            self.use_neural_scoring = False
+
         # 性能指标
         self.performance_metrics = {
             'avg_speed': 0.0,
@@ -503,6 +534,60 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         return score
 
+    def _get_vehicle_state_dict(self, veh_id: str, traci_lib) -> Dict:
+        """
+        获取车辆状态字典（用于神经网络评分）
+
+        Args:
+            veh_id: 车辆ID
+            traci_lib: TraCI库实例
+
+        Returns:
+            车辆状态字典
+        """
+        try:
+            lane_id = traci_lib.vehicle.getLaneID(veh_id)
+            position = traci_lib.vehicle.getPosition(veh_id)
+
+            # 计算Frenet坐标
+            if hasattr(self, 'frenet_system') and self.frenet_system is not None:
+                try:
+                    x, y = position
+                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+                    vs = traci_lib.vehicle.getSpeed(veh_id) * np.cos(traci_lib.vehicle.getAngle(veh_id))
+                    vd = traci_lib.vehicle.getSpeed(veh_id) * np.sin(traci_lib.vehicle.getAngle(veh_id))
+                except:
+                    s, d = 0.0, 0.0
+                    vs, vd = 0.0, 0.0
+            else:
+                s, d = 0.0, 0.0
+                vs, vd = 0.0, 0.0
+
+            state = {
+                's': s,
+                'd': d,
+                'vs': vs,
+                'vd': vd,
+                'speed': traci_lib.vehicle.getSpeed(veh_id),
+                'acceleration': traci_lib.vehicle.getAcceleration(veh_id),
+                'lane_index': traci_lib.vehicle.getLaneIndex(veh_id),
+                'angle': traci_lib.vehicle.getAngle(veh_id),
+                'x': position[0],
+                'y': position[1],
+                'is_icv': veh_id in self.current_icv_ids
+            }
+
+            return state
+        except Exception as e:
+            # 如果获取失败，返回默认状态
+            return {
+                's': 0.0, 'd': 0.0, 'vs': 0.0, 'vd': 0.0,
+                'speed': 0.0, 'acceleration': 0.0,
+                'lane_index': 0, 'angle': 0.0,
+                'x': 0.0, 'y': 0.0, 'is_icv': False
+            }
+
     def _dynamic_update_icv(
         self,
         all_vehicle_ids: List[str],
@@ -514,7 +599,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
 
         工作流程：
         1. 重新评估当前ICV的重要性评分
-        2. 识别低重要性ICV（评分低于阈值）
+        2. 识别低重要性ICV（Bottom-K排名，而非绝对阈值）
         3. 释放低重要性ICV的名额
         4. 从非ICV车辆池中招募高重要性车辆
         5. 更新ICV集合和评分缓存
@@ -531,21 +616,66 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         current_scores = {}
         icv_still_in_network = set()
 
+        # 引入时间衰减：控制时间越长，评分越低
+        control_duration = {}
+        for veh_id in self.current_icv_ids:
+            if veh_id in self.icv_selection_step:
+                control_duration[veh_id] = self.current_step - self.icv_selection_step
+
         for veh_id in self.current_icv_ids:
             if veh_id in all_vehicle_ids:
                 # 车辆仍在路网中，重新计算评分
-                score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+                base_score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
+
+                # ⭐ 使用神经网络评分（如果启用）
+                if self.use_neural_scoring and self.neural_scorer is not None:
+                    # 收集所有车辆状态
+                    vehicle_states_for_nn = {}
+                    for vid in all_vehicle_ids:
+                        try:
+                            vehicle_states_for_nn[vid] = self._get_vehicle_state_dict(vid, traci_lib)
+                        except:
+                            pass
+
+                    # 纯神经网络评分（不需要规则评分）
+                    try:
+                        neural_scores = self.neural_scorer.compute_scores(
+                            vehicle_states_for_nn
+                        )
+                        score = neural_scores.get(veh_id, base_score)
+                    except Exception as e:
+                        # 如果神经网络评分失败，回退到规则评分
+                        score = base_score
+                else:
+                    score = base_score
+
+                # ⭐ 时间衰减：控制时间越长，评分越低（最多降低30%）
+                if veh_id in control_duration:
+                    duration = control_duration[veh_id]
+                    decay_factor = max(0.7, 1.0 - duration / 1000.0)  # 每1000步最多降低30%
+                    score = base_score * decay_factor
+                else:
+                    score = base_score
+
                 current_scores[veh_id] = score
                 icv_still_in_network.add(veh_id)
             # else: 车辆已经离开路网，不需要保留
 
-        # ========== 2. 识别低重要性ICV ==========
-        # 阈值设置：如果评分<10分，认为重要性不够，需要释放
-        release_threshold = 10.0
-        low_importance_icvs = {
-            veh_id for veh_id, score in current_scores.items()
-            if score < release_threshold
-        }
+        # ========== 2. 识别低重要性ICV（使用相对排名而非绝对阈值） ==========
+        # ⭐ 关键修复：如果当前ICV数量超过目标，释放Bottom-K（评分最低的K个）
+        if len(icv_still_in_network) > num_icv:
+            # 按评分排序
+            sorted_icvs = sorted(
+                current_scores.items(),
+                key=lambda x: x[1]
+            )
+
+            # 释放评分最低的 (当前数量 - 目标数量) 个ICV
+            num_to_release = len(icv_still_in_network) - num_icv
+            low_importance_icvs = {veh_id for veh_id, score in sorted_icvs[:num_to_release]}
+        else:
+            # 当前ICV数量未超过目标，不强制释放
+            low_importance_icvs = set()
 
         # ========== 3. 释放低重要性ICV ==========
         remaining_icvs = icv_still_in_network - low_importance_icvs
@@ -588,7 +718,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         # ========== 调试信息（可选） ==========
         if self.current_step % 100 == 0:
             print(f"[ICV Update] Step {self.current_step}:")
-            print(f"  - Released {len(low_importance_icvs)} low-importance ICVs")
+            print(f"  - Released {len(low_importance_icvs)} low-importance ICVs (Bottom-K)")
             print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv} (hard constraint applied)")
 
             if len(self.icv_scores) > 0:
