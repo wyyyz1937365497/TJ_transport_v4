@@ -18,6 +18,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 import numpy as np
+import sys
+from pathlib import Path
+
+# 添加项目根目录到sys.path
+project_root = Path(__file__).parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.models.v5_lightweight import LightweightGraphConvolution
 
 
 class VehicleGraphBuilder:
@@ -224,7 +233,6 @@ class NeuralVehicleScorer(nn.Module):
         )
 
         # GNN层（使用现有的轻量级卷积）
-        from .v5_lightweight import LightweightGraphConvolution
         self.gnn_layers = nn.ModuleList([
             LightweightGraphConvolution(hidden_dim, hidden_dim)
             for _ in range(num_layers)

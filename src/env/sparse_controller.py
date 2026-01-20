@@ -3,7 +3,7 @@
 
 核心功能:
 1. 按需决策：并非每步都控制，而是每隔N步决策一次
-2. 车辆选择：只选择关键车辆进行控制
+2. 车辆选择：使用统一的ICV评分系统选择关键车辆
 3. 干预必要性判断：只在需要时干预，避免过度控制
 4. 成本追踪：实时追踪干预成本
 
@@ -118,10 +118,9 @@ class SparseController:
 
 class RuleBasedSparseController(SparseController):
     """
-    基于规则的稀疏控制器
+    基于统一ICV评分系统的稀疏控制器
 
-    使用交通工程规则选择关键车辆，无需训练
-    适合作为baseline或快速原型
+    使用统一的车辆评分系统选择关键车辆（支持神经网络/规则评分）
     """
 
     def __init__(
@@ -130,96 +129,53 @@ class RuleBasedSparseController(SparseController):
         top_k_ratio: float = 0.05,
         min_k: int = 3,
         max_k: int = 15,
-        # 规则参数
-        bottleneck_threshold: float = 0.7,    # 瓶颈区域阈值（纵向位置）
-        speed_threshold_ratio: float = 0.7,   # 速度异常阈值（相对平均速度）
-        merge_zone_start: float = 0.5,        # 汇流区起始位置
-        merge_zone_end: float = 0.8,          # 汇流区结束位置
-        ttc_threshold: float = 3.0,           # TTC阈值（秒）
+        # 评分系统
+        vehicle_scorer=None,
+        frenet_system=None
     ):
         super().__init__(decision_interval, top_k_ratio, min_k, max_k)
 
-        self.bottleneck_threshold = bottleneck_threshold
-        self.speed_threshold_ratio = speed_threshold_ratio
-        self.merge_zone_start = merge_zone_start
-        self.merge_zone_end = merge_zone_end
-        self.ttc_threshold = ttc_threshold
+        self.vehicle_scorer = vehicle_scorer
+        self.frenet_system = frenet_system
 
     def select_critical_vehicles(
         self,
-        vehicle_states: np.ndarray,  # [N, 9]
-        vehicle_ids: List[str],
+        observation: Dict,
         k: Optional[int] = None
     ) -> List[str]:
         """
-        基于规则选择关键车辆
+        使用统一的ICV评分系统选择关键车辆
 
         Args:
-            vehicle_states: [N, 9] 车辆状态
-                [s, d, vs, vd, speed, accel, lane, angle, is_icv]
-            vehicle_ids: [N] 车辆ID列表
+            observation: 完整的观测字典（来自环境）
+                {
+                    'vehicle_states': dict {veh_id: state_dict},
+                    'vehicle_ids': list,
+                    'icv_ids': set,
+                    'global_stats': array,
+                    'step': int
+                }
             k: 选择的车辆数（如果为None，则自动计算）
 
         Returns:
             selected_ids: 选中的车辆ID列表
         """
         if k is None:
-            k = self.compute_k(len(vehicle_states))
+            k = self.compute_k(len(observation.get('vehicle_ids', [])))
 
-        num_vehicles = len(vehicle_states)
-        if num_vehicles == 0:
-            return []
+        # 使用统一的评分系统
+        if self.vehicle_scorer is not None:
+            # ✅ 使用统一的评分器（神经网络或规则）
+            vehicle_states = observation.get('vehicle_states', {})
+            scores = self.vehicle_scorer.compute_scores(vehicle_states)
 
-        # ========== 提取特征 ==========
-        s = vehicle_states[:, 0]          # 纵向位置 [0, 1]
-        lanes = vehicle_states[:, 6]      # 车道索引
-        speeds = vehicle_states[:, 4]     # 速度 [0, 1] 归一化
-
-        # ========== 规则1：瓶颈区域的车辆 ==========
-        # 主线末端(s > 0.7)且非匝道(lane < 3)
-        in_bottleneck = (s > self.bottleneck_threshold) & (lanes < 3)
-        score_bottleneck = in_bottleneck.astype(float)
-
-        # ========== 规则2：速度异常的车辆 ==========
-        # 计算平均速度（只考虑主线车辆）
-        mainline_mask = lanes < 3
-        if mainline_mask.sum() > 1:
-            avg_speed = speeds[mainline_mask].mean()
-            speed_std = speeds[mainline_mask].std()
-            # 慢车（速度 < 平均速度 - 1.5倍标准差）
-            is_slow = speeds < (avg_speed - 1.5 * speed_std)
+            # Top-K选择
+            sorted_vehicles = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            selected_ids = [veh_id for veh_id, score in sorted_vehicles[:k]]
         else:
-            is_slow = np.zeros(num_vehicles, dtype=bool)
-
-        score_speed = is_slow.astype(float)
-
-        # ========== 规则3：汇流区车辆 ==========
-        # 匝道车道(lane >= 3)且在汇流区
-        in_merge_zone = (
-            (s > self.merge_zone_start) &
-            (s < self.merge_zone_end) &
-            (lanes >= 3)
-        )
-        score_merge = in_merge_zone.astype(float)
-
-        # ========== 规则4：紧急车辆（TTC低）==========
-        # 简化处理：使用速度和位置近似TTC
-        # 实际应用中应该使用真实TTC计算
-        score_emergency = np.zeros(num_vehicles)
-
-        # ========== 组合评分 ==========
-        total_score = (
-            0.3 * score_bottleneck +
-            0.3 * score_speed +
-            0.3 * score_merge +
-            0.1 * score_emergency
-        )
-
-        # ========== Top-K选择 ==========
-        top_k_indices = np.argsort(total_score)[-k:]
-
-        # 获取对应的车辆ID
-        selected_ids = [vehicle_ids[i] for i in top_k_indices if i < len(vehicle_ids)]
+            # ⚠️ 回退到简单规则（如果没有评分器）
+            vehicle_ids = observation.get('vehicle_ids', [])
+            selected_ids = vehicle_ids[:k] if k < len(vehicle_ids) else vehicle_ids
 
         return selected_ids
 
@@ -332,6 +288,8 @@ class LearnedSparseController(SparseController):
 def create_sparse_controller(
     controller_type: str = 'rule',
     policy_model: Optional[torch.nn.Module] = None,
+    vehicle_scorer=None,
+    frenet_system=None,
     **kwargs
 ) -> SparseController:
     """
@@ -340,13 +298,19 @@ def create_sparse_controller(
     Args:
         controller_type: 'rule' 或 'learned'
         policy_model: 策略模型（learned模式需要）
+        vehicle_scorer: 统一的车辆评分器（rule模式推荐）
+        frenet_system: Frenet坐标系系统（rule模式需要）
         **kwargs: 其他参数
 
     Returns:
         controller: 稀疏控制器实例
     """
     if controller_type == 'rule':
-        return RuleBasedSparseController(**kwargs)
+        return RuleBasedSparseController(
+            vehicle_scorer=vehicle_scorer,
+            frenet_system=frenet_system,
+            **kwargs
+        )
     elif controller_type == 'learned':
         if policy_model is None:
             raise ValueError("policy_model is required for learned controller")

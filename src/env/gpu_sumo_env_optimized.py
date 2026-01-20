@@ -313,8 +313,6 @@ class GPUSumoEnvironmentOptimized:
         """
         获取观测（订阅优化版）
 
-        优化前：32辆车 × 5次查询 = 160次API调用
-        优化后：1次getContextSubscriptionResults调用
         """
         if not self._subscription_enabled:
             # 回退到原始方法

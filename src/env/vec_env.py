@@ -1,32 +1,29 @@
 """
-并行环境管理器 - 使用Stable-Baselines3的SubprocVecEnv
-解决SUMO多进程并行问题
+并行环境管理器 - 不依赖SB3的并行环境
+
+使用Gymnasium的并行环境功能，无需Stable-Baselines3
 """
 
 import gymnasium as gym
 import numpy as np
 from typing import Dict, Any, List, Optional
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
-from stable_baselines3.common.vec_env.base_vec_env import (
-    VecEnv,
-    VecEnvStepReturn,
-)
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv
 
 from .gym_wrapper import GymSumoEnv, make_gym_env
 
 
 class ParallelSumoEnvs:
     """
-    SUMO并行环境管理器
+    SUMO并行环境管理器（无SB3依赖）
 
-    使用Stable-Baselines3的SubprocVecEnv实现真正的并行，
+    使用Gymnasium的VectorEnv实现真正的并行，
     每个SUMO实例在独立进程中运行，自动处理端口分配。
 
     特性：
     - 自动端口分配（避免冲突）
     - 每个环境独立进程
     - 标准Gymnasium接口
-    - 与Stable-Baselines3无缝集成
+    - 无需Stable-Baselines3
     - 自动错误恢复
     """
 
@@ -79,51 +76,57 @@ class ParallelSumoEnvs:
 
         return _init
 
-    def _make_vec_env(self, monitor_dir: Optional[str] = None) -> VecEnv:
+    def _make_vec_env(self, monitor_dir: Optional[str] = None):
         """
-        创建向量化环境
+        创建向量化环境（使用Gymnasium，无SB3依赖）
 
         Args:
-            monitor_dir: 监控目录
+            monitor_dir: 监控目录（暂不支持，Gymnasium使用RecordVideo）
 
         Returns:
-            VecEnv实例
+            VectorEnv实例
         """
-        # 如果只有1个环境，使用DummyVecEnv（不启动新进程）
+        # 创建环境函数列表
+        env_fns = [
+            self._make_env(i, self.seed if self.seed is None else self.seed + i)
+            for i in range(self._num_envs)
+        ]
+
+        # 如果只有1个环境，使用SyncVectorEnv（单进程）
         if self._num_envs == 1:
-            env_fns = [self._make_env(0, self.seed)]
-            vec_env = DummyVecEnv(env_fns)
+            vec_env = SyncVectorEnv(env_fns)
         else:
-            # 多个环境使用SubprocVecEnv（并行）
-            env_fns = [
-                self._make_env(i, self.seed if self.seed is None else self.seed + i)
-                for i in range(self._num_envs)
-            ]
+            # 多个环境使用AsyncVectorEnv（并行多进程）
+            vec_env = AsyncVectorEnv(env_fns)
 
-            vec_env = SubprocVecEnv(
-                env_fns=env_fns,
-                start_method='spawn'  # 使用spawn避免fork问题
-            )
-
-        # 添加监控（记录episode统计）
-        if monitor_dir is not None:
-            vec_env = VecMonitor(vec_env, monitor_dir)
+        # 注意：Gymnasium不使用VecMonitor，而是使用RecordVideo或其他监控方式
+        # 如果需要监控，可以添加wrapper
 
         return vec_env
 
-    def reset(self) -> np.ndarray:
-        """重置所有环境"""
+    def reset(self, seed: Optional[int] = None):
+        """
+        重置所有环境
+
+        Args:
+            seed: 随机种子（可选）
+
+        Returns:
+            observations: 初始观测
+        """
+        if seed is not None:
+            return self.vec_env.reset(seed=seed)
         return self.vec_env.reset()
 
-    def step(self, actions: np.ndarray) -> VecEnvStepReturn:
+    def step(self, actions: List[Dict]):
         """
         在所有环境中执行动作
 
         Args:
-            actions: [num_envs, action_dim]
+            actions: [num_envs] 每个环境的动作（Dict格式）
 
         Returns:
-            (observations, rewards, dones, infos)
+            (observations, rewards, terminateds, truncateds, infos)
         """
         return self.vec_env.step(actions)
 
@@ -173,6 +176,10 @@ class ParallelSumoEnvs:
         self.seed_val = seed
         return self.vec_env.seed(seed)
 
+    def call(self, method_name: str, *args, **kwargs):
+        """在所有环境中调用方法"""
+        return self.vec_env.call(method_name, *args, **kwargs)
+
 
 def create_parallel_envs(
     config: Dict[str, Any],
@@ -182,12 +189,12 @@ def create_parallel_envs(
     device: str = 'cuda'
 ) -> ParallelSumoEnvs:
     """
-    创建并行SUMO环境的便捷函数
+    创建并行SUMO环境的便捷函数（无SB3依赖）
 
     Args:
         config: SUMO配置
         num_envs: 并行环境数量
-        monitor_dir: 监控目录
+        monitor_dir: 监控目录（暂不支持）
         seed: 随机种子
         device: GPU设备 ('cuda' or 'cpu')
 
@@ -201,120 +208,3 @@ def create_parallel_envs(
         seed=seed,
         device=device
     )
-
-
-# 辅助函数：用于数据收集
-def collect_data_parallel(
-    config: Dict[str, Any],
-    num_episodes: int = 10,
-    num_envs: int = 4,
-    max_steps: int = 3600,
-    output_dir: str = "data"
-) -> tuple:
-    """
-    使用并行环境收集数据
-
-    Args:
-        config: SUMO配置
-        num_episodes: 需要收集的episodes数量
-        num_envs: 并行环境数
-        max_steps: 每个episode最大步数
-        output_dir: 输出目录
-
-    Returns:
-        (trajectories, stats)
-    """
-    import time
-    import pickle
-    from pathlib import Path
-
-    # 创建并行环境
-    parallel_envs = create_parallel_envs(
-        config=config,
-        num_envs=num_envs,
-        seed=config.get('seed', 42)
-    )
-
-    # 数据收集
-    all_trajectories = {}
-    episode_count = 0
-    start_time = time.time()
-
-    print(f"\n{'='*70}")
-    print(f"[INFO] 开始并行数据收集 (Stable-Baselines3 VecEnv)")
-    print(f"{'='*70}")
-    print(f"   - Episodes: {num_episodes}")
-    print(f"   - 并行环境: {num_envs}")
-    print(f"   - 最大步数: {max_steps}")
-    print(f"{'='*70}\n")
-
-    current_obs = parallel_envs.reset()
-
-    while episode_count < num_episodes:
-        # 随机动作（数据收集阶段）
-        actions = [parallel_envs.action_space.sample() for _ in range(num_envs)]
-
-        # 执行一步
-        obs, rewards, dones, infos = parallel_envs.step(actions)
-
-        # 完整的数据收集逻辑 - 记录轨迹
-        for env_idx, (ob, reward, done, info) in enumerate(zip(obs, rewards, dones, infos)):
-            # 初始化该环境的轨迹记录（如果需要）
-            if env_idx not in all_trajectories:
-                all_trajectories[env_idx] = []
-
-            # 记录当前步骤的数据
-            step_data = {
-                'observation': ob,
-                'reward': reward,
-                'done': done,
-                'info': info,
-                'action': actions[env_idx]
-            }
-            all_trajectories[env_idx].append(step_data)
-
-            # 检查是否episode结束
-            if done:
-                episode_count += 1
-                print(f"   [OK] Episode {episode_count}/{num_episodes} 完成 (env {env_idx})")
-
-                # 清理该环境的轨迹记录
-                if env_idx in all_trajectories:
-                    # 可以选择保存或处理这里收集的轨迹
-                    trajectory_length = len(all_trajectories[env_idx])
-                    print(f"      轨迹长度: {trajectory_length} 步")
-                    del all_trajectories[env_idx]
-
-                if episode_count >= num_episodes:
-                    break
-
-    # 清理
-    parallel_envs.close()
-
-    # 保存数据
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    timestamp = int(time.time())
-    filepath = Path(output_dir) / f'vec_env_data_{timestamp}.pkl'
-
-    with open(filepath, 'wb') as f:
-        pickle.dump({
-            'trajectories': all_trajectories,
-            'stats': {
-                'num_episodes': num_episodes,
-                'collection_time': time.time() - start_time,
-                'num_envs': num_envs
-            }
-        }, f)
-
-    print(f"\n{'='*70}")
-    print(f"[OK] 数据收集完成！")
-    print(f"   - Episodes: {episode_count}")
-    print(f"   - 耗时: {time.time() - start_time:.1f}s")
-    print(f"   - 数据文件: {filepath}")
-    print(f"{'='*70}\n")
-
-    return all_trajectories, {
-        'num_episodes': num_episodes,
-        'collection_time': time.time() - start_time,
-        'filepath': str(filepath)
-    }

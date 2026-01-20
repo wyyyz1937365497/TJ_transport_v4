@@ -53,7 +53,8 @@
       "Bash(git rm:*)",
       "Bash(bash:*)",
       "Bash(wc:*)",
-      "Bash(done:*)"
+      "Bash(done:*)",
+      "Bash(git log:*)"
     ]
   }
 }

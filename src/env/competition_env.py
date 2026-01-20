@@ -21,6 +21,9 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from utils.frenet_utils import get_frenet_system
 
+# 导入统一的车辆评分模块
+from .vehicle_scoring import UnifiedVehicleScorer, create_vehicle_scorer_from_config
+
 
 class CompetitionSumoEnv(GPUSumoEnvironment):
     """
@@ -121,42 +124,17 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         else:
             self.smart_icv_manager = None
 
-        # 动态ICV管理状态（兼容旧版）
-        self.current_icv_ids = set()  # 当前ICV车辆集合
-        self.icv_scores = {}  # 当前ICV的重要性评分 {veh_id: score}
-        self.icv_selection_step = 0  # 上次ICV选择的step
+        # 动态ICV管理状态
+        self.controlled_icv_ids = set()  # 当前受控ICV车辆集合
+        self.icv_control_step = {}  # 每个ICV车辆的控制开始时间 {veh_id: start_step}
         self.icv_reevaluate_interval = 10  # 每10步重新评估一次ICV组成
 
-        # ✅ 新增：神经网络ICV评分器（可选）
-        neural_icv_config = config.get('neural_icv_scoring', {})
-        use_neural_icv = neural_icv_config.get('enabled', False)
-
-        if use_neural_icv:
-            try:
-                from src.models.neural_vehicle_scorer import create_neural_icv_scorer
-
-                self.neural_scorer = create_neural_icv_scorer(
-                    node_dim=neural_icv_config.get('node_dim', 9),
-                    hidden_dim=neural_icv_config.get('hidden_dim', 64),
-                    num_layers=neural_icv_config.get('num_layers', 3),
-                    num_heads=neural_icv_config.get('num_heads', 4),
-                    checkpoint_path=neural_icv_config.get('checkpoint_path', None),
-                    device=device
-                )
-
-                self.use_neural_scoring = True
-                print(f"[OK] 神经网络ICV评分器已启用（纯GNN模式）")
-                print(f"     隐藏层维度: {neural_icv_config.get('hidden_dim', 64)}")
-                print(f"     GNN层数: {neural_icv_config.get('num_layers', 3)}")
-                print(f"     注意力头数: {neural_icv_config.get('num_heads', 4)}")
-            except Exception as e:
-                print(f"[WARN] 神经网络评分器初始化失败: {e}")
-                print(f"       回退到规则评分")
-                self.neural_scorer = None
-                self.use_neural_scoring = False
-        else:
-            self.neural_scorer = None
-            self.use_neural_scoring = False
+        # ✅ 使用统一的车辆评分器
+        self.vehicle_scorer = create_vehicle_scorer_from_config(
+            config=config,
+            frenet_system=self.frenet_system,
+            device=device
+        )
 
         # 性能指标
         self.performance_metrics = {
@@ -183,10 +161,9 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self.vehicle_travel_times = {}
         self.vehicle_departure_times = {}
 
-        # ✅ 重置动态ICV状态
-        self.current_icv_ids = set()
-        self.icv_scores = {}
-        self.icv_selection_step = 0
+        # 重置动态ICV状态
+        self.controlled_icv_ids = set()
+        self.icv_control_step = {}
 
         return obs
 
@@ -250,10 +227,10 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             # ✅ 动态ICV管理：定期重新评估ICV组成
             should_reevaluate = (
                 self.current_step == 0 or  # episode开始
-                (self.current_step - self.icv_selection_step) >= self.icv_reevaluate_interval  # 超过间隔
+                (self.current_step - self.icv_control_step) >= self.icv_reevaluate_interval  # 超过间隔
             )
 
-            if should_reevaluate and len(self.current_icv_ids) > 0:
+            if should_reevaluate and len(self.controlled_icv_ids) > 0:
                 # 动态更新：重新评估并可能释放部分ICV
                 icv_ids = self._dynamic_update_icv(
                     all_vehicle_ids,
@@ -262,17 +239,17 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 )
             else:
                 # 初始选择或保持不变
-                if len(self.current_icv_ids) == 0:
+                if len(self.controlled_icv_ids) == 0:
                     # 初始选择
                     icv_ids = self._intelligent_select_icv(
                         all_vehicle_ids,
                         traci_lib,
                         num_icv
                     )
-                    self.current_icv_ids = icv_ids
+                    self.controlled_icv_ids = icv_ids
                 else:
                     # 保持当前ICV集合（但需要检查车辆是否还在路网中）
-                    icv_ids = self.current_icv_ids & set(all_vehicle_ids)
+                    icv_ids = self.controlled_icv_ids & set(all_vehicle_ids)
 
                     # 如果ICV数量不足，补充新的
                     if len(icv_ids) < num_icv:
@@ -286,16 +263,17 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                                 additional_needed
                             )
                             icv_ids.update(additional_icv)
-                            self.current_icv_ids = icv_ids
+                            self.controlled_icv_ids = icv_ids
 
-                    # ✅ 关键修复：确保ICV数量不超过目标值（硬约束）
+                    # 确保ICV数量不超过目标值（硬约束）
                     if len(icv_ids) > num_icv:
+                        # ✅ 使用统一评分器计算所有车辆评分
+                        all_scores = self._compute_all_vehicle_scores(vehicle_states, traci_lib, all_vehicle_ids)
                         # 保留评分最高的num_icv个ICV
-                        icv_scores = {veh_id: self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
-                                      for veh_id in icv_ids if veh_id in all_vehicle_ids}
+                        icv_scores = {veh_id: all_scores.get(veh_id, 0.0) for veh_id in icv_ids}
                         sorted_icvs = sorted(icv_scores.items(), key=lambda x: x[1], reverse=True)
                         icv_ids = set([veh_id for veh_id, _ in sorted_icvs[:num_icv]])
-                        self.current_icv_ids = icv_ids
+                        self.controlled_icv_ids = icv_ids
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
         # 批量订阅所有车辆的关键属性（减少IPC调用）
@@ -417,176 +395,32 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         except:
             return 0.0
 
-    def _compute_vehicle_score(
+    def _compute_all_vehicle_scores(
         self,
-        veh_id: str,
+        vehicle_states: Dict[str, Dict],
         traci_lib,
         all_vehicle_ids: List[str]
-    ) -> float:
+    ) -> Dict[str, float]:
         """
-        计算单辆车的重要性评分
+        ✅ 统一的车辆评分接口
 
-        评分标准：
-        1. 位置权重：瓶颈区域车辆优先（最多25分）
-        2. 速度权重：速度异常车辆（最多10分）
-        3. 车道权重：关键车道车辆（最多5分）
-        4. 加速度权重：急加减速车辆（5分）
-        5. 跟驰距离权重：跟驰风险（最多8分）
+        使用配置的评分器（神经网络或规则）计算所有车辆的重要性评分。
 
         Args:
-            veh_id: 车辆ID
+            vehicle_states: 车辆状态字典
             traci_lib: TraCI库实例
-            all_vehicle_ids: 所有车辆ID列表（用于前车查询）
+            all_vehicle_ids: 所有车辆ID列表
 
         Returns:
-            重要性评分（0-53分）
+            车辆评分字典 {veh_id: score}
         """
-        score = 0.0
+        context = {
+            'traci_lib': traci_lib,
+            'all_vehicle_ids': all_vehicle_ids
+        }
 
-        try:
-            # 获取车辆基本信息
-            lane_id = traci_lib.vehicle.getLaneID(veh_id)
-            lane_index = traci_lib.vehicle.getLaneIndex(veh_id)
-            speed = traci_lib.vehicle.getSpeed(veh_id)
-            position = traci_lib.vehicle.getPosition(veh_id)  # (x, y)
+        return self.vehicle_scorer.compute_scores(vehicle_states, context)
 
-            # ========== 1. 位置权重：优先选择瓶颈区域（最多25分） ==========
-            # ✅ 修复：使用真实的s坐标判断是否在瓶颈区域
-            if hasattr(self, 'frenet_system') and self.frenet_system is not None:
-                try:
-                    # 计算Frenet坐标
-                    x, y = position
-                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
-
-                    # 获取真实的s坐标
-                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
-
-                    # 判断是否在瓶颈区域
-                    in_bottleneck = self.frenet_system.is_in_bottleneck(
-                        s=s,
-                        edge_id=edge_id
-                    )
-
-                    if in_bottleneck:
-                        score += 15.0  # 瓶颈区域车辆优先
-
-                    # ✅ 额外：距离瓶颈越近，权重越高
-                    # 获取瓶颈区域的s范围（如果有的话）
-                    if hasattr(self.frenet_system, 'bottleneck_s_range'):
-                        s_min, s_max = self.frenet_system.bottleneck_s_range.get(edge_id, (0, 0))
-                        if s_max > s_min:
-                            # 计算到瓶颈中心的距离
-                            bottleneck_center = (s_min + s_max) / 2.0
-                            dist_to_bottleneck = abs(s - bottleneck_center)
-                            # 距离越近，分数越高（最高10分）
-                            proximity_score = max(0, 10.0 - dist_to_bottleneck / 100.0)
-                            score += proximity_score
-
-                except Exception as e:
-                    # 如果Frenet坐标计算失败，使用简化的边缘判断
-                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
-                    # 简化判断：某些edge_id可能包含瓶颈关键字
-                    is_bottleneck_edge = any(keyword in edge_id.lower()
-                                             for keyword in ['bottleneck', 'ramp', 'merge', 'junction'])
-                    if is_bottleneck_edge:
-                        score += 10.0  # 降低权重，因为不够精确
-            else:
-                # 如果没有Frenet系统，使用简化的边缘判断
-                edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
-                is_bottleneck_edge = any(keyword in edge_id.lower()
-                                         for keyword in ['bottleneck', 'ramp', 'merge', 'junction'])
-                if is_bottleneck_edge:
-                    score += 10.0
-
-            # ========== 2. 速度权重：优先选择速度异常的车辆（最多10分） ==========
-            if speed < 5.0:
-                score += 10.0  # 慢速车（可能是拥堵源）
-            elif speed > 20.0:
-                score += 5.0   # 快速车（需要协调）
-
-            # ========== 3. 车道权重：优先选择关键车道（最多5分） ==========
-            # 最外侧车道（index=0）通常是汇流车道
-            if lane_index == 0:
-                score += 5.0
-            elif lane_index == 1:
-                score += 3.0
-            # 中间车道权重较低
-
-            # ========== 4. 加速度权重：优先选择急加减速的车辆（5分） ==========
-            acceleration = traci_lib.vehicle.getAcceleration(veh_id)
-            if abs(acceleration) > 2.0:
-                score += 5.0  # 急加减速（不稳定因素）
-
-            # ========== 5. 跟驰距离权重：优先选择跟驰距离近的车辆（最多8分） ==========
-            # 获取前车信息
-            leader_id = traci_lib.vehicle.getLeader(veh_id, 100.0)
-            if leader_id and leader_id in all_vehicle_ids:
-                leader_speed = traci_lib.vehicle.getSpeed(leader_id)
-                speed_diff = speed - leader_speed
-                if speed_diff < -5.0:  # 比前车慢很多（可能是瓶颈）
-                    score += 8.0
-                elif speed_diff > 5.0:  # 比前车快很多（可能追尾风险）
-                    score += 6.0
-
-        except Exception as e:
-            # 如果获取车辆信息失败，给予最低分数
-            score = 0.0
-
-        return score
-
-    def _get_vehicle_state_dict(self, veh_id: str, traci_lib) -> Dict:
-        """
-        获取车辆状态字典（用于神经网络评分）
-
-        Args:
-            veh_id: 车辆ID
-            traci_lib: TraCI库实例
-
-        Returns:
-            车辆状态字典
-        """
-        try:
-            lane_id = traci_lib.vehicle.getLaneID(veh_id)
-            position = traci_lib.vehicle.getPosition(veh_id)
-
-            # 计算Frenet坐标
-            if hasattr(self, 'frenet_system') and self.frenet_system is not None:
-                try:
-                    x, y = position
-                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
-                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
-                    vs = traci_lib.vehicle.getSpeed(veh_id) * np.cos(traci_lib.vehicle.getAngle(veh_id))
-                    vd = traci_lib.vehicle.getSpeed(veh_id) * np.sin(traci_lib.vehicle.getAngle(veh_id))
-                except:
-                    s, d = 0.0, 0.0
-                    vs, vd = 0.0, 0.0
-            else:
-                s, d = 0.0, 0.0
-                vs, vd = 0.0, 0.0
-
-            state = {
-                's': s,
-                'd': d,
-                'vs': vs,
-                'vd': vd,
-                'speed': traci_lib.vehicle.getSpeed(veh_id),
-                'acceleration': traci_lib.vehicle.getAcceleration(veh_id),
-                'lane_index': traci_lib.vehicle.getLaneIndex(veh_id),
-                'angle': traci_lib.vehicle.getAngle(veh_id),
-                'x': position[0],
-                'y': position[1],
-                'is_icv': veh_id in self.current_icv_ids
-            }
-
-            return state
-        except Exception as e:
-            # 如果获取失败，返回默认状态
-            return {
-                's': 0.0, 'd': 0.0, 'vs': 0.0, 'vd': 0.0,
-                'speed': 0.0, 'acceleration': 0.0,
-                'lane_index': 0, 'angle': 0.0,
-                'x': 0.0, 'y': 0.0, 'is_icv': False
-            }
 
     def _dynamic_update_icv(
         self,
@@ -612,46 +446,30 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         Returns:
             更新后的ICV集合
         """
+        # ========== 0. 收集所有车辆状态（用于评分） ==========
+        vehicle_states = {}
+        for veh_id in all_vehicle_ids:
+            try:
+                vehicle_states[veh_id] = self._get_vehicle_state_from_traci(veh_id, traci_lib)
+            except:
+                pass
+
         # ========== 1. 重新评估当前ICV的重要性 ==========
+        # ✅ 使用统一评分器计算所有车辆评分（一次性计算，避免重复）
+        all_scores = self._compute_all_vehicle_scores(vehicle_states, traci_lib, all_vehicle_ids)
+
         current_scores = {}
         icv_still_in_network = set()
 
         # 引入时间衰减：控制时间越长，评分越低
-        control_duration = {}
-        for veh_id in self.current_icv_ids:
-            if veh_id in self.icv_selection_step:
-                control_duration[veh_id] = self.current_step - self.icv_selection_step
-
-        for veh_id in self.current_icv_ids:
+        for veh_id in self.controlled_icv_ids:
             if veh_id in all_vehicle_ids:
-                # 车辆仍在路网中，重新计算评分
-                base_score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
-
-                # ⭐ 使用神经网络评分（如果启用）
-                if self.use_neural_scoring and self.neural_scorer is not None:
-                    # 收集所有车辆状态
-                    vehicle_states_for_nn = {}
-                    for vid in all_vehicle_ids:
-                        try:
-                            vehicle_states_for_nn[vid] = self._get_vehicle_state_dict(vid, traci_lib)
-                        except:
-                            pass
-
-                    # 纯神经网络评分（不需要规则评分）
-                    try:
-                        neural_scores = self.neural_scorer.compute_scores(
-                            vehicle_states_for_nn
-                        )
-                        score = neural_scores.get(veh_id, base_score)
-                    except Exception as e:
-                        # 如果神经网络评分失败，回退到规则评分
-                        score = base_score
-                else:
-                    score = base_score
+                # 车辆仍在路网中
+                base_score = all_scores.get(veh_id, 0.0)
 
                 # ⭐ 时间衰减：控制时间越长，评分越低（最多降低30%）
-                if veh_id in control_duration:
-                    duration = control_duration[veh_id]
+                if veh_id in self.icv_control_step:
+                    duration = self.current_step - self.icv_control_step[veh_id]
                     decay_factor = max(0.7, 1.0 - duration / 1000.0)  # 每1000步最多降低30%
                     score = base_score * decay_factor
                 else:
@@ -688,11 +506,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             non_icv_vehicles = set(all_vehicle_ids) - remaining_icvs
 
             if non_icv_vehicles:
-                # 计算候选车辆的评分
-                candidate_scores = {}
-                for veh_id in non_icv_vehicles:
-                    score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
-                    candidate_scores[veh_id] = score
+                # ✅ 使用已计算的评分（在步骤1中已经计算了所有车辆的评分）
+                candidate_scores = {k: v for k, v in all_scores.items() if k in non_icv_vehicles}
 
                 # 选择评分最高的K辆车辆
                 sorted_candidates = sorted(
@@ -705,15 +520,15 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 remaining_icvs.update(new_icvs)
 
         # ========== 5. 更新状态 ==========
-        # ✅ 关键修复：确保ICV数量不超过目标值（硬约束）
-        remaining_icvs = set(list(remaining_icvs)[:num_icv])  # 强制裁剪到num_icv
+        # 确保ICV数量不超过目标值（硬约束）
+        remaining_icvs = set(list(remaining_icvs)[:num_icv])
 
-        self.current_icv_ids = remaining_icvs
-        self.icv_scores = {
-            veh_id: current_scores.get(veh_id, 0)
-            for veh_id in remaining_icvs
-        }
-        self.icv_selection_step = self.current_step
+        # 更新ICV控制时间
+        for veh_id in remaining_icvs:
+            if veh_id not in self.icv_control_step:
+                self.icv_control_step[veh_id] = self.current_step
+
+        self.controlled_icv_ids = remaining_icvs
 
         # ========== 调试信息（可选） ==========
         if self.current_step % 100 == 0:
@@ -721,8 +536,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             print(f"  - Released {len(low_importance_icvs)} low-importance ICVs (Bottom-K)")
             print(f"  - Current ICV count: {len(remaining_icvs)}/{num_icv} (hard constraint applied)")
 
-            if len(self.icv_scores) > 0:
-                scores_list = list(self.icv_scores.values())
+            if len(current_scores) > 0:
+                scores_list = list(current_scores.values())
                 print(f"  - ICV scores: min={min(scores_list):.1f}, max={max(scores_list):.1f}, "
                       f"mean={sum(scores_list)/len(scores_list):.1f}")
 
@@ -735,7 +550,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         num_icv: int
     ) -> set:
         """
-        ✅ 智能选择ICV车辆（基于影响力评分）
+        ✅ 智能选择ICV车辆（基于统一评分器）
 
         优先选择关键车辆：
         1. 瓶颈区域的车辆（汇流区、减速区）
@@ -754,11 +569,16 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             # 如果车辆总数少于需要选择的数量，全部选择
             return set(all_vehicle_ids)
 
-        # 计算每辆车的关键性评分
-        vehicle_scores = {}
+        # 收集所有车辆状态
+        vehicle_states = {}
         for veh_id in all_vehicle_ids:
-            score = self._compute_vehicle_score(veh_id, traci_lib, all_vehicle_ids)
-            vehicle_scores[veh_id] = score
+            try:
+                vehicle_states[veh_id] = self._get_vehicle_state_from_traci(veh_id, traci_lib)
+            except:
+                pass
+
+        # ✅ 使用统一评分器计算所有车辆评分
+        vehicle_scores = self._compute_all_vehicle_scores(vehicle_states, traci_lib, all_vehicle_ids)
 
         # 选择评分最高的K辆车辆
         sorted_vehicles = sorted(
@@ -776,7 +596,69 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             print(f"[ICV Selection] Selected {len(selected_vehicles)} ICVs out of {len(all_vehicle_ids)} vehicles")
             print(f"  Top scores: {top_scores}")
 
+        # 更新ICV控制时间
+        for veh_id in selected_vehicles:
+            if veh_id not in self.icv_control_step:
+                self.icv_control_step[veh_id] = self.current_step
+
         return selected_vehicles
+
+    def _get_vehicle_state_from_traci(self, veh_id: str, traci_lib) -> Dict:
+        """
+        从TraCI获取车辆状态字典
+
+        Args:
+            veh_id: 车辆ID
+            traci_lib: TraCI库实例
+
+        Returns:
+            车辆状态字典
+        """
+        try:
+            lane_id = traci_lib.vehicle.getLaneID(veh_id)
+            position = traci_lib.vehicle.getPosition(veh_id)
+
+            # 计算Frenet坐标
+            if hasattr(self, 'frenet_system') and self.frenet_system is not None:
+                try:
+                    x, y = position
+                    edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+                    speed = traci_lib.vehicle.getSpeed(veh_id)
+                    angle = traci_lib.vehicle.getAngle(veh_id)
+                    vs = speed * np.cos(angle * np.pi / 180.0)
+                    vd = speed * np.sin(angle * np.pi / 180.0)
+                except:
+                    s, d = 0.0, 0.0
+                    vs, vd = 0.0, 0.0
+            else:
+                s, d = 0.0, 0.0
+                vs, vd = 0.0, 0.0
+
+            state = {
+                's': s,
+                'd': d,
+                'vs': vs,
+                'vd': vd,
+                'speed': traci_lib.vehicle.getSpeed(veh_id),
+                'acceleration': traci_lib.vehicle.getAcceleration(veh_id),
+                'lane_index': traci_lib.vehicle.getLaneIndex(veh_id),
+                'angle': traci_lib.vehicle.getAngle(veh_id),
+                'edge_id': lane_id.split('_')[0] if '_' in lane_id else lane_id,
+                'x': position[0],
+                'y': position[1],
+                'is_icv': veh_id in self.controlled_icv_ids
+            }
+
+            return state
+        except Exception as e:
+            # 如果获取失败，返回默认状态
+            return {
+                's': 0.0, 'd': 0.0, 'vs': 0.0, 'vd': 0.0,
+                'speed': 0.0, 'acceleration': 0.0,
+                'lane_index': 0, 'angle': 0.0, 'edge_id': '',
+                'x': 0.0, 'y': 0.0, 'is_icv': False
+            }
 
     def _compute_competition_global_stats(self, vehicle_states: Dict[str, Dict]) -> np.ndarray:
         """
