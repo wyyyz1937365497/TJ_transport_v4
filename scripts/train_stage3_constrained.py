@@ -47,15 +47,22 @@ class ConstrainedPPOTrainer(PPOTrainer):
     继承自Stage 2的PPOTrainer，添加成本约束优化
     """
 
-    def __init__(self, policy, env, config, device='cuda'):
+    def __init__(self, policy, env, config, device='cuda',
+                 use_cache=True, force_refresh=False, cache_dir=None):
         """
         Args:
             policy: JointICVPolicy
             env: CompetitionSumoEnv
             config: 配置字典
             device: 设备
+            use_cache: 是否使用缓存
+            force_refresh: 是否强制刷新缓存
+            cache_dir: 缓存目录
         """
-        super().__init__(policy, env, config, device)
+        super().__init__(policy, env, config, device,
+                        use_cache=use_cache,
+                        force_refresh=force_refresh,
+                        cache_dir=cache_dir)
 
         # Stage 3特定配置
         self.use_cost_critic = config['stage3_constrained_optimization']['ppo']['use_cost_critic']
@@ -98,16 +105,59 @@ class ConstrainedPPOTrainer(PPOTrainer):
         self.loss_weights = config['stage3_constrained_optimization']['ppo'].get('loss_weights', {})
         self.cost_loss_weight = self.loss_weights.get('cost', 0.5)
 
-    def collect_rollouts(self, num_steps):
+    def collect_rollouts(self, num_steps, cache_dir=None, use_cache=True, force_refresh=False):
         """
-        收集rollout数据（扩展：包含成本）
+        收集rollout数据（扩展：包含成本，支持缓存）
+
+        注意: 对于PPO训练，缓存效果有限，因为策略会不断更新。
+        缓存主要用于调试和重复实验。
 
         Args:
             num_steps: 收集的步数
+            cache_dir: 缓存目录路径
+            use_cache: 是否使用缓存
+            force_refresh: 是否强制刷新缓存
 
         Returns:
             rollouts: Dict
         """
+        import hashlib
+        import pickle
+        from pathlib import Path
+
+        # 生成缓存key
+        if cache_dir is None:
+            cache_dir = Path("cache/stage3_rollouts")
+        else:
+            cache_dir = Path(cache_dir)
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建缓存key（基于参数）
+        cache_params = {
+            'num_steps': num_steps,
+            'stage': 'stage3',
+        }
+        cache_key = hashlib.md5(str(cache_params).encode()).hexdigest()[:12]
+        cache_file = cache_dir / f"rollouts_{cache_key}.pkl"
+
+        # 尝试从缓存加载
+        if use_cache and not force_refresh and cache_file.exists():
+            print(f"[缓存] 发现rollout缓存: {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_rollouts = pickle.load(f)
+
+                # 验证缓存数据
+                if len(cached_rollouts['observations']) == num_steps:
+                    print(f"[缓存] 成功加载rollout（{num_steps}步）")
+                    return cached_rollouts
+                else:
+                    print(f"[缓存] rollout长度不匹配，将重新收集")
+            except Exception as e:
+                print(f"[缓存] 加载失败: {e}，将重新收集")
+
+        # 缓存未命中，进行rollout收集
         self.policy.eval()
         rollouts = {
             'observations': [],
@@ -162,6 +212,16 @@ class ConstrainedPPOTrainer(PPOTrainer):
         # 转换为numpy数组
         for key in rollouts.keys():
             rollouts[key] = np.array(rollouts[key])
+
+        # 保存到缓存
+        if use_cache or force_refresh:
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(rollouts, f)
+                cache_size_kb = cache_file.stat().st_size / 1024
+                print(f"[缓存] Rollout已缓存: {cache_file} ({cache_size_kb:.1f} KB)")
+            except Exception as e:
+                print(f"[缓存] 保存失败: {e}")
 
         return rollouts
 
@@ -384,6 +444,14 @@ def main():
     parser.add_argument('--device', type=str, default='cuda',
                         help='设备')
 
+    # 缓存相关参数
+    parser.add_argument('--use_cache', type=lambda x: x.lower() == 'true', default=True,
+                        help='是否使用缓存 (True/False, 默认: True)')
+    parser.add_argument('--force_refresh', action='store_true',
+                        help='强制刷新缓存，重新收集数据')
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='自定义缓存目录路径')
+
     args = parser.parse_args()
 
     # 加载配置
@@ -402,9 +470,9 @@ def main():
     # 创建环境
     print("\n创建环境...")
     env = CompetitionSumoEnv(
-        net_file=config['environment']['net_file'],
-        route_file=config['environment']['route_file'],
-        max_vehicles=config['environment']['icv_config']['max_vehicles']
+        config=config,
+        use_gui=False,
+        device=args.device
     )
 
     # 创建策略
@@ -441,7 +509,12 @@ def main():
     print(f"\n策略参数量: {sum(p.numel() for p in policy.parameters()):,}")
 
     # 创建训练器
-    trainer = ConstrainedPPOTrainer(policy, env, config, args.device)
+    trainer = ConstrainedPPOTrainer(
+        policy, env, config, args.device,
+        use_cache=args.use_cache,
+        force_refresh=args.force_refresh,
+        cache_dir=args.cache_dir
+    )
 
     # 训练
     start_time = time.time()

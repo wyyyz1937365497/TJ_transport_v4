@@ -12,23 +12,27 @@ global:
   checkpoint_dir: checkpoints/v5_complete
 
 # ============================================
+# SUMO配置
+# ============================================
+sumo_cfg: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
+
+# ============================================
 # 环境配置
 # ============================================
 environment:
   name: CompetitionSumoEnv
-  net_file: networks/official_scenario.net.xml
-  route_file: routes/official_routes.rou.xml
+  sumo_cfg: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
+  net_file: 仿真环境_初赛_1.0/仿真环境-初赛/net.xml
+  route_file: 仿真环境_初赛_1.0/仿真环境-初赛/routes.xml
 
   # SUMO配置
-  sumo_config:
-    gui: false
-    time_step: 0.1
-    max_steps: 3000  # 5分钟
+  step_length: 0.1
+  max_steps: 36000  # 3600秒 ÷ 0.1秒/步 = 36000步（官方固定）
 
   # ICV配置
   icv_config:
     penetration_rate: 0.10  # 10% ICV（比赛时调整为0.25）
-    max_vehicles: 32
+    max_vehicles: 600  # 官方固定
     control_interval: 5  # 每5步控制一次
 
 # ============================================
@@ -83,7 +87,7 @@ stage1_world_observer:
 
     # 优化器
     optimizer: Adam
-    lr: 3.0e-4
+    lr: 1.0e-3  # 🔥 从3.0e-4提高到1.0e-3，加速收敛
     weight_decay: 1.0e-5
     grad_clip: 1.0
 

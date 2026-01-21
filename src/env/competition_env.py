@@ -220,8 +220,14 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         valid_vehicle_ids = []
 
         # ✅ 智能ICV选择机制（基于规则的影响力评分 + 动态释放）
-        # ✅ 修复：使用icv_ratio而不是control_ratio（配置文件中使用icv_ratio）
-        control_ratio = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25))
+        # ✅ 修复：优先从icv_config读取渗透率
+        # 优先级: environment.icv_config.penetration_rate > icv_ratio > control_ratio > 0.25
+        icv_config = self.config.get('environment', {}).get('icv_config', {})
+        control_ratio = icv_config.get('penetration_rate')
+        
+        if control_ratio is None:
+            control_ratio = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25))
+            
         num_icv = max(1, int(len(all_vehicle_ids) * control_ratio))
 
         icv_ids = set()
@@ -537,7 +543,13 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         if self.current_step % 100 == 0:
             total_vehicles = len(all_vehicle_ids)
             icv_ratio = (len(remaining_icvs) / total_vehicles * 100) if total_vehicles > 0 else 0.0
-            target_ratio = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25)) * 100
+            
+            # 计算目标比例用于显示
+            icv_config = self.config.get('environment', {}).get('icv_config', {})
+            target_ratio_val = icv_config.get('penetration_rate')
+            if target_ratio_val is None:
+                target_ratio_val = self.config.get('icv_ratio', self.config.get('control_ratio', 0.25))
+            target_ratio = target_ratio_val * 100
             
             print(f"[ICV Update] Step {self.current_step}:")
             print(f"  - Released {len(low_importance_icvs)} low-importance ICVs (Bottom-K)")
