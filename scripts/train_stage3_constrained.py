@@ -245,12 +245,12 @@ class ConstrainedPPOTrainer(PPOTrainer):
                 mb_returns = returns_tensor[mb_indices]
                 mb_costs = costs_tensor[mb_indices]
 
-                # 重新计算log_prob
+                # 重新计算log_prob和entropy
                 self.policy.train()
                 outputs = self.policy(mb_obs, deterministic=False)
 
                 new_log_probs = outputs['log_prob']
-                entropy = new_log_probs  # 简化
+                entropy = outputs['entropy']  # 使用正确的熵（高斯分布的熵）
                 value = outputs['value']
 
                 # 获取成本预测（如果有）

@@ -39,6 +39,41 @@ from src.models.world_model import WorldModel, create_world_model
 from src.env.competition_env import CompetitionSumoEnv
 
 
+class VehicleEmbedding(nn.Module):
+    """
+    车辆状态嵌入层
+
+    将9维车辆状态映射到64维嵌入空间
+    """
+
+    def __init__(self, input_dim=9, hidden_dim=64):
+        super().__init__()
+
+        self.embedding = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(32, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+
+            nn.Linear(64, hidden_dim)
+        )
+
+    def forward(self, vehicle_states):
+        """
+        Args:
+            vehicle_states: [B, N, 9] 车辆状态
+
+        Returns:
+            embeddings: [B, N, hidden_dim] 车辆嵌入
+        """
+        return self.embedding(vehicle_states)
+
+
 class TrajectoryDataset(Dataset):
     """
     轨迹数据集
@@ -282,10 +317,17 @@ def train_world_model(model, dataloader, config, device='cuda'):
 
     Returns:
         best_loss: 最佳损失
+        vehicle_embedding: VehicleEmbedding层（用于Stage 2/3）
     """
-    # 优化器
+    # 创建车辆嵌入层
+    vehicle_embedding = VehicleEmbedding(
+        input_dim=9,
+        hidden_dim=config['policy']['hidden_dim']
+    ).to(device)
+
+    # 将嵌入层参数加入优化器
     optimizer = optim.Adam(
-        model.parameters(),
+        list(model.parameters()) + list(vehicle_embedding.parameters()),
         lr=config['training']['optimizer']['lr'],
         weight_decay=config['training']['optimizer']['weight_decay']
     )
@@ -343,15 +385,8 @@ def train_world_model(model, dataloader, config, device='cuda'):
                 vehicle_features_t = obs_t[:, :vehicle_dim]  # [B, N*9]
                 vehicle_states_t = vehicle_features_t.view(B, num_vehicles, 9)  # [B, N, 9]
 
-                # 创建嵌入（简化：直接使用车辆状态特征）
-                embeddings_t = vehicle_states_t[:, :, :2].float()  # [B, N, 2] 简化
-
-                # 扩展到64维
-                if embeddings_t.size(-1) < 64:
-                    embeddings_t = torch.cat([
-                        embeddings_t,
-                        torch.zeros(B, num_vehicles, 64 - embeddings_t.size(-1), device=device)
-                    ], dim=-1)
+                # 使用嵌入层创建64维嵌入（完整的9维特征）
+                embeddings_t = vehicle_embedding(vehicle_states_t.float())  # [B, N, 64]
 
                 # WorldModel前向传播
                 world_outputs = model(embeddings_t, hidden)
@@ -398,7 +433,11 @@ def train_world_model(model, dataloader, config, device='cuda'):
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['grad_clip'])
+            # 梯度裁剪（包括WorldModel和VehicleEmbedding）
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(vehicle_embedding.parameters()),
+                config['training']['grad_clip']
+            )
             scaler.step(optimizer)
             scaler.update()
 
@@ -430,10 +469,13 @@ def train_world_model(model, dataloader, config, device='cuda'):
             best_loss = avg_loss
             patience_counter = 0
 
-            # 保存最佳模型
+            # 保存最佳模型（WorldModel + VehicleEmbedding）
             checkpoint_path = Path(config['global']['checkpoint_dir']) / 'stage1_best.pth'
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save({
+                'world_model': model.state_dict(),
+                'vehicle_embedding': vehicle_embedding.state_dict()
+            }, checkpoint_path)
             print(f"  ✅ 最佳模型已保存: {checkpoint_path}")
         else:
             patience_counter += 1
@@ -443,7 +485,7 @@ def train_world_model(model, dataloader, config, device='cuda'):
             print(f"\n早停触发！")
             break
 
-    return best_loss
+    return best_loss, vehicle_embedding
 
 
 def main():
@@ -513,16 +555,19 @@ def main():
     print("=" * 80)
 
     start_time = time.time()
-    best_loss = train_world_model(world_model, dataloader, config, args.device)
+    best_loss, vehicle_embedding = train_world_model(world_model, dataloader, config, args.device)
     elapsed_time = time.time() - start_time
 
     print(f"\n训练完成！")
     print(f"  最佳损失: {best_loss:.4f}")
     print(f"  训练时长: {elapsed_time/3600:.2f} 小时")
 
-    # 保存最终模型
+    # 保存最终模型（WorldModel + VehicleEmbedding）
     final_checkpoint = Path(config['global']['checkpoint_dir']) / 'stage1_final.pth'
-    torch.save(world_model.state_dict(), final_checkpoint)
+    torch.save({
+        'world_model': world_model.state_dict(),
+        'vehicle_embedding': vehicle_embedding.state_dict()
+    }, final_checkpoint)
     print(f"  最终模型已保存: {final_checkpoint}")
 
     print("\n" + "=" * 80)

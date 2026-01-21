@@ -592,7 +592,7 @@ class HierarchicalPooling(nn.Module):
                     lane_pooled = (attn_weights * lane_vehicles).sum(dim=0, keepdim=True)  # [1, D]
                 else:
                     # 如果该车道的没有车辆，使用可学习的空嵌入
-                    lane_pooled = self.empty_lane_embedding.unsqueeze(0).unsqueeze(0)  # [1, 1, D] -> [1, D]
+                    lane_pooled = self.empty_lane_embedding.unsqueeze(0)  # [D] -> [1, D]
 
                 batch_lane_features.append(lane_pooled)
 
@@ -642,7 +642,7 @@ class HierarchicalPooling(nn.Module):
                     section_pooled = (attn_weights * section_vehicles).sum(dim=0, keepdim=True)  # [1, D]
                 else:
                     # 如果该路段没有车辆，使用可学习的空嵌入
-                    section_pooled = self.empty_section_embedding.unsqueeze(0).unsqueeze(0)  # [1, 1, D] -> [1, D]
+                    section_pooled = self.empty_section_embedding.unsqueeze(0)  # [D] -> [1, D]
 
                 batch_section_features.append(section_pooled)
 
@@ -747,8 +747,8 @@ class JointICVPolicy(nn.Module):
             num_sections=5    # 5个路段
         )
 
-        # 7. 动作分布参数
-        self.log_std = nn.Parameter(torch.full((self.max_vehicles * 2,), np.log(0.1)))
+        # 7. 动作分布参数（初始化为std=1.0以确保非负熵）
+        self.log_std = nn.Parameter(torch.zeros(self.max_vehicles * 2))  # log(1.0) = 0
 
         # ========== v5.0 扩展组件（可选） ==========
 
@@ -949,7 +949,7 @@ class JointICVPolicy(nn.Module):
 
         # ===========================================
 
-        # 7. 计算log_prob（高斯策略）
+        # 7. 计算log_prob和entropy（高斯策略）
         log_std = self.log_std.unsqueeze(0).expand_as(actions_flat)
         log_std = torch.clamp(log_std, min=-5.0, max=2.0)
 
@@ -969,10 +969,17 @@ class JointICVPolicy(nn.Module):
         )
         log_prob = log_prob.sum(dim=-1)  # [B]
 
+        # 计算熵（高斯分布的熵）
+        # entropy = 0.5 * log(2 * pi * e * std^2) = 0.5 * (log(2*pi) + 2*log_std + 1)
+        entropy = 0.5 * (
+            np.log(2 * np.pi) + 2 * log_std + 1
+        ).sum(dim=-1)  # [B]
+
         return {
             'actions': actions_out,
             'value': value,
             'log_prob': log_prob,
+            'entropy': entropy,  # 新增：返回策略熵
             'importance': importance,
             'selection': selection_mask,
             'k': k,

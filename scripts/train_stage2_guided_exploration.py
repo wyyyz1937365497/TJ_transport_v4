@@ -235,12 +235,12 @@ class PPOTrainer:
                 mb_advantages = advantages_tensor[mb_indices]
                 mb_returns = returns_tensor[mb_indices]
 
-                # 重新计算log_prob
+                # 重新计算log_prob和entropy
                 self.policy.train()
                 outputs = self.policy(mb_obs, deterministic=False)
 
                 new_log_probs = outputs['log_prob']
-                entropy = outputs['log_prob']  # 简化：使用log_prob作为熵的代理
+                entropy = outputs['entropy']  # 使用正确的熵（高斯分布的熵）
                 value = outputs['value']
 
                 # 计算ratio
