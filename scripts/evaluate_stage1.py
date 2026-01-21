@@ -120,17 +120,67 @@ def evaluate_flow_prediction(
     rmse = np.sqrt(mse)
 
     # 归一化后的指标（映射回原始尺度）
-    # 假设特征归一化范围为：
+    # 🔥 新特征归一化范围（改进后）：
     # s: [0, 1000], d: [-10, 10], vs: [0, 30], vd: [-5, 5]
-    # speed: [0, 30], accel: [-3, 3], lane: [0, 3], angle: [0, 360], bottleneck: [0, 1]
-    feature_scales = np.array([1000.0, 10.0, 30.0, 5.0, 30.0, 3.0, 3.0, 360.0, 1.0])
+    # acceleration: [-3, 3], leader_gap: [0, 1], leader_speed_diff: [-1, 1]
+    # road_type: [0, 1], lane_position: [0, 1]
+    # 注意：特征5-8已经在收集时归一化
+    feature_scales = np.array([1000.0, 10.0, 30.0, 5.0, 3.0, 1.0, 1.0, 1.0, 1.0])
     feature_errors_normalized = feature_errors / total_samples
     feature_errors_original = np.sqrt(feature_errors_normalized) * feature_scales
 
-    # 计算R²（需要计算总方差）
-    # 简化估计：基于MSE
-    # R² = 1 - MSE/Var，假设Var ≈ MSE(baseline) ≈ 1（归一化后）
-    r2 = max(0, 1 - mse)  # 粗略估计
+    # 🔥 正确计算R² Score
+    # R² = 1 - SS_res / SS_tot
+    # 其中：
+    #   SS_res = Σ(y_true - y_pred)² (残差平方和)
+    #   SS_tot = Σ(y_true - ȳ)² (总平方和)
+    #
+    # 注意：这个计算需要在所有batch上累积，而不是平均
+
+    # 重新遍历计算正确的R²
+    ss_tot = 0.0
+    ss_res = 0.0
+
+    for batch in dataloader:
+        obs = batch['obs'].to(device)  # 修复：使用'obs'而不是'observations'
+        next_obs = batch['next_obs'].to(device)
+        valid_masks = batch['valid_masks'].to(device)
+
+        B, T, MAX_VEHICLES, state_dim = obs.shape
+
+        # 预测
+        with torch.no_grad():
+            embeddings = vehicle_embedding(obs.reshape(-1, state_dim))
+            embeddings = embeddings.view(B, T, MAX_VEHICLES, -1)
+
+            hidden = model.initialize_hidden(B, device)
+            pred_list = []
+
+            for t in range(T):
+                obs_t = embeddings[:, t, :, :]
+                outputs = model(obs_t, hidden)
+                pred_list.append(outputs['pred_next_states'])
+                hidden = outputs['hidden']
+
+            pred_states = torch.stack(pred_list, dim=1)  # [B, T, MAX, 9]
+
+        # 计算SS_tot和SS_res
+        valid_mask = valid_masks[..., 0]  # [B, T, MAX] - 去掉最后一维
+
+        # 只对有效样本计算
+        valid_pred = pred_states[valid_mask > 0.5]  # [N, 9]
+        valid_target = next_obs[valid_mask > 0.5]  # [N, 9]
+
+        if len(valid_target) > 0:
+            target_mean = valid_target.mean(dim=0, keepdim=True)
+            ss_tot += ((valid_target - target_mean) ** 2).sum().item()
+            ss_res += ((valid_target - valid_pred) ** 2).sum().item()
+
+    # 计算R²
+    if ss_tot > 0:
+        r2 = 1 - (ss_res / ss_tot)
+    else:
+        r2 = 0.0
 
     metrics = {
         'mse': mse,
@@ -142,11 +192,11 @@ def evaluate_flow_prediction(
             'd': feature_errors_original[1],
             'vs': feature_errors_original[2],
             'vd': feature_errors_original[3],
-            'speed': feature_errors_original[4],
-            'acceleration': feature_errors_original[5],
-            'lane_index': feature_errors_original[6],
-            'angle': feature_errors_original[7],
-            'in_bottleneck': feature_errors_original[8],
+            'acceleration': feature_errors_original[4],
+            'leader_gap': feature_errors_original[5],  # 🔥 新特征
+            'leader_speed_diff': feature_errors_original[6],  # 🔥 新特征
+            'road_type': feature_errors_original[7],  # 🔥 新特征
+            'lane_position': feature_errors_original[8],  # 🔥 新特征
         }
     }
 
@@ -309,23 +359,25 @@ def visualize_predictions(
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle('Flow Prediction: Predicted vs Actual', fontsize=16)
 
+    # 🔥 新特征名称（改进后）
     feature_names = ['Position (s)', 'Lateral (d)', 'Long Vel (vs)',
-                     'Lat Vel (vd)', 'Speed', 'Accel']
+                     'Lat Vel (vd)', 'Accel', 'Leader Gap']
     feature_indices = [0, 1, 2, 3, 4, 5]
 
     for idx, (ax, feat_idx) in enumerate(zip(axes.flat, feature_indices)):
-        # 提取有效车辆（非padding）
-        valid_mask = batch['valid_masks'][0, :, 0].cpu().numpy() > 0.5
-        valid_indices = np.where(valid_mask[0])[0][:100]  # 前100个
+        # 提取有效车辆（非padding）- 使用第一个时间步
+        valid_mask_t0 = batch['valid_masks'][0, 0, :, 0].cpu().numpy() > 0.5
+        valid_indices = np.where(valid_mask_t0)[0][:100]  # 前100个
 
-        pred = pred_states_denorm[0, valid_indices, feat_idx]
-        target = target_states_denorm[0, valid_indices, feat_idx]
+        # 使用所有时间步的数据
+        pred_all = pred_states_denorm[:, valid_indices, feat_idx].flatten()
+        target_all = target_states_denorm[:, valid_indices, feat_idx].flatten()
 
-        ax.scatter(target, pred, alpha=0.5, s=1)
+        ax.scatter(target_all, pred_all, alpha=0.5, s=1)
 
         # 对角线（完美预测）
-        min_val = min(target.min(), pred.min())
-        max_val = max(target.max(), pred.max())
+        min_val = min(target_all.min(), pred_all.min())
+        max_val = max(target_all.max(), pred_all.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect')
 
         ax.set_xlabel(f'Actual {feature_names[idx]}')
@@ -342,19 +394,33 @@ def visualize_predictions(
     # 2. 特征误差柱状图（原始尺度）
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # 从metrics计算特征误差
+    # 🔥 从metrics计算特征误差（新特征）
     feature_names_all = ['Position (s)', 'Lateral (d)', 'Long Vel (vs)',
-                        'Lat Vel (vd)', 'Speed', 'Accel', 'Lane', 'Angle', 'Bottleneck']
-    feature_scales = np.array([1000.0, 10.0, 30.0, 5.0, 30.0, 3.0, 3.0, 360.0, 1.0])
+                        'Lat Vel (vd)', 'Accel', 'Leader Gap',
+                        'Leader Speed Diff', 'Road Type', 'Lane Position']
+    feature_scales = np.array([1000.0, 10.0, 30.0, 5.0, 3.0, 1.0, 1.0, 1.0, 1.0])
 
-    diff = (pred_states_denorm[0] - target_states_denorm[0])
-    valid_mask = batch['valid_masks'][0, :, 0].cpu().numpy() > 0.5
+    # 计算所有时间步的平均误差
+    diff = (pred_states_denorm - target_states_denorm)  # [T, MAX_VEHICLES, 9]
+
+    # 获取有效掩码：使用所有时间步和车辆
+    valid_masks_full = batch['valid_masks'][0].cpu().numpy()  # [T, MAX_VEHICLES] or [T, MAX_VEHICLES, 1]
+
+    # 如果是3D，去掉最后一维
+    if len(valid_masks_full.shape) == 3:
+        valid_masks_full = valid_masks_full[:, :, 0]
+
+    # 扩展到所有特征维度
+    valid_mask_3d = np.repeat(valid_masks_full[:, :, np.newaxis], 9, axis=2)  # [T, MAX_VEHICLES, 9]
+
     mae_per_feature = []
 
     for feat_idx in range(9):
-        if valid_mask[:, feat_idx].any():
-            feat_diff = np.abs(diff[:, feat_idx])
-            mae = feat_diff[valid_mask[:, feat_idx]].mean()
+        feat_diff = np.abs(diff[:, :, feat_idx])  # [T, MAX_VEHICLES]
+        feat_mask = valid_mask_3d[:, :, feat_idx].astype(bool)  # [T, MAX_VEHICLES]
+
+        if feat_mask.sum() > 0:
+            mae = feat_diff[feat_mask].mean()
             mae_per_feature.append(mae)
         else:
             mae_per_feature.append(0.0)
@@ -378,9 +444,20 @@ def visualize_predictions(
     plt.close()
 
     # 3. 风险预测混淆矩阵
-    from sklearn.metrics import confusion_matrix
+    # 手动计算混淆矩阵（避免sklearn依赖）
+    def compute_confusion_matrix(labels, preds, num_classes=2):
+        """计算混淆矩阵"""
+        cm = np.zeros((num_classes, num_classes), dtype=int)
+        for l, p in zip(labels, preds):
+            cm[int(l), int(p)] += 1
+        return cm
 
-    valid_mask = batch['valid_masks'][0].cpu().numpy().flatten() > 0.5
+    # 获取有效掩码：[T, MAX_VEHICLES]
+    valid_masks_np = batch['valid_masks'][0].cpu().numpy()
+    if len(valid_masks_np.shape) == 3:
+        valid_masks_np = valid_masks_np[:, :, 0]
+
+    valid_mask = valid_masks_np.flatten() > 0.5
     preds = (pred_risks[0].flatten() > 0.5).astype(int)
     labels = target_risks[0].flatten().astype(int)
 
@@ -388,7 +465,7 @@ def visualize_predictions(
     preds_valid = preds[valid_mask]
     labels_valid = labels[valid_mask]
 
-    cm = confusion_matrix(labels_valid, preds_valid, labels=[0, 1])
+    cm = compute_confusion_matrix(labels_valid, preds_valid, num_classes=2)
 
     fig, ax = plt.subplots(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -409,21 +486,25 @@ def visualize_predictions(
     fig.suptitle('Time Series Prediction Example (One Vehicle)', fontsize=16)
 
     # 找一个一直有效的车辆
-    valid_counts = batch['valid_masks'][0, :, 0].sum(dim=0).cpu().numpy()
+    valid_masks_np = batch['valid_masks'][0].cpu().numpy()  # [T, MAX_VEHICLES] or [T, MAX_VEHICLES, 1]
+    if len(valid_masks_np.shape) == 3:
+        valid_masks_np = valid_masks_np[:, :, 0]
+    valid_counts = valid_masks_np.sum(axis=0)  # 沿时间维度求和
     vehicle_idx = np.argmax(valid_counts)
 
     time_steps = np.arange(T)
 
     for feat_idx, ax in enumerate(axes.flat):
-        pred = pred_states_denorm[0, :, vehicle_idx, feat_idx]
-        target = target_states_denorm[0, :, vehicle_idx, feat_idx]
+        pred = pred_states_denorm[:, vehicle_idx, feat_idx]
+        target = target_states_denorm[:, vehicle_idx, feat_idx]
 
         ax.plot(time_steps, target, 'b-', label='Actual', linewidth=2)
         ax.plot(time_steps, pred, 'r--', label='Predicted', linewidth=2, alpha=0.7)
 
+        # 🔥 新特征名称（改进后）
         feature_name = ['Position (m)', 'Lateral (m)', 'Long Vel (m/s)',
-                         'Lat Vel (m/s)', 'Speed (m/s)', 'Accel (m/s²)',
-                         'Lane', 'Angle (°)', 'Bottleneck'][feat_idx]
+                         'Lat Vel (m/s)', 'Accel (m/s²)', 'Leader Gap (norm)',
+                         'Leader Speed Diff (norm)', 'Road Type (cat)', 'Lane Position (norm)'][feat_idx]
 
         ax.set_ylabel(feature_name)
         ax.set_title(f'Feature {feat_idx}')

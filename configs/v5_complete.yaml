@@ -44,7 +44,7 @@ policy:
 
   # 网络架构
   node_dim: 9
-  hidden_dim: 64
+  hidden_dim: 128  # 🔥 从64增加到128，提升模型容量
   num_layers: 3
   dropout: 0.1
 
@@ -95,17 +95,17 @@ stage1_world_observer:
     lr_schedule:
       enabled: true
       type: CosineAnnealingLR
-      T_max: 20
+      T_max: 50  # 从20增加到50，匹配新的epoch数
       eta_min: 1.0e-5
 
     # 早停
     early_stopping:
       enabled: true
-      patience: 5
+      patience: 10  # 从5增加到10，给予更多收敛时间
       min_delta: 1.0e-4
 
     # 训练轮数
-    num_epochs: 20
+    num_epochs: 50  # 🔥 从20增加到50，更充分训练
     batch_size: 32
 
     # 数据增强

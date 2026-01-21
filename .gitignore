@@ -12,6 +12,6 @@ checkpoints_sb3/
 checkpoints/
 results/
 collected_data/
-
+eval_results/
 # 缓存目录（数据收集缓存）
 cache/

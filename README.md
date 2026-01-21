@@ -2,6 +2,27 @@
 
 基于世界模型和联合PPO架构的多智能体交通控制系统，专为初赛和复赛设计。
 
+**最新更新**: v5.1 - 特征表示优化，RMSE改善4.3% 🌟
+
+---
+
+## 📢 最新更新 (v5.1)
+
+### 🌟 特征改进成果
+
+- ✅ **RMSE**: 1.06 → 1.0158 (**-4.3%**)
+- ✅ **leader_speed_diff**: 提升 **78%** 🌟🌟🌟
+- ✅ **风险预测 F1**: 0.60 → 0.6052
+- ✅ **R² Score**: 稳定在 0.2249
+
+**新增特征**:
+- `leader_gap`: 前车距离
+- `leader_speed_diff`: 前车速度差
+- `road_type`: 道路类型编码
+- `lane_position`: 车道内位置
+
+详见: [CHANGELOG.md](CHANGELOG.md)
+
 ---
 
 ## 🚀 快速开始
@@ -221,27 +242,41 @@ TJ_transport_v4/
 
 ## 📚 文档索引
 
-### 快速入门
-- 📖 [训练指南](docs/training_guide.md) - 三阶段训练详细说明
-- 📖 [文档索引](docs/INDEX.md) - 完整文档导航
+### 核心文档 ⭐
 
-### 架构设计
-- 📐 [联合PPO架构设计v5](docs/联合PPO架构设计v5.md) - 完整架构设计
-- 📐 [最终架构蓝图v5.0](docs/最终架构蓝图v5.0.md) - 技术蓝图
+- 📖 **[训练与评估指南](docs/TRAINING_GUIDE.md)** - 三阶段训练详细教程
+- 📐 **[系统架构分析](docs/ARCHITECTURE.md)** - 完整架构设计说明
+- 📝 **[改进日志](CHANGELOG.md)** - 版本更新和优化记录
 
-### 实施报告
-- ✅ [v5.0实施总结](v5_COMPLETE_SUMMARY.md) - 完整实施总结
-- ✅ [v5.0实施完成报告](docs/v5_implementation_complete.md) - 详细实施报告
-- ✅ [简化修复报告](SIMPLIFICATION_FIXES_REPORT.md) - 关键简化修复记录
+### 快速参考
 
-### 组件文档
-- 🧠 [ICV评分系统使用指南](docs/ICV评分系统使用指南.md) - 组件使用
-- 📈 [ICV评分系统架构演进](docs/ICV评分系统架构演进总结.md) - 架构演进
-- 💻 [ICV评分系统实现总结](docs/ICV评分系统实现总结.md) - 实现细节
+| 文档 | 说明 |
+|------|------|
+| [README.md](README.md) | 项目说明（本文档） |
+| [CHANGELOG.md](CHANGELOG.md) | 版本更新记录 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构详细分析 |
+| [docs/TRAINING_GUIDE.md](docs/TRAINING_GUIDE.md) | 训练与评估指南 |
 
-### 评测标准
-- 🏆 [交通工程赛道-评测公式](docs/交通工程赛道-评测公式.md) - 评分标准
-- 📝 [赛题说明](docs/赛题.md) - 比赛规则
+### 其他文档
+
+| 文档 | 说明 |
+|------|------|
+| [docs/INDEX.md](docs/INDEX.md) | 完整文档索引 |
+| [docs/training_guide.md](docs/training_guide.md) | 原训练指南 |
+| [v5_COMPLETE_SUMMARY.md](v5_COMPLETE_SUMMARY.md) | v5.0 实施总结 |
+| [SIMPLIFICATION_FIXES_REPORT.md](SIMPLIFICATION_FIXES_REPORT.md) | 简化修复报告 |
+
+### 历史文档（已归档）
+
+以下文档已整合到新的核心文档中，保留供参考：
+
+- [联合PPO架构设计v5.md](docs/联合PPO架构设计v5.md)
+- [最终架构蓝图v5.0.md](docs/最终架构蓝图v5.0.md)
+- [ICV评分系统使用指南.md](docs/ICV评分系统使用指南.md)
+- [ICV评分系统架构演进总结.md](docs/ICV评分系统架构演进总结.md)
+- [ICV评分系统实现总结.md](docs/ICV评分系统实现总结.md)
+- [交通工程赛道-评测公式.md](docs/交通工程赛道-评测公式.md)
+- [赛题.md](docs/赛题.md)
 
 ---
 

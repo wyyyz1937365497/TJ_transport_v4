@@ -119,18 +119,18 @@ class TrajectoryDataset(Dataset):
 
 def normalize_vehicle_states(raw_states):
     """
-    归一化车辆状态特征
+    归一化车辆状态特征（改进版）
 
     特征范围:
     - [0] s: 纵向位置 [0, 1000+] → [0, 1]
     - [1] d: 横向偏移 [-10, 10] → [-1, 1]
     - [2] vs: 纵向速度 [0, 30] → [0, 1]
     - [3] vd: 横向速度 [-5, 5] → [-1, 1]
-    - [4] speed: 总速度 [0, 30] → [0, 1]
-    - [5] acceleration: 加速度 [-3, 3] → [-1, 1]
-    - [6] lane_index: 车道索引 [0, 3] → [0, 1]
-    - [7] angle: 角度 [0, 360] → [0, 1]
-    - [8] in_bottleneck: 是否在瓶颈 [0, 1] → [0, 1]
+    - [4] acceleration: 加速度 [-3, 3] → [-1, 1]
+    - [5] leader_gap: 前车距离 [0, 1] (已归一化)
+    - [6] leader_speed_diff: 前车速度差 [-1, 1] (已归一化)
+    - [7] road_type: 道路类型 [0, 1] (已编码)
+    - [8] lane_position: 车道内位置 [0, 1] (已归一化)
 
     Args:
         raw_states: [N, 9] 原始车辆状态
@@ -140,24 +140,18 @@ def normalize_vehicle_states(raw_states):
     """
     normalized = raw_states.copy()
 
-    # 位置特征归一化
+    # 基础特征归一化
     normalized[:, 0] /= 1000.0      # s: [0, 1000+] → [0, ~1]
     normalized[:, 1] /= 10.0        # d: [-10, 10] → [-1, 1]
-
-    # 速度特征归一化
     normalized[:, 2] /= 30.0        # vs: [0, 30] → [0, 1]
     normalized[:, 3] /= 5.0         # vd: [-5, 5] → [-1, 1]
-    normalized[:, 4] /= 30.0        # speed: [0, 30] → [0, 1]
+    normalized[:, 4] /= 3.0         # acceleration: [-3, 3] → [-1, 1]
 
-    # 加速度归一化
-    normalized[:, 5] /= 3.0         # acceleration: [-3, 3] → [-1, 1]
-
-    # 离散特征归一化
-    normalized[:, 6] /= 3.0         # lane_index: [0, 3] → [0, 1]
-    normalized[:, 7] /= 360.0       # angle: [0, 360] → [0, 1]
-
-    # in_bottleneck已经是[0, 1]，无需归一化
-    # normalized[:, 8] 保持不变
+    # 新特征[5-8]已经在数据收集时归一化/编码，无需额外处理
+    # [5] leader_gap: 已归一化到 [0, 1]
+    # [6] leader_speed_diff: 已归一化到 [-1, 1]
+    # [7] road_type: 已编码到 [0, 1]
+    # [8] lane_position: 已归一化到 [0, 1]
 
     return normalized
 
@@ -413,20 +407,77 @@ def collect_idm_trajectories(env, num_episodes=20, max_steps=500, device='cuda',
             next_vehicle_ids = next_obs['vehicle_ids']
             next_vehicle_states_dict = next_obs['vehicle_states']
 
-            next_states_list = [
-                [
-                    next_vehicle_states_dict[veh_id]['s'],
-                    next_vehicle_states_dict[veh_id]['d'],
-                    next_vehicle_states_dict[veh_id]['vs'],
-                    next_vehicle_states_dict[veh_id]['vd'],
-                    next_vehicle_states_dict[veh_id]['speed'],
-                    next_vehicle_states_dict[veh_id]['acceleration'],
-                    next_vehicle_states_dict[veh_id]['lane_index'],
-                    next_vehicle_states_dict[veh_id]['angle'],
-                    1.0 if next_vehicle_states_dict[veh_id]['in_bottleneck'] else 0.0
+            # 🔥 特征改进：使用SUMO额外信息
+            # 获取traci实例
+            traci_lib = env.traci if hasattr(env, 'traci') else None
+
+            next_states_list = []
+            for veh_id in next_vehicle_ids:
+                state = next_vehicle_states_dict[veh_id]
+
+                # 基础特征
+                s = state['s']
+                d = state['d']
+                vs = state['vs']
+                vd = state['vd']
+                acceleration = state['acceleration']
+                edge_id = state.get('edge_id', '')
+                lane_id = state.get('lane_id', '')
+                current_speed = state['speed']
+
+                # 🔥 新增1：前车信息（使用SUMO API）
+                leader_gap = 1.0
+                leader_speed_diff = 0.0
+                if traci_lib is not None:
+                    try:
+                        leader_info = traci_lib.vehicle.getLeader(veh_id, 200.0)  # 200m范围内
+                        if leader_info is not None and len(leader_info) >= 2:
+                            leader_id = leader_info[0]
+                            gap = leader_info[1]
+                            leader_speed = traci_lib.vehicle.getSpeed(leader_id)
+
+                            # 归一化
+                            leader_gap = min(gap / 200.0, 1.0)  # [0, 1]
+                            leader_speed_diff = (current_speed - leader_speed) / 30.0  # [-1, 1]
+                            leader_speed_diff = max(-1.0, min(1.0, leader_speed_diff))
+                    except:
+                        leader_gap = 1.0
+                        leader_speed_diff = 0.0
+
+                # 🔥 新增2：道路类型编码
+                if edge_id == 'E1':  # 主干道
+                    road_type = 0.25
+                elif edge_id == 'E2':  # 汇入匝道
+                    road_type = 0.50
+                elif edge_id == 'E3':  # 汇出匝道
+                    road_type = 0.75
+                elif edge_id == 'E5':  # 瓶颈
+                    road_type = 1.00
+                else:
+                    road_type = 0.0  # 未知
+
+                # 🔥 新增3：车道内相对位置
+                lane_position_norm = 0.5
+                if traci_lib is not None and lane_id:
+                    try:
+                        lane_length = traci_lib.lane.getLength(lane_id)
+                        lane_position = traci_lib.vehicle.getLanePosition(veh_id)
+                        if lane_length > 0:
+                            lane_position_norm = lane_position / lane_length
+                            lane_position_norm = max(0.0, min(1.0, lane_position_norm))
+                    except:
+                        lane_position_norm = 0.5
+
+                # 构建新状态向量（9维）
+                state_vec = [
+                    s, d, vs, vd, acceleration,
+                    leader_gap,              # [5] 新增：前车距离
+                    leader_speed_diff,        # [6] 新增：前车速度差
+                    road_type,                # [7] 新增：道路类型
+                    lane_position_norm        # [8] 新增：车道内位置
                 ]
-                for veh_id in next_vehicle_ids
-            ]
+
+                next_states_list.append(state_vec)
 
             if len(next_states_list) > 0:
                 next_states = np.array(next_states_list)
