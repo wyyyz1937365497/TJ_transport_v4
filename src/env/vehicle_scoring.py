@@ -1,347 +1,282 @@
 """
-统一的车辆评分模块
+统一车辆评分模块
 
-提供两种评分方式：
-1. 规则评分（RuleBasedScorer）：基于手工设计的规则
-2. 神经网络评分（NeuralScorer）：基于GNN的评分，支持自动回退到规则评分
-
-设计原则：
-- 单一职责：每个评分器只负责一种评分方式
-- 统一接口：所有评分器实现相同的接口
-- 自动回退：神经网络评分失败时自动使用规则评分
+提供统一的车辆评分接口，支持神经网络评分和规则评分两种方式。
+默认使用神经网络评分，失效时回退到规则评分。
 """
 
+import sys
+from pathlib import Path
 import numpy as np
-from typing import Dict, List, Set, Optional
-from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Any
 
+# 添加项目根目录到路径
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
-class BaseVehicleScorer(ABC):
-    """车辆评分器基类"""
-
-    @abstractmethod
-    def compute_scores(
-        self,
-        vehicle_states: Dict[str, Dict],
-        context: Optional[Dict] = None
-    ) -> Dict[str, float]:
-        """
-        计算车辆重要性评分
-
-        Args:
-            vehicle_states: 车辆状态字典 {veh_id: state_dict}
-            context: 额外上下文信息（可选）
-
-        Returns:
-            评分字典 {veh_id: score}
-        """
-        pass
-
-
-class RuleBasedScorer(BaseVehicleScorer):
-    """
-    基于规则的车辆评分器
-
-    评分标准：
-    1. 位置权重：瓶颈区域车辆优先（最多25分）
-    2. 速度权重：速度异常车辆（最多10分）
-    3. 车道权重：关键车道车辆（最多5分）
-    4. 加速度权重：急加减速车辆（5分）
-    5. 跟驰距离权重：跟驰风险（最多8分）
-    """
-
-    def __init__(self, frenet_system):
-        """
-        初始化规则评分器
-
-        Args:
-            frenet_system: Frenet坐标系系统
-        """
-        self.frenet_system = frenet_system
-
-    def compute_scores(
-        self,
-        vehicle_states: Dict[str, Dict],
-        context: Optional[Dict] = None
-    ) -> Dict[str, float]:
-        """
-        计算所有车辆的规则评分
-
-        Args:
-            vehicle_states: 车辆状态字典
-            context: 包含traci_lib等额外信息（可选）
-
-        Returns:
-            评分字典 {veh_id: score}
-        """
-        scores = {}
-
-        for veh_id, state in vehicle_states.items():
-            scores[veh_id] = self._compute_single_vehicle_score(
-                veh_id, state, context
-            )
-
-        return scores
-
-    def _compute_single_vehicle_score(
-        self,
-        veh_id: str,
-        state: Dict,
-        context: Optional[Dict] = None
-    ) -> float:
-        """
-        计算单辆车的规则评分
-
-        Args:
-            veh_id: 车辆ID
-            state: 车辆状态
-            context: 上下文信息（包含traci_lib等）
-
-        Returns:
-            重要性评分（0-53分）
-        """
-        score = 0.0
-
-        try:
-            # ========== 1. 位置权重：优先选择瓶颈区域（最多25分） ==========
-            s = state.get('s', 0.0)
-            edge_id = state.get('edge_id', '')
-
-            in_bottleneck = self.frenet_system.is_in_bottleneck(s=s, edge_id=edge_id)
-
-            if in_bottleneck:
-                score += 15.0  # 瓶颈区域车辆优先
-
-            # 额外：距离瓶颈越近，权重越高
-            if hasattr(self.frenet_system, 'bottleneck_s_range'):
-                s_min, s_max = self.frenet_system.bottleneck_s_range.get(edge_id, (0, 0))
-                if s_max > s_min:
-                    bottleneck_center = (s_min + s_max) / 2.0
-                    dist_to_bottleneck = abs(s - bottleneck_center)
-                    proximity_score = max(0, 10.0 - dist_to_bottleneck / 100.0)
-                    score += proximity_score
-
-            # ========== 2. 速度权重：优先选择速度异常的车辆（最多10分） ==========
-            speed = state.get('speed', 0.0)
-            if speed < 5.0:
-                score += 10.0  # 慢速车
-            elif speed > 20.0:
-                score += 5.0   # 快速车
-
-            # ========== 3. 车道权重：优先选择关键车道（最多5分） ==========
-            lane_index = state.get('lane_index', 0)
-            if lane_index == 0:
-                score += 5.0
-            elif lane_index == 1:
-                score += 3.0
-
-            # ========== 4. 加速度权重：优先选择急加减速的车辆（5分） ==========
-            acceleration = state.get('acceleration', 0.0)
-            if abs(acceleration) > 2.0:
-                score += 5.0
-
-            # ========== 5. 跟驰距离权重：优先选择跟驰距离近的车辆（最多8分） ==========
-            if context and 'traci_lib' in context:
-                try:
-                    traci_lib = context['traci_lib']
-                    all_vehicle_ids = context.get('all_vehicle_ids', [])
-
-                    leader_id = traci_lib.vehicle.getLeader(veh_id, 100.0)
-                    if leader_id and leader_id in all_vehicle_ids:
-                        leader_speed = traci_lib.vehicle.getSpeed(leader_id)
-                        speed_diff = speed - leader_speed
-                        if speed_diff < -5.0:
-                            score += 8.0
-                        elif speed_diff > 5.0:
-                            score += 6.0
-                except:
-                    pass
-
-        except Exception as e:
-            score = 0.0
-
-        return score
-
-
-class NeuralScorer(BaseVehicleScorer):
-    """
-    基于神经网络的车辆评分器
-
-    特性：
-    - 使用GNN学习车辆交互
-    - 支持自动回退到规则评分
-    - 记录回退统计信息
-    """
-
-    def __init__(self, neural_scorer, rule_scorer: RuleBasedScorer, device: str = 'cuda'):
-        """
-        初始化神经网络评分器
-
-        Args:
-            neural_scorer: 神经网络评分器（从neural_vehicle_scorer导入）
-            rule_scorer: 规则评分器（作为后备）
-            device: 设备
-        """
-        self.neural_scorer = neural_scorer.to(device)
-        self.rule_scorer = rule_scorer
-        self.device = device
-
-        # 统计信息
-        self.neural_success_count = 0
-        self.neural_failure_count = 0
-
-    def compute_scores(
-        self,
-        vehicle_states: Dict[str, Dict],
-        context: Optional[Dict] = None
-    ) -> Dict[str, float]:
-        """
-        使用神经网络计算评分，失败时回退到规则评分
-
-        Args:
-            vehicle_states: 车辆状态字典
-            context: 上下文信息（用于规则评分回退）
-
-        Returns:
-            评分字典 {veh_id: score}
-        """
-        if not vehicle_states:
-            return {}
-
-        # 尝试神经网络评分
-        try:
-            scores = self.neural_scorer.compute_scores(vehicle_states)
-            self.neural_success_count += 1
-            return scores
-        except Exception as e:
-            # 回退到规则评分
-            self.neural_failure_count += 1
-            return self.rule_scorer.compute_scores(vehicle_states, context)
-
-    def get_stats(self) -> Dict[str, int]:
-        """获取评分器统计信息"""
-        return {
-            'neural_success_count': self.neural_success_count,
-            'neural_failure_count': self.neural_failure_count,
-            'total_calls': self.neural_success_count + self.neural_failure_count,
-            'success_rate': self.neural_success_count / max(1, self.neural_success_count + self.neural_failure_count)
-        }
+from src.env.rule_based_scorer import RuleBasedVehicleScorer
+from src.models.icv_gnn_scorer import create_icv_gnn_scorer
 
 
 class UnifiedVehicleScorer:
     """
-    统一的车辆评分器
+    统一车辆评分器
 
-    提供单一的接口来计算车辆评分，自动处理神经网络/规则评分的切换和回退。
+    支持两种评分方式：
+    1. 神经网络评分（默认，基于GNN）
+    2. 规则评分（备选，基于交通工程理论）
+
+    优先使用神经网络评分，出错时自动回退到规则评分。
     """
 
     def __init__(
         self,
-        neural_scorer=None,
+        config: Dict[str, Any],
         frenet_system=None,
-        use_neural: bool = True,
         device: str = 'cuda'
     ):
         """
         初始化统一评分器
 
         Args:
-            neural_scorer: 神经网络评分器（可选）
-            frenet_system: Frenet坐标系系统（规则评分需要）
-            use_neural: 是否使用神经网络评分
-            device: 设备
+            config: 配置字典
+            frenet_system: Frenet坐标系系统
+            device: 设备（'cuda'或'cpu'）
         """
-        self.use_neural = use_neural and neural_scorer is not None
+        self.config = config
+        self.frenet_system = frenet_system
+        self.device = device
 
-        # 创建规则评分器（作为后备或主要评分器）
-        self.rule_scorer = RuleBasedScorer(frenet_system)
+        # 配置参数
+        neural_config = config.get('neural_icv_scoring', {})
+        self.use_neural = neural_config.get('enabled', True)  # 默认启用神经网络
+        self.fallback_on_error = neural_config.get('fallback_on_error', True)
 
-        # 创建神经网络评分器（如果启用）
+        # 初始化评分器
+        self.neural_scorer = None
+        self.rule_scorer = None
+
         if self.use_neural:
-            self.neural_scorer = NeuralScorer(
-                neural_scorer=neural_scorer,
-                rule_scorer=self.rule_scorer,
-                device=device
+            try:
+                checkpoint_path = neural_config.get('checkpoint_path')
+                self.neural_scorer = create_icv_gnn_scorer(
+                    config=config,
+                    device=device,
+                    checkpoint_path=checkpoint_path
+                )
+                print(f"[UnifiedVehicleScorer] 神经网络评分器已启用 (device={device})")
+                if checkpoint_path:
+                    print(f"[UnifiedVehicleScorer] 预训练权重: {checkpoint_path}")
+                else:
+                    print(f"[UnifiedVehicleScorer] 使用随机初始化模型")
+            except Exception as e:
+                print(f"[UnifiedVehicleScorer] 警告：神经网络评分器初始化失败: {e}")
+                if self.fallback_on_error:
+                    print("[UnifiedVehicleScorer] 将回退到规则评分器")
+                    self.use_neural = False
+                else:
+                    raise
+
+        # 始终初始化规则评分器作为备选
+        try:
+            self.rule_scorer = RuleBasedVehicleScorer(
+                config=config,
+                frenet_system=frenet_system
             )
-        else:
-            self.neural_scorer = None
+            print("[UnifiedVehicleScorer] 规则评分器已初始化（备选）")
+        except Exception as e:
+            print(f"[UnifiedVehicleScorer] 警告：规则评分器初始化失败: {e}")
+
+        # 统计信息
+        self.stats = {
+            'neural_calls': 0,
+            'rule_calls': 0,
+            'errors': 0,
+        }
 
     def compute_scores(
         self,
         vehicle_states: Dict[str, Dict],
-        context: Optional[Dict] = None
+        context: Dict
     ) -> Dict[str, float]:
         """
-        统一的评分接口
+        计算所有车辆的评分
+
+        Args:
+            vehicle_states: {veh_id: {s, d, vs, vd, speed, accel, lane, angle, ...}}
+            context: {traci_lib, all_vehicle_ids, ...}
+
+        Returns:
+            scores: {veh_id: score} 评分范围 [0, 1]
+        """
+        # 优先使用神经网络评分
+        if self.use_neural and self.neural_scorer is not None:
+            try:
+                scores = self.neural_scorer.compute_scores(vehicle_states, context)
+                self.stats['neural_calls'] += 1
+                return scores
+            except Exception as e:
+                self.stats['errors'] += 1
+                print(f"[UnifiedVehicleScorer] 神经网络评分失败: {e}")
+
+                if self.fallback_on_error and self.rule_scorer is not None:
+                    print("[UnifiedVehicleScorer] 回退到规则评分器")
+                    scores = self.rule_scorer.compute_scores(vehicle_states, context)
+                    self.stats['rule_calls'] += 1
+                    return scores
+                else:
+                    raise
+
+        # 使用规则评分
+        elif self.rule_scorer is not None:
+            scores = self.rule_scorer.compute_scores(vehicle_states, context)
+            self.stats['rule_calls'] += 1
+            return scores
+
+        else:
+            raise RuntimeError("[UnifiedVehicleScorer] 没有可用的评分器")
+
+    def get_top_k_vehicles(
+        self,
+        vehicle_states: Dict[str, Dict],
+        context: Dict,
+        k: int,
+        min_score: float = 0.0
+    ) -> List[str]:
+        """
+        获取评分最高的K个车辆
 
         Args:
             vehicle_states: 车辆状态字典
-            context: 上下文信息（traci_lib, all_vehicle_ids等）
+            context: 上下文信息
+            k: 返回的车辆数量
+            min_score: 最低评分阈值
 
         Returns:
-            评分字典 {veh_id: score}
+            top_k_vehicles: 按评分排序的车辆ID列表
         """
-        if self.use_neural and self.neural_scorer is not None:
-            return self.neural_scorer.compute_scores(vehicle_states, context)
-        else:
-            return self.rule_scorer.compute_scores(vehicle_states, context)
+        scores = self.compute_scores(vehicle_states, context)
 
-    def get_stats(self) -> Dict[str, int]:
-        """获取评分器统计信息"""
-        if self.neural_scorer:
-            return self.neural_scorer.get_stats()
+        # 按评分排序
+        sorted_vehicles = sorted(
+            scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # 过滤低于阈值的车辆
+        filtered_vehicles = [
+            (veh_id, score) for veh_id, score in sorted_vehicles
+            if score >= min_score
+        ]
+
+        # 取前K个
+        top_k_vehicles = [
+            veh_id for veh_id, score in filtered_vehicles[:k]
+        ]
+
+        return top_k_vehicles
+
+    def get_score_breakdown(
+        self,
+        vehicle_states: Dict[str, Dict],
+        context: Dict,
+        veh_id: str
+    ) -> Dict[str, Any]:
+        """
+        获取单个车辆的评分详细分解（用于调试和可视化）
+
+        Args:
+            vehicle_states: 车辆状态字典
+            context: 上下文信息
+            veh_id: 车辆ID
+
+        Returns:
+            breakdown: 评分分解字典
+        """
+        if self.rule_scorer is not None and veh_id in vehicle_states:
+            return self.rule_scorer.get_score_breakdown(vehicle_states, context, veh_id)
         else:
-            return {'mode': 'rule_based_only'}
+            return {
+                'total': 0.0,
+                'error': 'Vehicle not found or rule scorer unavailable'
+            }
+
+    def get_statistics(self) -> Dict[str, int]:
+        """
+        获取评分器使用统计
+
+        Returns:
+            stats: 统计信息字典
+        """
+        return self.stats.copy()
+
+    def reset_statistics(self):
+        """重置统计信息"""
+        self.stats = {
+            'neural_calls': 0,
+            'rule_calls': 0,
+            'errors': 0,
+        }
+
+    def switch_to_neural(self, checkpoint_path: Optional[str] = None):
+        """
+        切换到神经网络评分模式
+
+        Args:
+            checkpoint_path: 预训练权重路径（可选）
+        """
+        if self.neural_scorer is None:
+            try:
+                self.neural_scorer = create_icv_gnn_scorer(
+                    config=self.config,
+                    device=self.device,
+                    checkpoint_path=checkpoint_path
+                )
+                self.use_neural = True
+                print("[UnifiedVehicleScorer] 已切换到神经网络评分模式")
+            except Exception as e:
+                print(f"[UnifiedVehicleScorer] 切换失败: {e}")
+        else:
+            if checkpoint_path is not None:
+                self.neural_scorer.load_checkpoint(checkpoint_path)
+            self.use_neural = True
+            print("[UnifiedVehicleScorer] 已切换到神经网络评分模式")
+
+    def switch_to_rule(self):
+        """切换到规则评分模式"""
+        self.use_neural = False
+        print("[UnifiedVehicleScorer] 已切换到规则评分模式")
+
+    def get_current_mode(self) -> str:
+        """
+        获取当前评分模式
+
+        Returns:
+            mode: 'neural' 或 'rule'
+        """
+        return 'neural' if self.use_neural else 'rule'
 
 
 def create_vehicle_scorer_from_config(
-    config: Dict,
-    frenet_system,
+    config: Dict[str, Any],
+    frenet_system=None,
     device: str = 'cuda'
 ) -> UnifiedVehicleScorer:
     """
-    从配置创建车辆评分器
+    从配置创建统一车辆评分器的工厂函数
 
     Args:
         config: 配置字典
         frenet_system: Frenet坐标系系统
-        device: 设备
+        device: 设备（'cuda'或'cpu'）
 
     Returns:
-        UnifiedVehicleScorer实例
+        scorer: UnifiedVehicleScorer实例
     """
-    # 读取神经网络ICV评分配置
-    neural_icv_config = config.get('neural_icv_scoring', {})
-    use_neural = neural_icv_config.get('enabled', True)
-
-    neural_scorer_model = None
-    if use_neural:
-        try:
-            from src.models.neural_vehicle_scorer import create_neural_icv_scorer
-
-            # 创建NeuralICVScorer（包含模型）
-            neural_icv_scorer = create_neural_icv_scorer(
-                node_dim=neural_icv_config.get('node_dim', 9),
-                hidden_dim=neural_icv_config.get('hidden_dim', 64),
-                num_layers=neural_icv_config.get('num_layers', 3),
-                num_heads=neural_icv_config.get('num_heads', 4),
-                checkpoint_path=neural_icv_config.get('checkpoint_path', None),
-                device=device
-            )
-
-            # 提取内部的神经网络模型
-            neural_scorer_model = neural_icv_scorer.neural_scorer
-            print(f"[OK] 神经网络ICV评分器已启用")
-        except Exception as e:
-            print(f"[WARN] 神经网络评分器初始化失败: {e}，使用规则评分")
-            neural_scorer_model = None
-
-    # 创建统一评分器
     scorer = UnifiedVehicleScorer(
-        neural_scorer=neural_scorer_model,
+        config=config,
         frenet_system=frenet_system,
-        use_neural=neural_scorer_model is not None,
         device=device
     )
-
     return scorer
