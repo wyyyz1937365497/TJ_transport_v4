@@ -42,7 +42,87 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.models.joint_icv_policy import create_joint_icv_policy
 from src.env.competition_env import CompetitionSumoEnv
-from src.training.ocr_rewards import OCRRewardComputer
+from src.training.ocr_rewards import OCRRewardCalculator as OCRRewardComputer
+
+
+def flatten_observation(obs_dict: dict, max_vehicles: int = 32) -> np.ndarray:
+    """
+    将观测字典转换为扁平化张量
+
+    Args:
+        obs_dict: 环境返回的观测字典
+        max_vehicles: 最大车辆数（用于padding）
+
+    Returns:
+        flattened_obs: [obs_dim] 扁平化观测
+            obs_dim = max_vehicles * 9 + 32 + 1
+    """
+    vehicle_states = obs_dict.get('vehicle_states', {})
+    vehicle_ids = obs_dict.get('vehicle_ids', [])
+    icv_ids = obs_dict.get('icv_ids', set())
+    global_stats = obs_dict.get('global_stats', np.zeros(32))
+
+    num_vehicles = len(vehicle_ids)
+
+    # 提取9维车辆特征（归一化）
+    vehicle_features = np.zeros((max_vehicles, 9), dtype=np.float32)
+
+    for i, veh_id in enumerate(vehicle_ids[:max_vehicles]):
+        if veh_id in vehicle_states:
+            state = vehicle_states[veh_id]
+            vehicle_features[i, 0] = state.get('s', 0.0) / 1000.0
+            vehicle_features[i, 1] = state.get('d', 0.0) / 10.0
+            vehicle_features[i, 2] = state.get('vs', 0.0) / 30.0
+            vehicle_features[i, 3] = state.get('vd', 0.0) / 10.0
+            vehicle_features[i, 4] = state.get('speed', 0.0) / 30.0
+            vehicle_features[i, 5] = state.get('acceleration', 0.0) / 3.0
+            vehicle_features[i, 6] = state.get('lane_index', 0.0) / 10.0
+            vehicle_features[i, 7] = state.get('angle', 0.0) / 360.0
+            vehicle_features[i, 8] = 1.0 if veh_id in icv_ids else 0.0
+
+    # 确保global_stats是32维
+    global_stats_flat = global_stats.flatten()
+    if len(global_stats_flat) < 32:
+        global_stats_flat = np.concatenate([
+            global_stats_flat,
+            np.zeros(32 - len(global_stats_flat), dtype=np.float32)
+        ])
+    elif len(global_stats_flat) > 32:
+        global_stats_flat = global_stats_flat[:32]
+
+    # 扁平化并拼接
+    vehicle_features_flat = vehicle_features.flatten()  # [max_vehicles * 9]
+    num_vehicles_array = np.array([num_vehicles], dtype=np.float32)
+
+    flattened_obs = np.concatenate([
+        vehicle_features_flat,
+        global_stats_flat,
+        num_vehicles_array
+    ])
+
+    return flattened_obs
+
+
+def convert_actions_to_dict(action_array: np.ndarray, vehicle_ids: list) -> dict:
+    """
+    将扁平动作数组转换为字典格式
+
+    Args:
+        action_array: [max_vehicles * 2] 扁平动作数组
+        vehicle_ids: 车辆ID列表
+
+    Returns:
+        actions_dict: {vehicle_id: [acceleration, lane_change]}
+    """
+    max_vehicles = action_array.shape[0] // 2
+    actions_reshaped = action_array.reshape(max_vehicles, 2)
+
+    actions_dict = {}
+    for i, veh_id in enumerate(vehicle_ids[:max_vehicles]):
+        if i < max_vehicles:
+            actions_dict[veh_id] = actions_reshaped[i]
+
+    return actions_dict
 
 
 class Stage2Evaluator:
@@ -81,7 +161,16 @@ class Stage2Evaluator:
         Returns:
             episode_metrics: Dict
         """
-        obs, _ = self.env.reset()
+        obs = self.env.reset()  # 返回观测字典
+
+        # 🔥 修复：预热环境，让车辆出发
+        # reset后vehicle_ids可能是空的，需要step一次让车辆开始仿真
+        if len(obs.get('vehicle_ids', [])) == 0:
+            obs, _, done, _ = self.env.step({})
+            if done:
+                print("⚠️  警告：环境在预热后就结束了！")
+                return episode_data
+
         done = False
         truncated = False
 
@@ -105,7 +194,9 @@ class Stage2Evaluator:
         max_steps = 36000  # 1小时仿真
 
         while not (done or truncated) and step_count < max_steps:
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+            # 将观测字典转换为扁平化张量
+            obs_flat = flatten_observation(obs, max_vehicles=self.policy.max_vehicles)
+            obs_tensor = torch.as_tensor(obs_flat, dtype=torch.float32).unsqueeze(0).to(self.device)
 
             # 前向传播
             with torch.no_grad():
@@ -113,8 +204,15 @@ class Stage2Evaluator:
 
             action = outputs['actions'][0].cpu().numpy()
 
+            # 将动作转换为字典格式
+            # 🔥 修复：只给ICV车辆分配动作，而不是所有车辆
+            icv_ids = obs.get('icv_ids', set())
+            vehicle_ids = list(icv_ids) if icv_ids else obs.get('vehicle_ids', [])
+            action_dict = convert_actions_to_dict(action, vehicle_ids)
+
             # 执行动作
-            next_obs, reward, done, truncated, info = self.env.step(action)
+            next_obs, reward, done, info = self.env.step(action_dict)
+            truncated = False  # 环境不返回truncated，统一使用done
 
             # 统计
             episode_data['steps'] += 1
@@ -131,7 +229,7 @@ class Stage2Evaluator:
                 episode_data['cost_rewards'].append(rewards.get('cost', 0))
 
             # 统计干预车辆数
-            obs_dim = obs.shape[0]
+            obs_dim = obs_flat.shape[0]
             vehicle_dim = (obs_dim - 32 - 1)
             num_vehicles = vehicle_dim // 9
             actions_reshaped = action.reshape(num_vehicles, 2)
@@ -148,6 +246,8 @@ class Stage2Evaluator:
             # 安全事件
             if 'collision' in info and info['collision']:
                 episode_data['collisions'] += 1
+
+            obs = next_obs
 
             if 'emergency_braking' in info and info['emergency_braking']:
                 episode_data['emergency_braking'] += 1
@@ -500,6 +600,14 @@ def main():
         initial_k_ratio=config['policy']['sparse_gate']['initial_k_ratio'],
         device=args.device
     )
+
+    # 启用WorldModel（如果checkpoint包含）
+    print("\n启用WorldModel...")
+    policy.enable_world_model(
+        num_vehicles=config['environment']['icv_config']['max_vehicles'],
+        latent_dim=64
+    )
+    print("  ✅ WorldModel已启用")
 
     # 加载权重
     print(f"\n加载检查点: {args.checkpoint}")

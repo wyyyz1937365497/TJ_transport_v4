@@ -915,13 +915,73 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         """获取比赛所需的信息"""
         base_info = self._get_info()
 
+        # 计算奖励组件（用于评估和训练监控）
+        vehicle_states = self._get_observation().get('vehicle_states', {})
+        if vehicle_states:
+            # 重新计算奖励组件
+            speeds = np.array([v['speed'] for v in vehicle_states.values()])
+            num_vehicles = len(speeds)
+
+            # 效率组件
+            avg_speed = np.mean(speeds)
+            speed_score = avg_speed * self.speed_norm_factor
+
+            arrived_count = len(self.stats.get('arrived_vehicles', []))
+            current_time = self.current_step * self.config.get('step_length', 0.1)
+            throughput_score = arrived_count / max(current_time, 1.0) * self.throughput_weight
+
+            departed_count = len(self.stats.get('departed_vehicles', []))
+            completion_score = (arrived_count / max(departed_count, 1)) if departed_count > 0 else 0.0
+
+            w_speed, w_throughput, w_completion = self.efficiency_weights
+            efficiency_score = (
+                w_speed * speed_score +
+                w_throughput * throughput_score +
+                w_completion * completion_score
+            )
+
+            # 稳定性组件
+            if num_vehicles > 1:
+                speed_std = np.std(speeds)
+                stability_score = -self.stability_weight * (speed_std / 10.0)
+            else:
+                stability_score = 0.0
+
+            congestion_ratio = np.mean(speeds < 1.0)
+            congestion_penalty = -self.congestion_penalty_weight * congestion_ratio
+
+            stopped_ratio = np.mean(speeds < 0.1)
+            stopped_penalty = -self.stopped_penalty_weight * stopped_ratio
+
+            stability_total = stability_score + congestion_penalty + stopped_penalty
+
+            # 干预成本组件
+            control_magnitude = self.intervention_stats.get('control_magnitude', 0.0)
+            magnitude_penalty = 0.01 * control_magnitude / max(num_vehicles, 1)
+
+            lane_changes = self.intervention_stats.get('total_lane_changes', 0)
+            lane_change_penalty = 0.1 * lane_changes / max(num_vehicles, 1)
+
+            intervention_cost = magnitude_penalty + lane_change_penalty
+        else:
+            avg_speed = 0.0
+            efficiency_score = 0.0
+            stability_total = 0.0
+            intervention_cost = 0.0
+
         competition_info = {
             **base_info,
             'intervention_stats': self.intervention_stats.copy(),
             'performance_metrics': self.performance_metrics.copy(),
-            'efficiency_score': self.performance_metrics.get('avg_speed', 0.0),
-            'stability_score': -self.performance_metrics.get('speed_std', 0.0),
-            'intervention_penalty': self.intervention_stats.get('control_magnitude', 0.0)
+            'efficiency_score': efficiency_score,
+            'stability_score': stability_total,
+            'intervention_penalty': intervention_cost,
+            'average_speed': float(avg_speed),
+            'reward_components': {
+                'efficiency': float(efficiency_score),
+                'stability': float(stability_total),
+                'cost': float(intervention_cost)
+            }
         }
 
         return competition_info

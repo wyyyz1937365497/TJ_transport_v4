@@ -153,10 +153,10 @@ stage2_guided_exploration:
   # PPO配置
   ppo:
     # 基础参数
-    num_iterations: 1000
-    num_steps_per_iteration: 2048
-    batch_size: 64
-    num_minibatches: 32
+    num_iterations: 100              # 🔥 100个迭代，充分训练
+    num_steps_per_iteration: 3600   # 🔥 完整3600秒仿真（36000步），与SUMO配置一致
+    batch_size: 256                  # 🔥 22G显存可用256
+    num_minibatches: 8               # 🔥 8个minibatch平衡训练速度
 
     # PPO裁剪参数
     clip_param: 0.2
@@ -168,7 +168,7 @@ stage2_guided_exploration:
 
     # 优化器
     optimizer: Adam
-    lr: 3.0e-4
+    lr: 1.0e-4  # 🔥 从3.0e-4降到1.0e-4，减少Policy Loss波动
     weight_decay: 1.0e-5
     grad_clip: 0.5
 
@@ -176,13 +176,13 @@ stage2_guided_exploration:
     lr_schedule:
       enabled: true
       type: LinearLR
-      total_iters: 1000
+      total_iters: 100              # 🔥 匹配num_iterations
       start_factor: 0.1
       end_factor: 1.0
 
     # PPO更新参数
     update_epochs: 10
-    entropy_coef: 0.01
+    entropy_coef: 0.02  # 🔥 从0.01增加到0.02，鼓励更多探索
     vf_coef: 0.5
 
     # KL散度自适应

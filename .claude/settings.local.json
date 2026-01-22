@@ -56,7 +56,9 @@
       "Bash(done:*)",
       "Bash(git log:*)",
       "Bash(top:*)",
-      "Bash(git ls-tree:*)"
+      "Bash(git ls-tree:*)",
+      "Bash(then ls -lh data/icv_selection/)",
+      "Bash(else echo \"❌ 目录不存在: data/icv_selection\")"
     ]
   }
 }

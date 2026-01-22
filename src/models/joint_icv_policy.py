@@ -950,6 +950,7 @@ class JointICVPolicy(nn.Module):
         # ===========================================
 
         # 7. 计算log_prob和entropy（高斯策略）
+        # 只为选中的ICV计算log_prob和entropy
         log_std = self.log_std.unsqueeze(0).expand_as(actions_flat)
         log_std = torch.clamp(log_std, min=-5.0, max=2.0)
 
@@ -961,19 +962,27 @@ class JointICVPolicy(nn.Module):
         else:
             actions_out = mean + std * torch.randn_like(mean)
 
-        # 计算log_prob
-        log_prob = -0.5 * (
+        # 计算每个动作维度的log_prob
+        log_prob_per_dim = -0.5 * (
             ((actions_out - mean) / (std + 1e-6)) ** 2 +
             2 * log_std +
             np.log(2 * np.pi)
-        )
-        log_prob = log_prob.sum(dim=-1)  # [B]
+        )  # [B, N*2]
 
-        # 计算熵（高斯分布的熵）
-        # entropy = 0.5 * log(2 * pi * e * std^2) = 0.5 * (log(2*pi) + 2*log_std + 1)
-        entropy = 0.5 * (
+        # 创建选择mask（从[B, N, 1]扩展到[B, N*2]）
+        selection_mask_2d = selection_mask.squeeze(-1)  # [B, N]
+        selection_mask_flat = selection_mask_2d.repeat(1, 2)  # [B, N*2] 每辆车2个动作
+
+        # 只对选中的ICV计算log_prob和entropy
+        masked_log_prob = log_prob_per_dim * selection_mask_flat  # [B, N*2]
+        log_prob = masked_log_prob.sum(dim=-1)  # [B] 只对选中的维求和
+
+        # 计算熵（只对选中的ICV）
+        entropy_per_dim = 0.5 * (
             np.log(2 * np.pi) + 2 * log_std + 1
-        ).sum(dim=-1)  # [B]
+        )  # [B, N*2]
+        masked_entropy = entropy_per_dim * selection_mask_flat  # [B, N*2]
+        entropy = masked_entropy.sum(dim=-1)  # [B] 只对选中的维求和
 
         return {
             'actions': actions_out,
@@ -1018,24 +1027,33 @@ class JointICVPolicy(nn.Module):
         raw_actions = self.policy_head(embeddings, selection_mask)
         actions_flat = raw_actions.view(B, -1)
 
-        # 计算log_prob和entropy
+        # 计算log_prob和entropy（只对选中的ICV）
         log_std = self.log_std.unsqueeze(0).expand_as(actions_flat)
         log_std = torch.clamp(log_std, min=-5.0, max=2.0)
 
         mean = actions_flat
         std = torch.exp(log_std)
 
-        log_prob = -0.5 * (
+        # 计算每个动作维度的log_prob
+        log_prob_per_dim = -0.5 * (
             ((actions - mean) / (std + 1e-6)) ** 2 +
             2 * log_std +
             np.log(2 * np.pi)
-        )
-        log_prob = log_prob.sum(dim=-1)
+        )  # [B, N*2]
 
-        entropy = 0.5 * (
+        # 创建选择mask（从[B, N, 1]扩展到[B, N*2]）
+        selection_mask_2d = selection_mask.squeeze(-1)  # [B, N]
+        selection_mask_flat = selection_mask_2d.repeat(1, 2)  # [B, N*2]
+
+        # 只对选中的ICV计算log_prob和entropy
+        masked_log_prob = log_prob_per_dim * selection_mask_flat
+        log_prob = masked_log_prob.sum(dim=-1)
+
+        entropy_per_dim = 0.5 * (
             np.log(2 * np.pi) + 2 * log_std + 1
-        ).sum(dim=-1)
-        entropy = entropy.mean()
+        )
+        masked_entropy = entropy_per_dim * selection_mask_flat
+        entropy = masked_entropy.sum(dim=-1).mean()
 
         value = self.value_head(embeddings)
 

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Stage 2: 引导探索训练（Guided Exploration Training）
+Stage 2: 基于规则的ICV选择训练（Rule-Based ICV Selection Training）
 
 功能：
-1. 加载Stage 1预训练的WorldModel
-2. PPO训练优化OCR奖励
+1. 使用基于规则的ICV选择器（不训练选择器）
+2. PPO训练只优化策略网络（加速度和换道）
 3. 固定奖励权重
 
+与标准Stage 2的区别：
+- ICV选择使用规则而不是神经网络
+- 策略网络不学习选择，只学习控制
+- 用于验证规则选择器是否优于神经网络选择器
+
 使用方法：
-    python scripts/train_stage2_guided_exploration.py --config configs/v5_complete.yaml --resume checkpoints/v5_complete/stage1_best.pth
+    python scripts/train_stage2_rule_based.py --config configs/v5_complete.yaml
 
 输出：
-    - checkpoints/v5_complete/stage2_guided.pth
-    - logs/v5_complete/stage2/
+    - checkpoints/v5_complete/stage2_rule_based.pth
+    - logs/v5_complete/stage2_rule_based/
 """
 
 import os
@@ -37,6 +42,7 @@ from src.models.joint_icv_policy import create_joint_icv_policy
 from src.models.world_model import WorldModel, create_world_model
 from src.env.competition_env import CompetitionSumoEnv
 from src.training.ocr_rewards import OCRRewardCalculator as OCRRewardComputer
+from src.env.rule_based_scorer import RuleBasedVehicleScorer
 
 
 def flatten_observation(obs_dict: dict, max_vehicles: int = 32) -> np.ndarray:
@@ -119,20 +125,60 @@ def convert_actions_to_dict(action_array: np.ndarray, vehicle_ids: list) -> dict
     return actions_dict
 
 
+def select_icv_by_rules(obs_dict: dict, rule_scorer: RuleBasedVehicleScorer,
+                        k_ratio: float = 0.10) -> set:
+    """
+    使用规则选择器选择ICV
+
+    Args:
+        obs_dict: 观测字典
+        rule_scorer: 规则评分器
+        k_ratio: K值比例
+
+    Returns:
+        icv_ids: 选择的ICV车辆ID集合
+    """
+    vehicle_states = obs_dict.get('vehicle_states', {})
+    all_vehicle_ids = obs_dict.get('vehicle_ids', [])
+
+    if not all_vehicle_ids:
+        return set()
+
+    # 使用规则评分器计算所有车辆的评分
+    context = {
+        'traci_lib': None,  # 规则评分器可以在没有TraCI的情况下工作
+        'all_vehicle_ids': all_vehicle_ids
+    }
+
+    scores = rule_scorer.compute_scores(vehicle_states, context)
+
+    # 选择Top-K车辆
+    k = max(5, int(len(all_vehicle_ids) * k_ratio))
+    k = min(k, len(all_vehicle_ids))
+
+    # 按分数排序
+    sorted_vehicles = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    # 选择Top-K
+    icv_ids = set([veh_id for veh_id, _ in sorted_vehicles[:k]])
+
+    return icv_ids
+
+
 class PPOTrainer:
     """
-    PPO训练器（Stage 2）
+    PPO训练器（Stage 2 - 基于规则的ICV选择）
     """
 
     def __init__(self, policy, env, config, device='cuda',
-                 use_cache=True, force_refresh=False, cache_dir=None):
+                 use_cache=False, force_refresh=False, cache_dir=None):
         """
         Args:
             policy: JointICVPolicy
             env: CompetitionSumoEnv
             config: 配置字典
             device: 设备
-            use_cache: 是否使用缓存
+            use_cache: 是否使用缓存（规则模式默认关闭）
             force_refresh: 是否强制刷新缓存
             cache_dir: 缓存目录
         """
@@ -143,6 +189,10 @@ class PPOTrainer:
         self.use_cache = use_cache
         self.force_refresh = force_refresh
         self.cache_dir = cache_dir
+
+        # 🔥 新增：初始化规则选择器
+        self.rule_scorer = RuleBasedVehicleScorer(config=config)
+        print("[PPOTrainer] 规则ICV选择器已初始化")
 
         # PPO配置
         ppo_config = config['stage2_guided_exploration']['ppo']
@@ -294,9 +344,9 @@ class PPOTrainer:
             log_prob = outputs['log_prob'][0].cpu().item()
 
             # 将动作转换为字典格式
-            # 🔥 修复：只给ICV车辆分配动作，而不是所有车辆
-            icv_ids = obs.get('icv_ids', set())
-            vehicle_ids = list(icv_ids) if icv_ids else obs.get('vehicle_ids', [])
+            # 🔥 基于规则的ICV选择：使用规则选择器而不是环境返回的icv_ids
+            rule_selected_icv_ids = select_icv_by_rules(obs, self.rule_scorer, k_ratio=0.10)
+            vehicle_ids = list(rule_selected_icv_ids) if rule_selected_icv_ids else obs.get('vehicle_ids', [])
             action_dict = convert_actions_to_dict(action, vehicle_ids)
 
             # 执行动作
@@ -507,30 +557,28 @@ class PPOTrainer:
 
             # 保存检查点
             if (iteration + 1) % self.config['stage2_guided_exploration']['checkpoint']['save_interval'] == 0:
-                checkpoint_path = checkpoint_dir / f'stage2_iter_{iteration+1}.pth'
+                checkpoint_path = checkpoint_dir / f'stage2_rule_iter_{iteration+1}.pth'
                 torch.save(self.policy.state_dict(), checkpoint_path)
                 print(f"  检查点已保存: {checkpoint_path}")
 
             # 保存最佳模型
             if metrics['mean_return'] > best_reward:
                 best_reward = metrics['mean_return']
-                best_checkpoint = checkpoint_dir / 'stage2_best.pth'
+                best_checkpoint = checkpoint_dir / 'stage2_rule_best.pth'
                 torch.save(self.policy.state_dict(), best_checkpoint)
                 print(f"  ✅ 最佳模型已保存: {best_checkpoint}")
 
         print("\n" + "=" * 80)
-        print("🎉 Stage 2 训练完成！")
+        print("🎉 Stage 2 规则选择器训练完成！")
         print("=" * 80)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 2: Guided Exploration Training")
+    parser = argparse.ArgumentParser(description="Stage 2: Rule-Based ICV Selection Training")
     parser.add_argument('--config', type=str, default='configs/v5_complete.yaml',
                         help='配置文件路径')
     parser.add_argument('--resume', type=str, default=None,
                         help='恢复检查点路径（Stage 1的WorldModel）')
-    parser.add_argument('--pretrain_importance', type=str, default=None,
-                        help='预训练的ImportancePredictor权重路径')
     parser.add_argument('--device', type=str, default='cuda',
                         help='设备')
 
@@ -549,16 +597,14 @@ def main():
         config = yaml.safe_load(f)
 
     print("=" * 80)
-    print("Stage 2: 引导探索训练")
+    print("Stage 2: 基于规则的ICV选择训练")
     print("=" * 80)
     print(f"\n配置文件: {args.config}")
     print(f"设备: {args.device}")
+    print(f"\n📌 特点：使用规则选择器选择ICV，策略只学习控制")
 
     if args.resume:
-        print(f"恢复Stage 1检查点: {args.resume}")
-
-    if args.pretrain_importance:
-        print(f"预训练ImportancePredictor: {args.pretrain_importance}")
+        print(f"\n恢复Stage 1检查点: {args.resume}")
 
     # 创建环境
     print("\n创建环境...")
@@ -601,49 +647,6 @@ def main():
         policy.use_world_model = True
         policy.world_model = world_model
         print(f"  ✅ WorldModel已启用")
-
-    # 🔥 加载预训练的ImportancePredictor权重（如果有）
-    if args.pretrain_importance:
-        print(f"\n加载预训练的ImportancePredictor权重...")
-        try:
-            pretrain_checkpoint = torch.load(args.pretrain_importance, map_location=args.device)
-
-            # 加载ImportancePredictor权重
-            if 'model_state_dict' in pretrain_checkpoint:
-                # 预训练脚本保存的格式
-                state_dict = pretrain_checkpoint['model_state_dict']
-
-                # 提取ImportancePredictor的权重
-                importance_weights = {}
-                gnn_weights = {}
-
-                for key, value in state_dict.items():
-                    if key.startswith('importance_predictor.'):
-                        new_key = key.replace('importance_predictor.', '')
-                        importance_weights[new_key] = value
-                    elif key.startswith('gnn_encoder.'):
-                        new_key = key.replace('gnn_encoder.', '')
-                        gnn_weights[new_key] = value
-
-                # 加载ImportancePredictor
-                if importance_weights:
-                    policy.importance_predictor.load_state_dict(importance_weights, strict=False)
-                    print(f"  ✅ ImportancePredictor权重已加载")
-
-                # 加载GNN编码器
-                if gnn_weights:
-                    policy.gnn_encoder.load_state_dict(gnn_weights, strict=False)
-                    print(f"  ✅ GNN编码器权重已加载")
-
-                print(f"  📊 预训练验证准确率: {pretrain_checkpoint.get('val_acc', 'N/A'):.4f}")
-            else:
-                # 直接的state_dict格式
-                policy.importance_predictor.load_state_dict(pretrain_checkpoint, strict=False)
-                print(f"  ✅ ImportancePredictor权重已加载")
-
-        except Exception as e:
-            print(f"  ⚠️  加载预训练权重失败: {e}")
-            print(f"  将使用随机初始化的ImportancePredictor")
 
     # 创建训练器
     trainer = PPOTrainer(
