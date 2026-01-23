@@ -561,7 +561,7 @@ def main():
 
     # 设置默认值
     if 'sumocfg_file' not in env_config:
-        env_config['sumocfg_file'] = 'configs/scenario/sumo_config.sumocfg'
+        env_config['sumocfg_file'] = '仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg'
     if 'max_steps' not in env_config:
         env_config['max_steps'] = 3600
     if 'icv_ratio' not in env_config:
