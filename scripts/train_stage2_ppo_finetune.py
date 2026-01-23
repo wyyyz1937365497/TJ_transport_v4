@@ -244,19 +244,7 @@ class PPOFinetuneTrainer:
                 icv_ids = obs_dict.get('icv_ids', set())
                 actions_dict = convert_actions_to_dict(action, vehicle_ids, icv_ids)
 
-                # 计算奖励
-                vehicle_info = self.env.get_vehicle_info()
-                accel_commands = len([a for a in action[::2] if abs(a) > 0.01])
-                lane_changes = len([a for a in action[1::2] if a > 0.5])
-
-                reward = self.reward_calculator.update(
-                    vehicle_info=vehicle_info,
-                    accel_commands=accel_commands,
-                    lane_changes=lane_changes,
-                    action_dict=actions_dict
-                )
-
-                # 执行动作
+                # 执行动作（环境内部计算奖励）
                 next_obs_dict, reward, done, info = self.env.step(actions_dict)
 
                 # 存储转换
