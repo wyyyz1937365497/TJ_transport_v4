@@ -219,7 +219,7 @@ class PPOFinetuneTrainer:
         episode_returns = []
 
         for episode_idx in tqdm(range(num_episodes), desc="Collecting rollouts"):
-            obs = self.env.reset()
+            obs_dict = self.env.reset()
             episode_reward = 0.0
             episode_obs = []
             episode_actions = []
@@ -229,7 +229,6 @@ class PPOFinetuneTrainer:
 
             for step in range(self.max_steps_per_episode):
                 # 解析观测
-                obs_dict = self.env.get_observation_dict()
                 obs_flat = flatten_observation(obs_dict)
                 obs_tensor = torch.from_numpy(obs_flat).unsqueeze(0).float().to(self.device)
 
@@ -258,7 +257,7 @@ class PPOFinetuneTrainer:
                 )
 
                 # 执行动作
-                next_obs, reward, done, info = self.env.step(actions_dict)
+                next_obs_dict, reward, done, info = self.env.step(actions_dict)
 
                 # 存储转换
                 episode_obs.append(obs_flat)
@@ -266,6 +265,9 @@ class PPOFinetuneTrainer:
                 episode_rewards.append(reward)
                 episode_values.append(value)
                 episode_log_probs.append(log_prob)
+
+                # 更新观测
+                obs_dict = next_obs_dict
 
                 episode_reward += reward
 
