@@ -107,11 +107,11 @@ stage2_ppo_finetune:
     # 训练迭代数
     num_iterations: 100
 
-    # 每次迭代的episode数
-    num_episodes_per_iter: 10
+    # 每次迭代的episode数（优化：10 → 5，提速50%）
+    num_episodes_per_iter: 5
 
-    # 每个episode最大步数
-    max_steps_per_episode: 3600
+    # 每个episode最大步数（优化：3600 → 1800，提速50%）
+    max_steps_per_episode: 1800
 
     # 学习率（微调使用更小的学习率）
     lr: 1.0e-4
@@ -123,10 +123,10 @@ stage2_ppo_finetune:
     entropy_coef: 0.01             # 熵系数
     value_coef: 0.5                # 价值损失系数
 
-    # 训练配置
-    num_minibatches: 4             # minibatch数量
-    ppo_epochs: 10                 # 每次更新的PPO epoch数
-    batch_size: 64                 # 批次大小
+    # 训练配置（优化：增大batch size，补偿减少的episodes）
+    num_minibatches: 8             # 4 → 8
+    ppo_epochs: 15                 # 10 → 15 (增加更新轮数补偿)
+    batch_size: 128                # 64 → 128
 
   # Bottleneck奖励配置
   bottleneck_rewards:
