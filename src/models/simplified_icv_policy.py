@@ -180,6 +180,9 @@ class SimplifiedICVPolicy(nn.Module):
 
         self.training = True
 
+        # 将模型移动到指定设备
+        self.to(self.device)
+
     def _parse_observation(
         self,
         obs: torch.Tensor
