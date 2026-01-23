@@ -120,7 +120,9 @@ class OCRRewardCalculator:
         w_stability: float = 0.3,   # 初赛稳定性权重
         alpha: float = 1.0,         # 加速度指令权重
         beta: float = 5.0,          # 换道指令权重
-        use_improved_reward: bool = False  # ✅ 新增：是否使用改进的即时奖励
+        use_improved_reward: bool = False,  # ✅ 新增：是否使用改进的即时奖励
+        use_bottleneck_rewards: bool = False,  # ✅ OCR-MAX: 是否使用Bottleneck即时奖励
+        bottleneck_reward_config: Optional[Dict] = None  # ✅ OCR-MAX: Bottleneck奖励配置
     ):
         """
         Args:
@@ -157,6 +159,17 @@ class OCRRewardCalculator:
         self.alpha = alpha
         self.beta = beta
         self.use_improved_reward = use_improved_reward
+        self.use_bottleneck_rewards = use_bottleneck_rewards  # ✅ OCR-MAX
+
+        # ✅ OCR-MAX: 初始化Bottleneck奖励计算器
+        if use_bottleneck_rewards:
+            from src.training.bottleneck_rewards import BottleneckRewardComputer
+            self.bottleneck_computer = BottleneckRewardComputer(
+                **(bottleneck_reward_config or {})
+            )
+            print(f"[OCRRewardCalculator] ✅ OCR-MAX: Bottleneck奖励已启用")
+        else:
+            self.bottleneck_computer = None
 
         # 当前episode统计
         self.current_episode = EpisodeStatistics()
@@ -167,6 +180,7 @@ class OCRRewardCalculator:
         print(f"  - w_efficiency: {self.w_efficiency}")
         print(f"  - w_stability: {self.w_stability}")
         print(f"  - use_improved_reward: {self.use_improved_reward}")
+        print(f"  - use_bottleneck_rewards: {self.use_bottleneck_rewards}")  # ✅ OCR-MAX
 
     def reset(self):
         """重置episode统计"""
@@ -177,10 +191,11 @@ class OCRRewardCalculator:
         vehicle_info: List[Dict],
         accel_commands: int,
         lane_changes: int,
-        num_controlled: Optional[int] = None  # 保留参数（向后兼容），但不再用于计算
+        num_controlled: Optional[int] = None,  # 保留参数（向后兼容），但不再用于计算
+        action_dict: Optional[Dict] = None  # ✅ OCR-MAX: 新增参数，用于Bottleneck奖励计算
     ) -> float:
         """
-        更新统计并计算即时奖励（修复版）
+        更新统计并计算即时奖励（修复版 + OCR-MAX扩展）
 
         Args:
             vehicle_info: 车辆信息列表
@@ -195,6 +210,7 @@ class OCRRewardCalculator:
             accel_commands: 本步加速度指令数
             lane_changes: 本步换道指令数
             num_controlled: 本步被控制的车辆数（可选，向后兼容，不影响计算）
+            action_dict: ✅ OCR-MAX: 执行的动作字典 {veh_id: np.array([accel, lane_change])}
 
         Returns:
             reward: float 即时奖励
@@ -231,6 +247,15 @@ class OCRRewardCalculator:
             reward = self._compute_step_reward_improved()
         else:
             reward = self._compute_step_reward_simple(vehicle_info)
+
+        # ✅ OCR-MAX: 集成Bottleneck即时奖励
+        if self.use_bottleneck_rewards and action_dict is not None:
+            bottleneck_reward = self.bottleneck_computer.compute_step_reward(
+                vehicle_info,
+                action_dict
+            )
+            # 组合: OCR即时奖励 + Bottleneck即时奖励
+            reward = reward + 0.5 * bottleneck_reward  # 权重可调
 
         return reward
 
