@@ -58,7 +58,11 @@
       "Bash(top:*)",
       "Bash(git ls-tree:*)",
       "Bash(then ls -lh data/icv_selection/)",
-      "Bash(else echo \"❌ 目录不存在: data/icv_selection\")"
+      "Bash(else echo \"❌ 目录不存在: data/icv_selection\")",
+      "Bash(for:*)",
+      "Bash(do if grep -q 'Policy Loss:' training_stage2.log)",
+      "Bash(then echo '✅ Iteration 1 完成!' grep -E \"\\(Policy Loss|Value Loss|Entropy|Mean Return|LR:\\)\" training_stage2.log)",
+      "Bash(source:*)"
     ]
   }
 }

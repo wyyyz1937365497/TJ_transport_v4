@@ -55,7 +55,7 @@ policy:
 
   # 稀疏门控
   sparse_gate:
-    initial_k_ratio: 0.10  # 初始K值比例
+    initial_k_ratio: 0.80  # 🔥 提高到0.8，使k≈25匹配环境的ICV数量（之前0.1导致k=3太少）
     min_k: 5
     max_k_ratio: 0.25  # 最大25%（官方限制）
     gumbel_temperature: 1.0
@@ -168,21 +168,21 @@ stage2_guided_exploration:
 
     # 优化器
     optimizer: Adam
-    lr: 1.0e-4  # 🔥 从3.0e-4降到1.0e-4，减少Policy Loss波动
+    lr: 3.0e-4  # 🔥 提高到3.0e-4，加快收敛（之前1.0e-4太慢，Entropy持续上升）
     weight_decay: 1.0e-5
-    grad_clip: 0.5
+    grad_clip: 1.0  # 🔥 从0.5提高到1.0，防止Policy Loss爆炸（之前达到9703）
 
     # 学习率调度
     lr_schedule:
       enabled: true
       type: LinearLR
       total_iters: 100              # 🔥 匹配num_iterations
-      start_factor: 0.1
-      end_factor: 1.0
+      start_factor: 1.0  # 🔥 从0.1改为1.0，移除过度warmup（之前导致LR=1e-5太低）
+      end_factor: 1.0  # 🔥 保持恒定学习率
 
     # PPO更新参数
     update_epochs: 10
-    entropy_coef: 0.02  # 🔥 从0.01增加到0.02，鼓励更多探索
+    entropy_coef: 0.01  # 🔥 从0.02降回0.01，减少过度探索（之前Entropy持续上升）
     vf_coef: 0.5
 
     # KL散度自适应

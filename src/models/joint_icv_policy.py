@@ -897,8 +897,10 @@ class JointICVPolicy(nn.Module):
         # 5. 策略输出
         raw_actions = self.policy_head(embeddings, selection_mask)  # [B, N, 2]
 
-        # 应用选择掩码
+        # ========== 方案A：使用selection_mask过滤 ==========
+        # 只对选中的ICV车辆输出动作（k_ratio=0.8, k≈25）
         actions = raw_actions * selection_mask  # [B, N, 2]
+        # ===========================================
 
         # 展平动作
         actions_flat = actions.view(B, -1)  # [B, N*2]

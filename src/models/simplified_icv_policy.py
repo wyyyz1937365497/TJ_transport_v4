@@ -86,8 +86,8 @@ class SimplifiedPolicyHead(nn.Module):
                 'log_std': [B, 2]
             }
         """
-        # 策略输出
-        action_mean = self.actor(embeddings)  # [B, N, 2]
+        # 策略输出（使用tanh确保输出在[-1, 1]范围）
+        action_mean = torch.tanh(self.actor(embeddings))  # [B, N, 2]
 
         # 加速度：[-1, 1] → [-3, 2]
         accel = action_mean[:, :, 0:1]
@@ -187,34 +187,40 @@ class SimplifiedICVPolicy(nn.Module):
         """
         解析观测张量
 
+        观测格式：[B, obs_dim]
+        其中 obs_dim = max_vehicles * node_dim + 32 + 1
+        - max_vehicles * node_dim: 车辆状态
+        - + 32: global_stats
+        - + 1: num_vehicles
+
         Args:
             obs: [B, obs_dim] 扁平化观测
 
         Returns:
             components: {
-                'vehicle_states': [B, N, 9],
+                'vehicle_states': [B, N, node_dim],
                 'global_stats': [B, 32],
                 'num_vehicles': [B, 1]
             }
         """
         B = obs.shape[0]
-        obs = obs.view(B, self.num_vehicles, self.node_dim + 1 + 32)  # [B, N, 42]
 
-        # 分离组件
-        vehicle_states = obs[:, :, :9]  # [B, N, 9]
-        num_vehicles = obs[:, :, 9:10]  # [B, N, 1]
-        global_stats = obs[:, :, 10:]  # [B, N, 32]
+        # 提取车辆状态
+        vehicle_features_size = self.num_vehicles * self.node_dim
+        vehicle_states = obs[:, :vehicle_features_size]  # [B, N*node_dim]
+        vehicle_states = vehicle_states.view(B, self.num_vehicles, self.node_dim)  # [B, N, node_dim]
 
-        # 取第一个有效车辆的全局统计
-        global_stats = global_stats[:, 0, :]  # [B, 32]
+        # 剩余部分
+        remaining = obs[:, vehicle_features_size:]  # [B, 33]
 
-        # num_vehicles也取第一个
-        num_vehicles = num_vehicles[:, 0, 0]  # [B]
+        # 分离global_stats (32维) 和 num_vehicles (1维)
+        global_stats = remaining[:, :32]  # [B, 32]
+        num_vehicles = remaining[:, 32:33]  # [B, 1]
 
         return {
             'vehicle_states': vehicle_states,
             'global_stats': global_stats,
-            'num_vehicles': num_vehicles
+            'num_vehicles': num_vehicles  # [B, 1]
         }
 
     def forward(
@@ -256,45 +262,49 @@ class SimplifiedICVPolicy(nn.Module):
 
         # 4. 策略输出（直接输出所有车辆动作，不过滤）
         policy_outputs = self.policy_head(attended_embeddings)
-        actions = policy_outputs['actions']  # [B, N, 2]
-        action_mean = policy_outputs['action_mean']  # [B, N, 2]
+        actions = policy_outputs['actions']  # [B, N, 2] 已变换到正确范围
+        action_mean = policy_outputs['action_mean']  # [B, N, 2] 原始网络输出[-1,1]
         log_std = policy_outputs['log_std']  # [B, N, 2]
 
-        # 5. SafetyShield过滤（推理时）
-        if not self.training and self.use_safety_shield:
-            # 转换为numpy格式
-            actions_np = actions[0].cpu().numpy()
-            vehicle_states_np = vehicle_states[0].cpu().numpy()
-
-            # 应用SafetyShield
-            safe_actions = self.safety_shield.filter_actions(
-                actions_np,
-                vehicle_states_np
-            )
-            safe_actions_tensor = torch.from_numpy(safe_actions['safe_actions']).unsqueeze(0).to(device)
-
-            actions = safe_actions_tensor
-
-        # 6. 价值估计
+        # 5. 价值估计
         value = self.value_head(attended_embeddings)  # [B, 1]
 
-        # 7. 计算log_prob和entropy（用于PPO训练）
+        # 6. 计算log_prob和entropy（用于PPO训练）
+        # 注意：log_prob和entropy基于原始action_mean（[-1,1]范围）计算
         if deterministic:
-            # 确定性模式：直接使用mean
-            actions_out = action_mean
+            # 确定性模式：直接使用变换后的actions
+            actions_out = actions
+            # 确定性模式：log_prob为0（熵为0）
+            log_prob_per_dim = torch.zeros_like(action_mean)  # [B, N, 2]
         else:
-            # 随机模式：从高斯分布采样
+            # 随机模式：对原始action_mean添加噪声，然后变换
             std = torch.exp(log_std.clamp(-5.0, 2.0))  # [B, N, 2]
             noise = torch.randn_like(action_mean)
-            actions_out = action_mean + std * noise
+            noisy_action_mean = action_mean + std * noise
 
-        # 计算log_prob（高斯分布）
-        # log_prob = -0.5 * (((actions - mean) / std)^2 + 2*log_std + log(2π))
-        log_prob_per_dim = -0.5 * (
-            ((actions_out - action_mean) / (torch.exp(log_std.clamp(-5.0, 2.0)) + 1e-6)) ** 2 +
-            2 * log_std +
-            np.log(2 * np.pi)
-        )  # [B, N, 2]
+            # 关键：clamp到[-1, 1]确保变换后不会超出范围
+            noisy_action_mean = torch.clamp(noisy_action_mean, -1.0, 1.0)
+
+            # 变换到正确范围
+            # 加速度：[-1, 1] → [-3, 2]
+            accel = noisy_action_mean[:, :, 0:1]
+            accel = (accel + 1.0) / 2.0 * (2.0 - (-3.0)) + (-3.0)
+            accel = torch.clamp(accel, -3.0, 2.0)
+
+            # 换道：[-1, 1] → [0, 1]
+            lane_change = noisy_action_mean[:, :, 1:2]
+            lane_change = (lane_change + 1.0) / 2.0
+            lane_change = torch.clamp(lane_change, 0.0, 1.0)
+
+            actions_out = torch.cat([accel, lane_change], dim=-1)  # [B, N, 2]
+
+            # 计算log_prob（高斯分布）- 使用原始[-1,1]空间
+            # log_prob = -0.5 * (((sample - mean) / std)^2 + 2*log_std + log(2π))
+            log_prob_per_dim = -0.5 * (
+                ((noisy_action_mean - action_mean) / (std + 1e-6)) ** 2 +
+                2 * log_std +
+                np.log(2 * np.pi)
+            )  # [B, N, 2]
 
         # 对所有车辆和动作维度求和
         log_prob = log_prob_per_dim.sum(dim=-1).sum(dim=-1)  # [B]
@@ -310,8 +320,21 @@ class SimplifiedICVPolicy(nn.Module):
         # 对所有车辆和动作维度求平均
         entropy = entropy_per_dim.mean(dim=-1).mean(dim=-1)  # [B]
 
-        # 7. 展平动作
-        actions_flat = actions_out.view(B, -1)  # [B, N*2]
+        # 7. SafetyShield过滤（推理时）
+        actions_to_filter = actions_out  # [B, N, 2]
+        if not self.training and self.use_safety_shield:
+            # SafetyShield期望PyTorch张量输入
+            safe_output = self.safety_shield.filter_actions(
+                actions_to_filter,
+                vehicle_states
+            )
+            actions_out = safe_output['safe_actions']
+
+        # 8. 展平动作（格式：[accel_0, accel_1, ..., accel_N-1, lane_0, lane_1, ..., lane_N-1]）
+        # 先transpose: [B, N, 2] -> [B, 2, N]
+        actions_transposed = actions_out.transpose(1, 2)  # [B, 2, N]
+        # 再flatten: [B, 2, N] -> [B, 2*N]
+        actions_flat = actions_transposed.contiguous().view(B, -1)  # [B, 2*N]
 
         return {
             'actions': actions_flat,
@@ -323,7 +346,7 @@ class SimplifiedICVPolicy(nn.Module):
     def train_mode(self):
         """设置为训练模式"""
         self.training = True
-        self.eval()
+        self.train()  # 使用train()而不是eval()
 
     def eval_mode(self):
         """设置为评估模式"""
