@@ -64,6 +64,9 @@ stage0_collect_demonstrations:
   # 选择的车辆数量（Top-K）
   k_vehicles: 25
 
+  # 并行worker数（默认1为串行，推荐4-8）
+  num_workers: 4
+
   # 输出目录
   output_dir: data/demonstrations
 

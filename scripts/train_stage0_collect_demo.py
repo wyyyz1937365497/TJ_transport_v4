@@ -564,6 +564,14 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
+    # 从配置文件读取num_workers（如果命令行未指定）
+    if args.num_workers == 1:
+        stage0_config = config.get('stage0_collect_demonstrations', {})
+        config_num_workers = stage0_config.get('num_workers', 1)
+        if config_num_workers > 1:
+            args.num_workers = config_num_workers
+            print(f"从配置文件读取num_workers={args.num_workers}")
+
     # 根据num_workers选择串行或并行模式
     if args.num_workers > 1:
         print(f"\n{'='*80}")
