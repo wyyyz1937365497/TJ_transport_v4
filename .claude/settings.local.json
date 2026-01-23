@@ -62,7 +62,23 @@
       "Bash(for:*)",
       "Bash(do if grep -q 'Policy Loss:' training_stage2.log)",
       "Bash(then echo '✅ Iteration 1 完成!' grep -E \"\\(Policy Loss|Value Loss|Entropy|Mean Return|LR:\\)\" training_stage2.log)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(cat:*)",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo \"=== Phase 1: 基础架构 ===\")",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo -e \"\\\\n=== Phase 2: Bottleneck奖励 ===\")",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo -e \"\\\\n=== Phase 3: 分阶段训练脚本 ===\")",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo -e \"\\\\n=== Phase 5: 配置文件 ===\")",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo -e \"\\\\n=== 测试脚本 ===\")",
+      "Bash(__NEW_LINE_e8fa97683f8817b7__ echo -e \"\\\\n=== Git提交历史 ===\")",
+      "Bash(__NEW_LINE_d595fd1bfe44a260__ echo \"=== 模型文件（1118行）===\")",
+      "Bash(__NEW_LINE_d595fd1bfe44a260__ echo -e \"\\\\n=== 训练脚本（旧版Stage1+2+3）===\")",
+      "Bash(__NEW_LINE_d595fd1bfe44a260__ echo -e \"\\\\n=== 保留的文件 ===\")",
+      "Bash(__NEW_LINE_d595fd1bfe44a260__ echo -e \"\\\\n=== 新OCR-MAX脚本 ===\")",
+      "Bash(__NEW_LINE_d595fd1bfe44a260__ echo -e \"\\\\n=== 确认删除 ===\")",
+      "Bash(read:*)",
+      "Bash(then)",
+      "Bash(else)",
+      "Bash(exit:*)"
     ]
   }
 }
