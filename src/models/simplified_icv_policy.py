@@ -204,6 +204,7 @@ class SimplifiedICVPolicy(nn.Module):
             }
         """
         B = obs.shape[0]
+        device = obs.device
 
         # 提取车辆状态
         vehicle_features_size = self.num_vehicles * self.node_dim
@@ -217,10 +218,12 @@ class SimplifiedICVPolicy(nn.Module):
         global_stats = remaining[:, :32]  # [B, 32]
         num_vehicles = remaining[:, 32:33]  # [B, 1]
 
+        # 确保所有组件在同一设备上
+        # （虽然view操作保持设备，但显式确保更安全）
         return {
-            'vehicle_states': vehicle_states,
-            'global_stats': global_stats,
-            'num_vehicles': num_vehicles  # [B, 1]
+            'vehicle_states': vehicle_states.to(device),
+            'global_stats': global_stats.to(device),
+            'num_vehicles': num_vehicles.to(device)  # [B, 1]
         }
 
     def forward(
