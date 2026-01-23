@@ -558,12 +558,20 @@ def main():
     # 创建环境
     print("\n创建环境...")
     env_config = config.get('environment', {})
+
+    # 设置默认值
+    if 'sumocfg_file' not in env_config:
+        env_config['sumocfg_file'] = 'configs/scenario/sumo_config.sumocfg'
+    if 'max_steps' not in env_config:
+        env_config['max_steps'] = 3600
+    if 'icv_ratio' not in env_config:
+        env_config['icv_ratio'] = 0.10
+
+    # CompetitionSumoEnv接受完整的config字典
     env = CompetitionSumoEnv(
-        config_file=env_config.get('sumocfg_file', 'configs/scenario/sumo_config.sumocfg'),
-        max_steps=env_config.get('max_steps', 3600),
-        icv_ratio=env_config.get('icv_ratio', 0.10),
+        config=env_config,
         use_gui=False,
-        seed=config.get('global', {}).get('seed', 42)
+        device=args.device
     )
 
     # 创建奖励计算器
