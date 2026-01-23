@@ -184,7 +184,10 @@ def evaluate_model(
         for step in range(max_steps):
             # 扁平化观测
             obs_flat = flatten_observation(obs_dict)
-            obs_tensor = torch.from_numpy(obs_flat).unsqueeze(0).float().to(device)
+            obs_tensor = torch.from_numpy(obs_flat).unsqueeze(0).float()
+
+            # 确保输入在正确的设备上
+            obs_tensor = obs_tensor.to(device)
 
             # 策略推理（确定性）
             with torch.no_grad():
