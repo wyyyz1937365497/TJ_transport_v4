@@ -27,6 +27,12 @@ from tqdm import tqdm
 
 import numpy as np
 
+# 尝试导入libsumo（更快）或traci
+try:
+    import libsumo as traci
+except ImportError:
+    import traci
+
 # 添加项目路径
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -125,12 +131,12 @@ def collect_idm_action(env, veh_id: str, vehicle_states: dict) -> np.ndarray:
 
     try:
         # 尝试获取前车信息
-        leader_info = env.traci_lib.vehicle.getLeader(veh_id, 100.0)
+        leader_info = traci.vehicle.getLeader(veh_id, 100.0)
         if leader_info is not None:
             leader_id, leader_distance = leader_info
-            leader_speed = env.traci_lib.vehicle.getSpeed(leader_id)
+            leader_speed = traci.vehicle.getSpeed(leader_id)
             delta_v = current_speed - leader_speed
-            gap = leader_distance - env.traci_lib.vehicle.getLength(veh_id)
+            gap = leader_distance - traci.vehicle.getLength(veh_id)
     except:
         gap = 100.0
         delta_v = 0.0
@@ -237,7 +243,7 @@ def collect_demonstrations(
 
             # 构建context
             context = {
-                'traci_lib': env.traci_lib,
+                'traci_lib': traci,  # 直接使用导入的traci
                 'all_vehicle_ids': vehicle_ids,
                 'icv_ids': icv_ids
             }
