@@ -221,7 +221,7 @@ def collect_demonstrations(
     print(f"  选择车辆数: {k_vehicles}")
 
     for episode_idx in tqdm(range(num_episodes), desc="Collecting episodes"):
-        obs = env.reset()
+        obs_dict = env.reset()
         episode_data = {
             'episode_id': episode_idx,
             'transitions': [],
@@ -231,7 +231,6 @@ def collect_demonstrations(
 
         for step in range(max_steps):
             # 解析观测
-            obs_dict = env.get_observation_dict()
             vehicle_states = obs_dict.get('vehicle_states', {})
             vehicle_ids = obs_dict.get('vehicle_ids', [])
             icv_ids = obs_dict.get('icv_ids', set())
@@ -258,7 +257,7 @@ def collect_demonstrations(
                 actions_dict[veh_id] = action
 
             # 执行动作
-            next_obs, reward, done, info = env.step(actions_dict)
+            next_obs_dict, reward, done, info = env.step(actions_dict)
 
             # 存储转换
             transition = {
@@ -271,6 +270,9 @@ def collect_demonstrations(
             }
             episode_data['transitions'].append(transition)
             episode_data['total_reward'] += reward
+
+            # 更新观测
+            obs_dict = next_obs_dict
 
             if done:
                 break
