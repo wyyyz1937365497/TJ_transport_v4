@@ -302,8 +302,10 @@ def collect_single_episode_worker(args: Tuple) -> Dict[str, Any]:
         obs_dict = env.reset()
 
         # Track departures and arrivals for OCR calculation
-        departed_vehicles = set()
-        arrived_vehicles = set()
+        # ✅ 修复：直接使用traci跟踪车辆，避免环境接口问题
+        all_departed = set()
+        all_arrived = set()
+        previous_vehicles = set()
 
         for step in range(max_steps):
             # Parse observation
@@ -311,9 +313,15 @@ def collect_single_episode_worker(args: Tuple) -> Dict[str, Any]:
             vehicle_ids = obs_dict.get('vehicle_ids', [])
             icv_ids = obs_dict.get('icv_ids', set())
 
-            # Track departures
-            departed = obs_dict.get('departed_vehicles', [])
-            departed_vehicles.update(departed)
+            # ✅ 修复：使用traci直接跟踪departed和arrived车辆
+            current_vehicles = set(vehicle_ids)
+
+            # 新departed的车辆 = 当前车辆 - 之前的车辆
+            newly_departed = current_vehicles - previous_vehicles
+            all_departed.update(newly_departed)
+
+            # 更新vehicle集合
+            previous_vehicles = current_vehicles
 
             # Build context for scorer
             context = {
@@ -339,9 +347,14 @@ def collect_single_episode_worker(args: Tuple) -> Dict[str, Any]:
             # Execute actions
             next_obs_dict, reward, done, info = env.step(actions_dict)
 
-            # Track arrivals
-            arrived = info.get('arrived_vehicles', [])
-            arrived_vehicles.update(arrived)
+            # ✅ 修复：使用traci检查arrived车辆
+            try:
+                # 获取已到达的车辆（从仿真中移除的）
+                arrived = worker_traci.simulation.getArrivedIDList()
+                if arrived:
+                    all_arrived.update(arrived)
+            except:
+                pass  # 如果traci调用失败，忽略
 
             # Store transition
             transition = {
@@ -363,13 +376,13 @@ def collect_single_episode_worker(args: Tuple) -> Dict[str, Any]:
                 break
 
         # Calculate OCR
-        if len(departed_vehicles) > 0:
-            episode_data['ocr'] = len(arrived_vehicles) / len(departed_vehicles)
+        if len(all_departed) > 0:
+            episode_data['ocr'] = len(all_arrived) / len(all_departed)
         else:
             episode_data['ocr'] = 0.0
 
-        episode_data['departed_count'] = len(departed_vehicles)
-        episode_data['arrived_count'] = len(arrived_vehicles)
+        episode_data['departed_count'] = len(all_departed)
+        episode_data['arrived_count'] = len(all_arrived)
 
     except Exception as e:
         print(f"[Worker {worker_id}] Error in episode {episode_idx}: {e}")
