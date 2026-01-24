@@ -1,36 +1,29 @@
 """
-神经网络模型模块（v5轻量级架构）
+神经网络模型模块（模仿学习 + MPC架构）
 
 主要组件：
-- v5_lightweight.py: 轻量级OCR-GNN策略网络（专为初赛优化）
+- SimplifiedICVPolicy: 简化的策略网络，用于模仿学习
+- SafetyShield: 安全防护盾模块（可选）
 """
 
 # 延迟导入，避免循环依赖
 def __getattr__(name):
     if name in [
-        'LightweightGraphConvolution',
-        'VehicleInfluenceScorer',
-        'LightweightOCRGNN',
-        'LightweightPolicyV5',
-        'create_lightweight_policy_v5',
+        'SimplifiedICVPolicy',
     ]:
-        from src.models.v5_lightweight import (
-            LightweightGraphConvolution,
-            VehicleInfluenceScorer,
-            LightweightOCRGNN,
-            LightweightPolicyV5,
-            create_lightweight_policy_v5,
-        )
+        from src.models.simplified_icv_policy import SimplifiedICVPolicy
+        return SimplifiedICVPolicy
 
-        return locals()[name]
+    if name in [
+        'SafetyShield',
+    ]:
+        from src.models.safety_shield import SafetyShield
+        return SafetyShield
+
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
 # 导出所有模块
 __all__ = [
-    # 轻量级OCR-GNN
-    'LightweightGraphConvolution',
-    'VehicleInfluenceScorer',
-    'LightweightOCRGNN',
-    'LightweightPolicyV5',
-    'create_lightweight_policy_v5',
+    'SimplifiedICVPolicy',
+    'SafetyShield',
 ]
