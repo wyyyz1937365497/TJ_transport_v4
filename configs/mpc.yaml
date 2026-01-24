@@ -1,0 +1,165 @@
+# MPC配置文件
+# 用于生成最优控制策略的专家演示
+
+global:
+  seed: 42
+  device: cuda
+
+# 环境配置
+environment:
+  # SUMO配置文件
+  sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
+
+  # ICV比例
+  icv_ratio: 0.10  # 10% ICV
+
+  # 最大步数
+  max_steps: 3600  # 6分钟 @ 0.1s/step
+
+  # 是否使用GUI
+  use_gui: false
+
+  # 车辆评分器配置
+  neural_icv_scoring:
+    enabled: false  # MPC不使用神经网络评分器
+
+  rule_based_scoring:
+    enabled: true
+    bottleneck_s_min: 1200.0  # 瓶颈起点
+    bottleneck_s_max: 2200.0  # 瓶颈终点
+    upstream_s_min: 600.0     # 上游区域起点
+    weights:
+      bottleneck_weight: 2.0  # 瓶颈区域权重
+      upstream_weight: 1.0    # 上游区域权重
+      speed_weight: 0.5       # 速度权重
+      gap_weight: 1.0         # 车间距权重
+
+# MPC控制器配置
+mpc:
+  # 预测时域（预测未来N步）
+  prediction_horizon: 10  # 1秒 (10 * 0.1s)
+
+  # 控制时域（优化未来M步的控制）
+  control_horizon: 5      # 0.5秒 (5 * 0.1s)
+
+  # 时间步长
+  dt: 0.1  # 秒
+
+  # 状态权重（Q矩阵）
+  # 目标函数：sum((x_ref - x)^T Q (x_ref - x) + u^T R u)
+  state_weights:
+    speed: 10.0      # 速度跟踪权重（鼓励达到30 m/s）
+    position: 1.0    # 位置权重
+    acceleration: 0.1 # 加速度平滑权重（最小化jerk）
+    gap: 50.0        # 车间距保持权重（关键！防止追尾）
+
+  # 控制权重（R矩阵）
+  control_weights:
+    acceleration: 0.5  # 加速度控制权重
+    lane_change: 0.1   # 换道控制权重
+
+  # 约束参数
+  constraints:
+    min_accel: -4.5   # 最大减速度 (m/s²)
+    max_accel: 2.0    # 最大加速度 (m/s²)
+    min_speed: 0.0    # 最小速度 (m/s)
+    max_speed: 30.0   # 最大速度 (m/s) = 108 km/h
+    min_gap: 2.0      # 最小车距 (m)
+    desired_gap: 5.0  # 期望车距 (m)
+
+  # 瓶颈区域参数
+  bottleneck_region:
+    s_min: 1200.0  # 瓶颈起点 (m)
+    s_max: 2200.0  # 瓶颈终点 (m)
+
+  # 优化求解器配置
+  solver:
+    name: OSQP       # 求解器: OSQP (推荐) 或 CLARABEL
+    verbose: false   # 求解器输出
+    max_iters: 1000  # 最大迭代次数
+    tolerance: 1.0e-4  # 收敛容差
+
+  # 增量优化（加速实时求解）
+  incremental_optimization:
+    enabled: true
+    update_interval: 3  # 每N步重新求解一次
+    warm_start: true    # 热启动
+
+  # 控制器类型
+  controller_type: centralized  # centralized (集中式) 或 distributed (分布式)
+
+  # 车辆选择策略
+  vehicle_selection:
+    strategy: rule_based  # rule_based (规则) 或 random (随机)
+    k_vehicles: 25        # 控制车辆数量
+
+# 数据收集配置
+data_collection:
+  # episode数量
+  num_episodes: 50
+
+  # 并行worker数量
+  num_workers: 4
+
+  # 输出目录
+  output_dir: data/demonstrations/mpc
+
+  # 数据质量过滤
+  filter:
+    enabled: true
+    min_ocr: 0.5469  # 最低OCR (baseline)
+    min_reward: -1000.0  # 最低奖励
+
+  # episode超时
+  timeout: 400  # 秒 (6.67分钟)
+
+# 训练配置（用于模仿学习）
+training:
+  # 数据路径
+  demo_data_path: data/demonstrations/mpc/demonstrations.pkl
+
+  # 数据分割
+  val_split: 0.2  # 20%验证集
+
+  # 训练参数
+  batch_size: 32
+  num_epochs: 50
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+
+  # 学习率调度
+  lr_scheduler:
+    type: ReduceLROnPlateau
+    patience: 5
+    factor: 0.5
+
+  # 早停
+  early_stopping:
+    patience: 10
+    min_delta: 0.001
+
+  # 检查点
+  checkpoints:
+    save_dir: checkpoints/mpc_imitation
+    save_interval: 10
+
+# 评估配置
+evaluation:
+  # 评估episodes
+  num_episodes: 10
+
+  # 评估步数
+  max_steps: 3600
+
+  # baseline OCR
+  baseline_ocr: 0.5469
+
+  # 目标OCR
+  target_ocr: 0.5600  # 56% (比baseline高1.3%)
+
+  # 控制车辆数
+  k_vehicles: 25
+
+  # 使用GUI
+  use_gui: false

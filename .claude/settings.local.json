@@ -79,7 +79,11 @@
       "Bash(then)",
       "Bash(else)",
       "Bash(exit:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "Bash(export SUMO_HOME=/home/wyyyz/build/sumo:*)",
+      "Bash(conda:*)",
+      "Bash(git reset:*)",
+      "Bash(kill:*)"
     ]
   }
 }
