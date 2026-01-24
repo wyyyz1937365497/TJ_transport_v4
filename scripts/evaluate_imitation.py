@@ -293,9 +293,12 @@ def main():
     # Create environment
     env_config = config.get('environment', {})
 
-    # ✅ 修复：确保有有效的sumocfg_file路径
-    if 'sumocfg_file' not in env_config or not env_config['sumocfg_file']:
-        env_config['sumocfg_file'] = '仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg'
+    # ✅ 修复：环境期望的键是sumo_config或sumocfg，而不是sumocfg_file
+    if 'sumo_config' not in env_config or not env_config['sumo_config']:
+        if 'sumocfg' not in env_config or not env_config['sumocfg']:
+            env_config['sumo_config'] = '仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg'
+        else:
+            env_config['sumo_config'] = env_config['sumocfg']
 
     env_config['max_steps'] = args.max_steps
     env_config['icv_ratio'] = env_config.get('icv_ratio', 0.10)
