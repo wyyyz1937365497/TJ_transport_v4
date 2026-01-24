@@ -137,7 +137,7 @@ class ImitationLearningTrainer:
         # Logging
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir / self.log_dir.name)
+        self.writer = SummaryWriter(self.log_dir)
 
         # Training state
         self.current_epoch = 0
