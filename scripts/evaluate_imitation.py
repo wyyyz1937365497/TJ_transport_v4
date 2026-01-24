@@ -292,9 +292,24 @@ def main():
 
     # Create environment
     env_config = config.get('environment', {})
-    env_config['sumocfg_file'] = env_config.get('sumocfg_file', '仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg')
+
+    # ✅ 修复：确保有有效的sumocfg_file路径
+    if 'sumocfg_file' not in env_config or not env_config['sumocfg_file']:
+        env_config['sumocfg_file'] = '仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg'
+
     env_config['max_steps'] = args.max_steps
     env_config['icv_ratio'] = env_config.get('icv_ratio', 0.10)
+
+    # ✅ 修复：禁用神经网络评分器，使用规则评分器（与训练时一致）
+    if 'neural_icv_scoring' not in env_config:
+        env_config['neural_icv_scoring'] = {'enabled': False}
+    else:
+        env_config['neural_icv_scoring']['enabled'] = False
+
+    if 'rule_based_scoring' not in env_config:
+        env_config['rule_based_scoring'] = {'enabled': True}
+    else:
+        env_config['rule_based_scoring']['enabled'] = True
 
     env = CompetitionSumoEnv(
         config=env_config,
