@@ -527,8 +527,8 @@ class OCRMAXSubmission:
 
         Args:
             action_array: [max_vehicles * 2] 扁平动作数组
-            vehicle_ids: 车辆ID列表
-            icv_ids: ICV ID集合
+            vehicle_ids: 车辆ID列表（与观测中的顺序一致）
+            icv_ids: ICV ID集合（要控制的车辆）
 
         Returns:
             actions_dict: {vehicle_id: [acceleration, lane_change]}
@@ -538,16 +538,17 @@ class OCRMAXSubmission:
         # 重塑为 [max_vehicles, 2]
         actions_reshaped = action_array.reshape(self.max_vehicles, 2)
 
-        for i, veh_id in enumerate(vehicle_ids):
-            if veh_id in icv_ids and i < self.max_vehicles:
+        # ✅ 修复：按vehicle_ids顺序遍历，动作与观测中的车辆位置一一对应
+        # 只有在icv_ids中的车辆才应用控制
+        for i, veh_id in enumerate(vehicle_ids[:self.max_vehicles]):
+            if veh_id in icv_ids:  # 只有ICV车辆才控制
                 accel = actions_reshaped[i, 0].item()
                 lane_change = actions_reshaped[i, 1].item()
 
-                # 反归一化加速度
-                accel = accel * 5.0 - 1.0  # 映射到合理范围
-
-                # 限制范围
-                accel = np.clip(accel, -4.5, 2.0)
+                # ✅ 修复：模型输出已经是正确范围，不需要额外的反归一化
+                # 模型输出：accel ∈ [-3, 2], lane_change ∈ [0, 1]
+                # 直接限制范围即可（防止轻微的数值误差）
+                accel = np.clip(accel, -3.0, 2.0)
                 lane_change = np.clip(lane_change, 0.0, 1.0)
 
                 actions_dict[veh_id] = np.array([accel, lane_change])

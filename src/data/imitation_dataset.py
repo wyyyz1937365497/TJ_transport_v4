@@ -159,15 +159,17 @@ class ImitationDataset(Dataset):
         # Create mask: which vehicles are controlled
         mask = np.zeros(32, dtype=np.float32)
 
-        # Fill in actions for ICV vehicles
-        for i, veh_id in enumerate(icv_ids[:32]):  # Max 32 vehicles
-            if veh_id in actions_dict:
+        # ✅ 修复：动作必须与观测中的车辆位置一一对应
+        # 观测是按vehicle_ids顺序填充的，所以动作也必须按vehicle_ids顺序填充
+        # 只有在actions_dict中的车辆才有控制动作（即selected_vehicles）
+        for i, veh_id in enumerate(vehicle_ids[:32]):  # 按vehicle_ids顺序（与obs一致）
+            if veh_id in actions_dict:  # 只有被控制的车辆才有动作
                 action = actions_dict[veh_id]
                 # action should be [acceleration, lane_change_probability]
                 if isinstance(action, (list, tuple, np.ndarray)) and len(action) >= 2:
                     flat_actions[i * 2] = float(action[0])      # acceleration
                     flat_actions[i * 2 + 1] = float(action[1])  # lane_change
-                    mask[i] = 1.0
+                    mask[i] = 1.0  # 标记为受控车辆
 
         # Apply transforms if provided
         if self.transform is not None:

@@ -108,15 +108,15 @@ def flatten_observation(obs_dict: dict, max_vehicles: int = 32) -> np.ndarray:
 def convert_actions_to_dict(
     actions: np.ndarray,
     vehicle_ids: list,
-    icv_ids: set
+    selected_vehicles: list
 ) -> dict:
     """
     Convert flattened action array to action dictionary
 
     Args:
         actions: [64] flattened action array (32 vehicles * 2)
-        vehicle_ids: List of vehicle IDs
-        icv_ids: Set of ICV vehicle IDs
+        vehicle_ids: List of vehicle IDs (in observation order)
+        selected_vehicles: List of vehicles to control
 
     Returns:
         actions_dict: {veh_id: [acceleration, lane_change]}
@@ -126,9 +126,11 @@ def convert_actions_to_dict(
     # Reshape actions to [32, 2]
     actions_reshaped = actions.reshape(32, 2)
 
-    # Map to ICV vehicles
-    for i, veh_id in enumerate(icv_ids):
-        if i < 32:  # Max 32 vehicles
+    # ✅ 修复：动作与观测中的车辆位置一一对应
+    # 观测中actions[i]对应vehicle_ids[i]
+    # 只有selected_vehicles中的车辆才应用控制
+    for i, veh_id in enumerate(vehicle_ids[:32]):  # 按vehicle_ids顺序
+        if veh_id in selected_vehicles:  # 只有被选中的车辆才应用动作
             action = actions_reshaped[i]
             actions_dict[veh_id] = action
 
