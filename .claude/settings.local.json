@@ -78,7 +78,8 @@
       "Bash(read:*)",
       "Bash(then)",
       "Bash(else)",
-      "Bash(exit:*)"
+      "Bash(exit:*)",
+      "Bash(tee:*)"
     ]
   }
 }

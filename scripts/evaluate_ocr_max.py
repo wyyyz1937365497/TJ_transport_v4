@@ -178,9 +178,6 @@ def evaluate_model(
         episode_reward = 0.0
         episode_length = 0
 
-        # 记录初始车辆
-        initial_vehicles = set(obs_dict.get('vehicle_ids', []))
-
         for step in range(max_steps):
             # 扁平化观测
             obs_flat = flatten_observation(obs_dict)
@@ -217,9 +214,14 @@ def evaluate_model(
             if done:
                 break
 
-        # 计算OCR
-        final_vehicles = set(info.get('arrived_vehicles', set()))
-        ocr = len(final_vehicles) / max(len(initial_vehicles), 1)
+        # 计算OCR（从环境stats获取）
+        # OCR = arrived_vehicles / departed_vehicles
+        arrived_count = len(env.stats.get('arrived_vehicles', []))
+        departed_count = len(env.stats.get('departed_vehicles', []))
+        if departed_count > 0:
+            ocr = arrived_count / departed_count
+        else:
+            ocr = 0.0
 
         episode_returns.append(episode_reward)
         episode_lengths.append(episode_length)
@@ -227,7 +229,7 @@ def evaluate_model(
 
         print(f"Episode {episode_idx + 1}/{num_episodes}: "
               f"Return={episode_reward:.2f}, "
-              f"OCR={ocr:.4f}, "
+              f"OCR={ocr:.4f} ({arrived_count}/{departed_count}), "
               f"Length={episode_length}")
 
     # 统计
@@ -244,13 +246,77 @@ def evaluate_model(
         'std_acceleration': np.std(all_accelerations),
         'episode_returns': episode_returns,
         'episode_ocrs': episode_ocrs,
-        'episode_lengths': episode_lengths
+        'episode_lengths': episode_lengths,
+        'all_speeds': all_speeds,
+        'all_accelerations': all_accelerations
     }
 
     return results
 
 
-def print_results(results: Dict, model_name: str = "Model"):
+def compute_competition_score(
+    ocr_ai: float,
+    ocr_baseline: float,
+    speed_std_ai: float,
+    speed_std_baseline: float,
+    abs_accel_ai: float,
+    abs_accel_baseline: float,
+    preliminary: bool = True
+) -> Dict[str, float]:
+    """
+    计算比赛评分
+
+    Args:
+        ocr_ai: AI模型的OCR
+        ocr_baseline: 基准OCR
+        speed_std_ai: AI速度标准差
+        speed_std_baseline: 基准速度标准差
+        abs_accel_ai: AI平均绝对加速度
+        abs_accel_baseline: 基准平均绝对加速度
+        preliminary: 是否初赛（初赛只看效率）
+
+    Returns:
+        评分字典
+    """
+    # ========== 效率得分 ==========
+    delta_ocr = (ocr_ai - ocr_baseline) / max(ocr_baseline, 1e-6)
+    efficiency_score = 100.0 * max(0.0, delta_ocr)
+
+    # ========== 稳定性得分（初赛不计算） ==========
+    if preliminary:
+        stability_score = 0.0
+    else:
+        # 速度标准差相对改善
+        i_speed_std = -(speed_std_ai - speed_std_baseline) / max(speed_std_baseline, 1e-6)
+        # 平均绝对加速度相对改善
+        i_abs_accel = -(abs_accel_ai - abs_accel_baseline) / max(abs_accel_baseline, 1e-6)
+
+        # 稳定性得分 (权重: speed_std=0.4, abs_accel=0.6)
+        stability_score = 100.0 * (
+            0.4 * max(0.0, i_speed_std) +
+            0.6 * max(0.0, i_abs_accel)
+        )
+
+    # ========== 总分 ==========
+    # 初赛：只看效率
+    # 复赛：(效率 + 稳定性) × 干预成本惩罚
+    if preliminary:
+        total_score = efficiency_score  # P_int = 1, W_stability = 0
+    else:
+        # 复赛需要干预成本惩罚（这里暂时设为1）
+        p_int = 1.0
+        total_score = (efficiency_score + stability_score) * p_int
+
+    return {
+        'efficiency_score': efficiency_score,
+        'stability_score': stability_score,
+        'total_score': total_score,
+        'delta_ocr': delta_ocr,
+        'ocr_improvement': (ocr_ai - ocr_baseline) / max(ocr_baseline, 1e-6) * 100
+    }
+
+
+def print_results(results: Dict, model_name: str = "Model", competition_score: Dict = None):
     """打印评估结果"""
     print(f"\n{'='*80}")
     print(f"{model_name} 评估结果")
@@ -269,6 +335,17 @@ def print_results(results: Dict, model_name: str = "Model"):
     for i, (ret, ocr) in enumerate(zip(results['episode_returns'], results['episode_ocrs'])):
         print(f"  Episode {i+1:2d}: Return={ret:7.2f}, OCR={ocr:.4f}")
 
+    # 比赛评分
+    if competition_score is not None:
+        print(f"\n{'='*80}")
+        print(f"🏆 初赛评分 (基于效率)")
+        print(f"{'='*80}\n")
+
+        print(f"  效率得分: {competition_score['efficiency_score']:.2f}")
+        print(f"  OCR相对提升: {competition_score['ocr_improvement']:+.2f}%")
+        print(f"  ΔOCR: {competition_score['delta_ocr']:+.4f}")
+        print(f"\n  🎯 初赛总分: {competition_score['total_score']:.2f}")
+
     print(f"\n{'='*80}\n")
 
 
@@ -278,7 +355,7 @@ def save_results(results: Dict, output_path: str, metadata: Dict):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 只保存标量结果，不保存数组
-    save_results = {
+    save_results_dict = {
         'metadata': metadata,
         'metrics': {
             'mean_return': float(results['mean_return']),
@@ -306,7 +383,7 @@ def save_results(results: Dict, output_path: str, metadata: Dict):
     }
 
     with open(output_path, 'w') as f:
-        json.dump(save_results, f, indent=2)
+        json.dump(save_results_dict, f, indent=2)
 
     print(f"✅ 结果已保存到: {output_path}")
 
@@ -319,6 +396,8 @@ def main():
                         help='模型检查点路径')
     parser.add_argument('--baseline_checkpoint', type=str, default=None,
                         help='基线模型检查点路径（用于对比）')
+    parser.add_argument('--baseline_ocr', type=float, default=None,
+                        help='基准OCR值（用于计算比赛评分，如不提供则使用baseline_checkpoint的结果）')
     parser.add_argument('--num_eval_episodes', type=int, default=20,
                         help='评估episode数')
     parser.add_argument('--max_steps', type=int, default=3600,
@@ -379,9 +458,34 @@ def main():
         desc=f"Evaluating ({Path(args.checkpoint).stem})"
     )
 
+    # 计算比赛评分（需要基准OCR）
+    competition_score = None
+    baseline_ocr = args.baseline_ocr
+    baseline_speed_std = 6.32  # 默认基准值（从之前评估获得）
+    baseline_abs_accel = 0.394  # 默认基准值
+
+    # 如果提供了baseline_checkpoint，用它作为基准
+    if args.baseline_checkpoint is not None and baseline_ocr is None:
+        print(f"\n注意：使用baseline_checkpoint的结果作为基准OCR")
+
+    # 如果直接提供了baseline_ocr，使用它
+    if baseline_ocr is not None:
+        # 计算平均绝对加速度
+        mean_abs_accel = np.mean([abs(a) for a in results.get('all_accelerations', [])])
+
+        competition_score = compute_competition_score(
+            ocr_ai=results['mean_ocr'],
+            ocr_baseline=baseline_ocr,
+            speed_std_ai=results['std_speed'],
+            speed_std_baseline=baseline_speed_std,
+            abs_accel_ai=mean_abs_accel,
+            abs_accel_baseline=baseline_abs_accel,
+            preliminary=True  # 初赛
+        )
+
     # 打印结果
     model_name = Path(args.checkpoint).stem
-    print_results(results, model_name)
+    print_results(results, model_name, competition_score)
 
     # 保存结果
     metadata = {
@@ -392,6 +496,9 @@ def main():
         'device': args.device,
         'evaluation_time': datetime.now().isoformat()
     }
+    if competition_score is not None:
+        metadata['competition_score'] = competition_score
+        metadata['baseline_ocr'] = baseline_ocr
     save_results(results, f"{args.output_dir}/{model_name}_results.json", metadata)
 
     # 对比基线（如果提供）
