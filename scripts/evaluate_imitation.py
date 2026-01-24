@@ -181,11 +181,19 @@ def evaluate_episode(
     """
     obs_dict = env.reset()
 
+    # ✅ 修复：使用traci直接跟踪车辆，不依赖环境接口
     departed_vehicles = set()
     arrived_vehicles = set()
+    previous_vehicles = set()
 
     total_reward = 0.0
     step = 0
+
+    # Import traci for direct tracking
+    try:
+        import libsumo as traci_lib
+    except ImportError:
+        import traci as traci_lib
 
     for step in range(max_steps):
         # Parse observation
@@ -193,9 +201,15 @@ def evaluate_episode(
         vehicle_ids = obs_dict.get('vehicle_ids', [])
         icv_ids = obs_dict.get('icv_ids', set())
 
-        # Track departures
-        departed = obs_dict.get('departed_vehicles', [])
-        departed_vehicles.update(departed)
+        # ✅ 修复：使用traci直接跟踪departed和arrived车辆
+        current_vehicles = set(vehicle_ids)
+
+        # 新departed的车辆 = 当前车辆 - 之前的车辆
+        newly_departed = current_vehicles - previous_vehicles
+        departed_vehicles.update(newly_departed)
+
+        # 更新vehicle集合
+        previous_vehicles = current_vehicles
 
         # Select top-k vehicles
         if len(icv_ids) > 0:
@@ -225,9 +239,13 @@ def evaluate_episode(
         # Execute actions
         next_obs_dict, reward, done, info = env.step(actions_dict)
 
-        # Track arrivals
-        arrived = info.get('arrived_vehicles', [])
-        arrived_vehicles.update(arrived)
+        # ✅ 修复：使用traci检查arrived车辆
+        try:
+            arrived = traci_lib.simulation.getArrivedIDList()
+            if arrived:
+                arrived_vehicles.update(arrived)
+        except:
+            pass  # 如果traci调用失败，忽略
 
         # Accumulate reward
         total_reward += reward
