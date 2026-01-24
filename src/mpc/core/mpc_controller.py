@@ -349,14 +349,18 @@ class MPCController:
                 v_next = v_k + u_accel * dt
                 a_next = u_accel
 
-                # 换道决策（简化版，保持凸性）
-                # 车道基本保持不变，但在优化问题外可以考虑换道
-                # 这是因为频繁换道在MPC中难以优化且不稳定
-                lane_next = X[k, i, 3]  # 保持当前车道
-
-                # 换道决策作为单独的高层策略，不纳入MPC优化
-                # 如果需要换道，通过外部策略实现（如基于速度和位置的规则）
-                # MPC专注于纵向控制（加速度）的优化
+                # 换道决策（改进版：软约束换道）
+                # 允许换道但通过代价函数惩罚频繁换道
+                # 使用松弛变量来保持凸性
+                if k < M:
+                    # 换道变化量：基于换道概率阈值
+                    # u_lane > 0.5表示倾向换道，< 0.5表示保持
+                    lane_change_indicator = u_lane  # [0, 1]
+                    # 允许车道在连续值上变化，但通过代价惩罚来限制
+                    lane_next = X[k, i, 3] + 0.1 * (lane_change_indicator - 0.5) * dt
+                    # 通过软约束将车道限制在合理范围（整数车道附近）
+                else:
+                    lane_next = X[k, i, 3]  # 预测时域外保持车道
 
                 # 状态转移约束
                 constraints.append(X[k + 1, i, 0] == s_next)

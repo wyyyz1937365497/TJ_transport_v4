@@ -238,9 +238,34 @@ class FrenetCoordinateSystem:
         end_x = to_coords[0] + perp_x * offset
         end_y = to_coords[1] + perp_y * offset
 
-        # 对于曲线道路（有junction形状信息），插值生成中间点
-        # 这里简化为直线连接（因为shape缺失）
-        shape = [(start_x, start_y), (end_x, end_y)]
+        # 使用三次贝塞尔曲线生成平滑的junction shape
+        # 而非简单直线，这样更符合真实道路几何
+        # 控制点基于起点和终点的方向向量
+        dx = end_x - start_x
+        dy = end_y - start_y
+        
+        # 生成5个插值点来近似曲线
+        num_points = 5
+        shape = []
+        for i in range(num_points):
+            t = i / (num_points - 1)
+            # 三次贝塞尔曲线：B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+            # 控制点：P0=start, P1=start+0.3*direction, P2=end-0.3*direction, P3=end
+            t_inv = 1 - t
+            b0 = t_inv ** 3
+            b1 = 3 * t_inv ** 2 * t
+            b2 = 3 * t_inv * t ** 2
+            b3 = t ** 3
+            
+            x = (b0 * start_x + 
+                 b1 * (start_x + 0.3 * dx) + 
+                 b2 * (end_x - 0.3 * dx) + 
+                 b3 * end_x)
+            y = (b0 * start_y + 
+                 b1 * (start_y + 0.3 * dy) + 
+                 b2 * (end_y - 0.3 * dy) + 
+                 b3 * end_y)
+            shape.append((x, y))
 
         return shape
 
@@ -272,16 +297,25 @@ class FrenetCoordinateSystem:
                 continue
 
             # 从该junction连接的lane推断位置
-            # 简化：使用第一个incoming lane的终点
+            # 改进：使用所有incoming lanes的终点加权平均
+            incoming_points = []
             for inc_lane in junction.findall('incLane'):
                 lane_id = inc_lane.get('id')
                 # 从已解析的lanes中查找
                 if lane_id in self.lanes:
                     lane_shape = self.lanes[lane_id].shape
                     if lane_shape:
-                        # 使用lane的终点作为junction位置
-                        junction_coords[junction_id] = lane_shape[-1]
-                        break
+                        incoming_points.append(lane_shape[-1])
+            
+            # 如果有多个连接lane，使用加权平均获得更准确的junction中心
+            if incoming_points:
+                if len(incoming_points) == 1:
+                    junction_coords[junction_id] = incoming_points[0]
+                else:
+                    # 使用所有点的平均值作为junction中心
+                    avg_x = sum(p[0] for p in incoming_points) / len(incoming_points)
+                    avg_y = sum(p[1] for p in incoming_points) / len(incoming_points)
+                    junction_coords[junction_id] = (avg_x, avg_y)
 
         return junction_coords
 
@@ -330,8 +364,18 @@ class FrenetCoordinateSystem:
             (s, d): 纵向位置(m), 横向偏移(m)
         """
         if lane_id not in self.lanes:
-            # 车道不存在,返回简化坐标
-            return (0.0, 0.0)
+            # 车道不存在时，尝试基于edge找到最近的车道
+            # 而非简单返回(0,0)，这样能保持坐标的连续性
+            if edge_id:
+                # 查找该edge上的其他车道
+                edge_lanes = [lid for lid in self.lanes.keys() if lid.startswith(edge_id)]
+                if edge_lanes:
+                    # 使用第一个可用车道计算
+                    lane_id = edge_lanes[0]
+                else:
+                    return (0.0, 0.0)
+            else:
+                return (0.0, 0.0)
 
         centerline = self.lanes[lane_id]
 

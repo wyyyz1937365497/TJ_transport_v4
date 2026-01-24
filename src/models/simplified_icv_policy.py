@@ -286,10 +286,11 @@ class SimplifiedICVPolicy(nn.Module):
             # 随机模式：对原始action_mean添加噪声，然后变换
             std = torch.exp(log_std.clamp(-5.0, 2.0))  # [B, N, 2]
             noise = torch.randn_like(action_mean)
-            noisy_action_mean = action_mean + std * noise
+            # 保存未clamp的采样值用于正确计算log_prob
+            noisy_action_mean_raw = action_mean + std * noise
 
-            # 关键：clamp到[-1, 1]确保变换后不会超出范围
-            noisy_action_mean = torch.clamp(noisy_action_mean, -1.0, 1.0)
+            # clamp到[-1, 1]用于安全的变换
+            noisy_action_mean = torch.clamp(noisy_action_mean_raw, -1.0, 1.0)
 
             # 变换到正确范围
             # 加速度：[-1, 1] → [-3, 2]
@@ -304,10 +305,11 @@ class SimplifiedICVPolicy(nn.Module):
 
             actions_out = torch.cat([accel, lane_change], dim=-1)  # [B, N, 2]
 
-            # 计算log_prob（高斯分布）- 使用原始[-1,1]空间
+            # 计算log_prob（高斯分布）- 使用原始未clamp的采样值
+            # 这样保证了概率密度的正确性，避免clamp导致的概率失真
             # log_prob = -0.5 * (((sample - mean) / std)^2 + 2*log_std + log(2π))
             log_prob_per_dim = -0.5 * (
-                ((noisy_action_mean - action_mean) / (std + 1e-6)) ** 2 +
+                ((noisy_action_mean_raw - action_mean) / (std + 1e-6)) ** 2 +
                 2 * log_std +
                 np.log(2 * np.pi)
             )  # [B, N, 2]
