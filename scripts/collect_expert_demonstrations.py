@@ -272,6 +272,23 @@ def collect_single_episode_worker(args: Tuple) -> Dict[str, Any]:
     if 'icv_ratio' not in env_config:
         env_config['icv_ratio'] = 0.10
 
+    # ✅ 修复：禁用神经网络评分器，强制使用规则评分器
+    # 确保专家演示使用高质量的规则选择策略
+    if 'neural_icv_scoring' not in env_config:
+        env_config['neural_icv_scoring'] = {'enabled': False}
+    else:
+        env_config['neural_icv_scoring']['enabled'] = False
+
+    # 启用规则评分器
+    if 'rule_based_scoring' not in env_config:
+        env_config['rule_based_scoring'] = {
+            'enabled': True,
+            'bottleneck_s_min': 1200.0,
+            'bottleneck_s_max': 2200.0
+        }
+    else:
+        env_config['rule_based_scoring']['enabled'] = True
+
     # Create environment
     env = CompetitionSumoEnv(
         config=env_config,
