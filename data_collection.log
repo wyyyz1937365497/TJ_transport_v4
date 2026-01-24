@@ -1,0 +1,14 @@
+======================================================================
+Expert Demonstration Collector
+======================================================================
+Config: configs/v5_complete.yaml
+Episodes: 100
+Max steps: 3600
+K vehicles: 25
+Workers: 8
+Output: data/demonstrations/expert
+Seed: 42
+======================================================================
+
+[Parallel Collection] Collecting 100 episodes with 8 workers...
+Collecting episodes:   0%|          | 0/100 [00:00<?, ?it/s]

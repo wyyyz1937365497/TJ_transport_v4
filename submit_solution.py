@@ -31,6 +31,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 导入模型
 from src.models.simplified_icv_policy import SimplifiedICVPolicy
+from src.utils.frenet_utils import get_frenet_system
+from src.env.vehicle_scoring import UnifiedVehicleScorer, create_vehicle_scorer_from_config
 
 
 class OCRMAXSubmission:
@@ -40,16 +42,18 @@ class OCRMAXSubmission:
     集成SimplifiedICVPolicy到官方评测框架
     """
 
-    def __init__(self, sumo_cfg_path, checkpoint_path, device='cuda'):
+    def __init__(self, sumo_cfg_path, checkpoint_path, device='cuda', use_conservative_control=False):
         """
         Args:
             sumo_cfg_path: SUMO配置文件路径
             checkpoint_path: 模型权重路径
             device: 运行设备
+            use_conservative_control: 是否使用保守控制（默认False，适合模仿学习模型）
         """
         self.sumo_cfg_path = sumo_cfg_path
         self.checkpoint_path = checkpoint_path
         self.device = device
+        self.use_conservative_control = use_conservative_control
 
         # 数据存储（与官方框架一致）
         self.vehicle_data = []
@@ -82,6 +86,20 @@ class OCRMAXSubmission:
         # ICV跟踪
         self.icv_ratio = 0.10
         self.icv_ids = set()
+
+        # ========== Frenet坐标系 ==========
+        self.frenet_system = None
+        self.net_file = None
+
+        # ========== ICV管理（与训练环境一致） ==========
+        self.controlled_icv_ids = set()  # 当前受控ICV车辆集合
+        self.icv_control_step = {}  # 每个ICV车辆的控制开始时间
+        self.last_icv_reevaluate_step = 0  # 上次重新评估ICV的步数
+        self.icv_reevaluate_interval = 10  # 每10步重新评估一次ICV组成
+        self.current_step = 0  # 当前仿真步数
+
+        # ========== 车辆评分器 ==========
+        self.vehicle_scorer = None
 
         print("=" * 70)
         print("OCR-MAX模型提交框架")
@@ -128,6 +146,52 @@ class OCRMAXSubmission:
         print(f"  - 网络文件: {self.net_file}")
         print(f"  - 路径文件: {self.routes_file}")
         print(f"  - 时间步长: {self.step_length}s")
+
+        # 初始化Frenet坐标系
+        if self.net_file and os.path.exists(self.net_file):
+            try:
+                self.frenet_system = get_frenet_system(self.net_file)
+                print(f"  - Frenet坐标系: ✅ 已加载")
+            except Exception as e:
+                print(f"  - Frenet坐标系: ⚠️ 加载失败 ({e})")
+                print(f"    将使用简化坐标计算")
+
+        # 初始化车辆评分器
+        try:
+            scorer_config = {
+                'neural_icv_scoring': {'enabled': False},  # 禁用神经网络评分
+                'rule_based_scoring': {
+                    'enabled': True,
+                    'bottleneck_s_min': 1200.0,
+                    'bottleneck_s_max': 2200.0,
+                    'key_merge_points': [
+                        {'s': 1400.0, 'weight': 1.5, 'name': 'E17/J15'},
+                        {'s': 1800.0, 'weight': 1.5, 'name': 'E19/J17'},
+                        {'s': 1000.0, 'weight': 1.2, 'name': 'E23/J5'}
+                    ],
+                    'weights': {
+                        'bottleneck': 0.40,
+                        'speed': 0.25,
+                        'lane': 0.15,
+                        'distance': 0.15,
+                        'ttc': 0.05
+                    },
+                    'desired_speed': 30.0,
+                    'max_accel': 2.0,
+                    'max_decel': -4.5,
+                    'safe_time_gap': 1.5,
+                    'speed_threshold_ratio': 0.7
+                }
+            }
+            self.vehicle_scorer = create_vehicle_scorer_from_config(
+                scorer_config,
+                frenet_system=self.frenet_system,
+                device=self.device
+            )
+            print(f"  - 车辆评分器: ✅ 已加载 (规则基线)")
+        except Exception as e:
+            print(f"  - 车辆评分器: ⚠️ 加载失败 ({e})")
+            print(f"    将使用简单的ID排序选择")
 
     def parse_routes(self):
         """解析路径文件"""
@@ -275,17 +339,53 @@ class OCRMAXSubmission:
         vehicle_ids = traci.vehicle.getIDList()
         vehicle_states = {}
 
-        # 选择ICV（前10%车辆）
+        # ========== 智能ICV选择（与训练环境一致） ==========
         num_icv = max(1, int(len(vehicle_ids) * self.icv_ratio))
 
-        # 更新ICV集合（保持已有ICV，添加新的）
-        if len(self.icv_ids) < num_icv:
-            # 按照ID排序选择前N辆
-            sorted_vehicles = sorted(vehicle_ids)
-            self.icv_ids = set(sorted_vehicles[:num_icv])
+        # 动态ICV管理：定期重新评估ICV组成
+        should_reevaluate = (
+            self.current_step == 0 or  # episode开始
+            (self.current_step - self.last_icv_reevaluate_step) >= self.icv_reevaluate_interval  # 超过间隔
+        )
 
-        # 只保留当前存在的车辆
-        self.icv_ids = self.icv_ids.intersection(set(vehicle_ids))
+        if should_reevaluate and len(self.controlled_icv_ids) > 0 and self.vehicle_scorer is not None:
+            # 动态更新：重新评估并可能释放部分ICV
+            icv_ids = self._dynamic_update_icv(vehicle_ids, num_icv)
+            self.last_icv_reevaluate_step = self.current_step
+        else:
+            # 初始选择或保持不变
+            if len(self.controlled_icv_ids) == 0:
+                # 初始选择：使用智能评分器
+                if self.vehicle_scorer is not None:
+                    icv_ids = self._intelligent_select_icv(vehicle_ids, num_icv)
+                else:
+                    # 回退到简单选择
+                    sorted_vehicles = sorted(vehicle_ids)
+                    icv_ids = set(sorted_vehicles[:num_icv])
+                self.controlled_icv_ids = icv_ids
+            else:
+                # 保持当前ICV集合（但需要检查车辆是否还在路网中）
+                icv_ids = self.controlled_icv_ids & set(vehicle_ids)
+
+                # 如果ICV数量不足，补充新的
+                if len(icv_ids) < num_icv:
+                    additional_needed = min(num_icv - len(icv_ids), len(set(vehicle_ids) - icv_ids))
+                    if additional_needed > 0 and self.vehicle_scorer is not None:
+                        remaining_vehicles = list(set(vehicle_ids) - icv_ids)
+                        additional_icv = self._intelligent_select_icv(remaining_vehicles, additional_needed)
+                        icv_ids.update(additional_icv)
+                        self.controlled_icv_ids = icv_ids
+
+                # 确保ICV数量不超过目标值（硬约束）
+                if len(icv_ids) > num_icv and self.vehicle_scorer is not None:
+                    # 使用评分器重新排序并保留最高的
+                    all_scores = self._compute_all_vehicle_scores(vehicle_states, vehicle_ids)
+                    icv_scores = {veh_id: all_scores.get(veh_id, 0.0) for veh_id in icv_ids}
+                    sorted_icvs = sorted(icv_scores.items(), key=lambda x: x[1], reverse=True)
+                    icv_ids = set([veh_id for veh_id, _ in sorted_icvs[:num_icv]])
+                    self.controlled_icv_ids = icv_ids
+
+        self.icv_ids = icv_ids
 
         # 收集车辆状态
         for veh_id in vehicle_ids:
@@ -297,18 +397,34 @@ class OCRMAXSubmission:
                 lane_index = traci.vehicle.getLaneIndex(veh_id)
                 angle = traci.vehicle.getAngle(veh_id)
 
-                # 获取Frenet坐标（简化版）
-                road_id = traci.vehicle.getRoadID(veh_id)
+                # 获取道路信息
+                lane_id = traci.vehicle.getLaneID(veh_id)
+                edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
                 route = traci.vehicle.getRoute(veh_id)
                 route_index = traci.vehicle.getRouteIndex(veh_id)
 
-                # 简化的s, d坐标（相对于edge）
-                s = position
-                d = lane_index * 3.5  # 假设车道宽度3.5m
+                # ========== 正确的Frenet坐标计算 ==========
+                if self.frenet_system is not None and lane_id in self.frenet_system.lanes:
+                    # 使用Frenet系统（推荐）
+                    x, y = traci.vehicle.getPosition(veh_id)
+                    s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
 
-                # 简化的vs, vd（基于速度和角度）
-                vs = speed * np.cos(np.radians(angle))
-                vd = speed * np.sin(np.radians(angle))
+                    # 获取车道在s位置的航向角
+                    lane_heading_obj = self.frenet_system.lanes.get(lane_id)
+                    if lane_heading_obj is not None:
+                        heading_at_s = lane_heading_obj.get_heading_at_s(s)
+                    else:
+                        heading_at_s = np.radians(angle)
+
+                    # 速度分解到Frenet坐标系（相对于道路方向）
+                    vs = speed * np.cos(angle * np.pi / 180.0 - heading_at_s)
+                    vd = speed * np.sin(angle * np.pi / 180.0 - heading_at_s)
+                else:
+                    # 简化版（回退方案）
+                    s = position
+                    d = lane_index * 3.5
+                    vs = speed * np.cos(np.radians(angle))
+                    vd = speed * np.sin(np.radians(angle))
 
                 vehicle_states[veh_id] = {
                     's': s,
@@ -438,6 +554,229 @@ class OCRMAXSubmission:
 
         return actions_dict
 
+    # ========================================================================
+    # ICV智能选择核心方法（与训练环境完全一致）
+    # ========================================================================
+
+    def _intelligent_select_icv(self, all_vehicle_ids, num_icv):
+        """
+        智能选择ICV车辆（基于统一评分器）
+
+        优先选择关键车辆：
+        1. 瓶颈区域的车辆（汇流区、减速区）
+        2. 速度异常的车辆（过慢或过快）
+        3. 关键位置的车辆（最外侧车道、上游瓶颈）
+
+        Args:
+            all_vehicle_ids: 所有车辆ID列表
+            num_icv: 需要选择的ICV数量
+
+        Returns:
+            选中车辆ID的集合
+        """
+        if len(all_vehicle_ids) <= num_icv:
+            return set(all_vehicle_ids)
+
+        # 收集所有车辆状态
+        vehicle_states = {}
+        for veh_id in all_vehicle_ids:
+            try:
+                vehicle_states[veh_id] = self._get_vehicle_state(veh_id)
+            except:
+                pass
+
+        # 使用评分器计算所有车辆评分
+        vehicle_scores = self._compute_all_vehicle_scores(vehicle_states, all_vehicle_ids)
+
+        # 选择评分最高的K辆车辆
+        sorted_vehicles = sorted(
+            vehicle_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # 取前K辆
+        selected_vehicles = set([veh_id for veh_id, score in sorted_vehicles[:num_icv]])
+
+        # 更新ICV控制时间
+        for veh_id in selected_vehicles:
+            if veh_id not in self.icv_control_step:
+                self.icv_control_step[veh_id] = self.current_step
+
+        return selected_vehicles
+
+    def _dynamic_update_icv(self, all_vehicle_ids, num_icv):
+        """
+        动态更新ICV集合：重新评估并释放低重要性ICV
+
+        每10步执行一次：
+        1. 计算当前ICV的评分（带时间衰减）
+        2. 计算候选车辆的评分
+        3. 如果候选车辆评分 > 当前ICV评分，则替换
+
+        Args:
+            all_vehicle_ids: 所有车辆ID列表
+            num_icv: 目标ICV数量
+
+        Returns:
+            更新后的ICV集合
+        """
+        if len(self.controlled_icv_ids) == 0:
+            return self._intelligent_select_icv(all_vehicle_ids, num_icv)
+
+        # 收集所有车辆状态
+        vehicle_states = {}
+        for veh_id in all_vehicle_ids:
+            try:
+                vehicle_states[veh_id] = self._get_vehicle_state(veh_id)
+            except:
+                pass
+
+        # 计算所有车辆的基础评分
+        all_scores = self._compute_all_vehicle_scores(vehicle_states, all_vehicle_ids)
+
+        # 当前ICV的评分（带时间衰减）
+        current_scores = {}
+        icv_still_in_network = set()
+
+        for veh_id in self.controlled_icv_ids:
+            if veh_id in all_vehicle_ids:
+                base_score = all_scores.get(veh_id, 0.0)
+
+                # 时间衰减：控制时间越长，评分越低（最多降低30%）
+                if veh_id in self.icv_control_step:
+                    duration = self.current_step - self.icv_control_step[veh_id]
+                    decay_factor = max(0.7, 1.0 - duration / 1000.0)
+                    score = base_score * decay_factor
+                else:
+                    score = base_score
+
+                current_scores[veh_id] = score
+                icv_still_in_network.add(veh_id)
+
+        # 候选车辆（非ICV）
+        candidate_vehicles = set(all_vehicle_ids) - self.controlled_icv_ids
+        candidate_scores = {
+            veh_id: all_scores.get(veh_id, 0.0)
+            for veh_id in candidate_vehicles
+        }
+
+        # 合并并排序
+        all_icv_scores = {**current_scores, **candidate_scores}
+        sorted_vehicles = sorted(all_icv_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # 选择评分最高的num_icv个
+        new_icv_ids = set([veh_id for veh_id, score in sorted_vehicles[:num_icv]])
+
+        # 更新控制时间
+        for veh_id in new_icv_ids:
+            if veh_id not in self.icv_control_step:
+                self.icv_control_step[veh_id] = self.current_step
+
+        # 调试输出
+        if self.current_step % 100 == 0:
+            total_vehicles = len(all_vehicle_ids)
+            icv_ratio = len(new_icv_ids) / total_vehicles * 100 if total_vehicles > 0 else 0
+            released = len(self.controlled_icv_ids) - len(new_icv_ids & self.controlled_icv_ids)
+            print(f"[ICV Update] Step {self.current_step}:")
+            print(f"  - Released {released} low-importance ICVs")
+            print(f"  - Current ICV count: {len(new_icv_ids)}/{num_icv} (target: {self.icv_ratio*100:.0f}%)")
+            print(f"  - Total vehicles: {total_vehicles}, Actual ratio: {icv_ratio:.1f}%")
+
+            if len(all_icv_scores) > 0:
+                scores_list = list(all_icv_scores.values())
+                print(f"  - ICV scores: min={min(scores_list):.2f}, max={max(scores_list):.2f}, "
+                      f"mean={sum(scores_list)/len(scores_list):.2f}")
+
+        self.controlled_icv_ids = new_icv_ids
+        return new_icv_ids
+
+    def _compute_all_vehicle_scores(self, vehicle_states, all_vehicle_ids):
+        """
+        计算所有车辆的评分
+
+        使用UnifiedVehicleScorer计算车辆重要性评分。
+
+        Args:
+            vehicle_states: 车辆状态字典
+            all_vehicle_ids: 所有车辆ID列表
+
+        Returns:
+            车辆评分字典 {veh_id: score}
+        """
+        if self.vehicle_scorer is None:
+            # 回退到简单评分（基于ID排序）
+            return {veh_id: float(veh_id) for veh_id in all_vehicle_ids}
+
+        context = {
+            'traci': traci,
+            'all_vehicle_ids': all_vehicle_ids
+        }
+
+        try:
+            return self.vehicle_scorer.compute_scores(vehicle_states, context)
+        except Exception as e:
+            print(f"[Warning] 车辆评分失败，使用回退方案: {e}")
+            return {veh_id: float(veh_id) for veh_id in all_vehicle_ids}
+
+    def _get_vehicle_state(self, veh_id):
+        """
+        获取单个车辆的状态字典
+
+        Args:
+            veh_id: 车辆ID
+
+        Returns:
+            车辆状态字典
+        """
+        try:
+            lane_id = traci.vehicle.getLaneID(veh_id)
+            position = traci.vehicle.getLanePosition(veh_id)
+            speed = traci.vehicle.getSpeed(veh_id)
+            acceleration = traci.vehicle.getAcceleration(veh_id)
+            lane_index = traci.vehicle.getLaneIndex(veh_id)
+            angle = traci.vehicle.getAngle(veh_id)
+            edge_id = lane_id.split('_')[0] if '_' in lane_id else lane_id
+
+            # 计算Frenet坐标
+            if self.frenet_system is not None and lane_id in self.frenet_system.lanes:
+                x, y = traci.vehicle.getPosition(veh_id)
+                s, d = self.frenet_system.cartesian_to_frenet(x, y, edge_id, lane_id)
+
+                # 获取航向角并计算vs, vd
+                lane_heading_obj = self.frenet_system.lanes.get(lane_id)
+                if lane_heading_obj is not None:
+                    heading_at_s = lane_heading_obj.get_heading_at_s(s)
+                    vs = speed * np.cos(angle * np.pi / 180.0 - heading_at_s)
+                    vd = speed * np.sin(angle * np.pi / 180.0 - heading_at_s)
+                else:
+                    vs = speed * np.cos(np.radians(angle))
+                    vd = speed * np.sin(np.radians(angle))
+            else:
+                # 简化坐标
+                s = position
+                d = lane_index * 3.5
+                vs = speed * np.cos(np.radians(angle))
+                vd = speed * np.sin(np.radians(angle))
+
+            return {
+                'id': veh_id,
+                's': s,
+                'd': d,
+                'vs': vs,
+                'vd': vd,
+                'speed': speed,
+                'acceleration': acceleration,
+                'lane_id': lane_id,
+                'lane_index': lane_index,
+                'angle': angle,
+                'edge_id': edge_id,
+                'x': traci.vehicle.getPosition(veh_id)[0],
+                'y': traci.vehicle.getPosition(veh_id)[1]
+            }
+        except Exception as e:
+            return None
+
     def apply_control_actions(self, actions_dict):
         """
         应用控制动作到SUMO
@@ -485,6 +824,9 @@ class OCRMAXSubmission:
         参数:
             step: 当前仿真步数
         """
+        # 更新当前步数（用于ICV动态管理）
+        self.current_step = step
+
         # 获取观测
         obs_dict = self.get_observation_dict()
 
@@ -505,11 +847,45 @@ class OCRMAXSubmission:
         actions_dict = self.convert_actions_to_dict(action, vehicle_ids, icv_ids)
 
         # 应用动作到SUMO
+        # 根据配置决定是否使用保守控制过滤
+        if self.use_conservative_control:
+            # ========== 保守控制过滤（禁用减速和换道）==========
+            # 仅用于PPO等不稳定模型
+            actions_dict = self.filter_conservative_actions(actions_dict, obs_dict)
+        # else: 不使用过滤，完全信任模型（适合模仿学习）
+
         self.apply_control_actions(actions_dict)
 
     # ========================================================================
     # 第三部分: 数据收集与统计（与官方框架一致）
     # ========================================================================
+
+
+    def filter_conservative_actions(self, actions_dict, vehicle_states):
+        """
+        保守控制过滤：只保留安全的控制动作
+
+        策略：
+        1. 禁止减速（只允许加速或保持）
+        2. 禁止换道（避免干扰交通流）
+
+        目标：减少有害控制，使OCR恢复到baseline水平或更高
+        """
+        safe_actions = {}
+
+        for veh_id, action in actions_dict.items():
+            acceleration, lane_change = action
+
+            # 1. 禁止减速（只允许加速或保持）
+            if acceleration < 0:
+                acceleration = 0.0
+
+            # 2. 禁止换道（设为0，不执行换道）
+            lane_change = 0.0
+
+            safe_actions[veh_id] = (acceleration, lane_change)
+
+        return safe_actions
 
     def get_traffic_light_states(self):
         """获取红绿灯状态"""
@@ -882,7 +1258,7 @@ def main():
     sumo_cfg = "仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg"
 
     # 模型权重路径
-    checkpoint_path = "checkpoints/ocr_max/stage2_best.pth"
+    checkpoint_path = "checkpoints/ocr_max/stage2_ppo_iter99.pth"
 
     # 仿真参数
     MAX_STEPS = 3600
