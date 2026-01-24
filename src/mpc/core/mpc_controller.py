@@ -289,16 +289,35 @@ class MPCController:
                         gap_error = cp.maximum(desired_gap - gap, 0.0)
                         cost += self.config.Q_gap * cp.square(gap_error)
 
-                # 5. 瓶颈区域特殊处理（简化：不使用logical_and以保持凸性）
-                # 注：由于cp.logical_and会创建非凸约束，这里简化处理
-                # 瓶颈区域优化主要通过调整目标函数权重实现
-                s_pos = X[k, i, 0]
+                # 5. 瓶颈区域特殊处理（凸优化友好）
+                # 基于初始位置预计算权重，避免动态条件
+                s_init = X_init[i, 0]
 
-                # 如果车辆可能在瓶颈区域（基于初始位置），增加控制平滑性
-                # 使用软约束：当位置接近瓶颈区域时，增加控制权重
-                # 这里简化为对所有情况都应用平滑控制
+                # 预计算瓶颈区域权重（在优化外）
+                # 如果初始位置在瓶颈区域，使用增强权重
+                is_in_bottleneck = (s_init >= self.config.bottleneck_s_min and
+                                   s_init <= self.config.bottleneck_s_max)
+
+                bottleneck_speed_multiplier = 2.0 if is_in_bottleneck else 1.0
+                bottleneck_gap_multiplier = 1.5 if is_in_bottleneck else 1.0
+
                 if k < M:
+                    # 控制平滑性
                     cost += self.config.Q_accel * cp.square(U[k, i, 0])
+
+                    # 速度跟踪（瓶颈区域使用更高权重）
+                    speed_target = 30.0
+                    cost += bottleneck_speed_multiplier * self.config.Q_speed * cp.square(X[k + 1, i, 1] - speed_target)
+
+                    # 瓶颈区域车距保持
+                    if leader_id and leader_id in icv_states:
+                        leader_idx = icv_ids.index(leader_id) if leader_id in icv_ids else -1
+                        if leader_idx >= 0:
+                            gap = X[k, leader_idx, 0] - X[k, i, 0]
+                            # 瓶颈区域期望车距更大
+                            desired_gap_enhanced = self.config.desired_gap + (2.0 if is_in_bottleneck else 0.0)
+                            gap_error = cp.maximum(desired_gap_enhanced - gap, 0.0)
+                            cost += bottleneck_gap_multiplier * self.config.Q_gap * cp.square(gap_error)
 
         # ========== 约束条件 ==========
 
@@ -329,7 +348,15 @@ class MPCController:
                 s_next = s_k + v_k * dt
                 v_next = v_k + u_accel * dt
                 a_next = u_accel
-                lane_next = X[k, i, 3]  # 简化：不考虑换道
+
+                # 换道决策（简化版，保持凸性）
+                # 车道基本保持不变，但在优化问题外可以考虑换道
+                # 这是因为频繁换道在MPC中难以优化且不稳定
+                lane_next = X[k, i, 3]  # 保持当前车道
+
+                # 换道决策作为单独的高层策略，不纳入MPC优化
+                # 如果需要换道，通过外部策略实现（如基于速度和位置的规则）
+                # MPC专注于纵向控制（加速度）的优化
 
                 # 状态转移约束
                 constraints.append(X[k + 1, i, 0] == s_next)
@@ -545,6 +572,7 @@ class DistributedMPCController:
         # 前车状态
         leader_v0 = leader_state.get('speed', v0) if leader_state else v0
         leader_s0 = leader_state.get('s', s0 + 100.0) if leader_state else s0 + 100.0
+        leader_a0 = leader_state.get('acceleration', 0.0) if leader_state else 0.0
 
         # 目标函数
         cost = 0.0
@@ -557,12 +585,22 @@ class DistributedMPCController:
             # 控制成本
             cost += self.config.R_accel * cp.square(u_accel[k])
 
-            # 车间距保持
+            # 车间距保持（改进版：使用前车加速度）
             if leader_state is not None:
-                # 简化：假设前车匀速
-                leader_s_k = leader_s0 + leader_v0 * (k + 1) * dt
+                # 使用前车的加速度进行更准确的预测
+                # 前车运动学方程：s(t) = s0 + v0*t + 0.5*a*t²
+                time_k = (k + 1) * dt
+                leader_s_k = leader_s0 + leader_v0 * time_k + 0.5 * leader_a0 * time_k ** 2
+
                 gap = leader_s_k - s[k]
-                gap_error = cp.maximum(self.config.desired_gap - gap, 0.0)
+
+                # 自适应期望车距
+                # 前车减速时 (leader_a0 < 0)，增加安全车距
+                adaptive_desired_gap = self.config.desired_gap
+                if leader_a0 < -0.5:  # 前车显著减速
+                    adaptive_desired_gap += 2.0  # 增加车距
+
+                gap_error = cp.maximum(adaptive_desired_gap - gap, 0.0)
                 cost += self.config.Q_gap * cp.square(gap_error)
 
         # 约束

@@ -118,9 +118,22 @@ class SimplifiedTrafficModel:
         # 更新加速度（用于输出）
         next_a = next_accel
 
-        # 2. 处理换道（简化：probabilistic）
-        # 在MPC中我们主要优化纵向控制，换道作为辅助
-        next_lane = lane  # 简化：不频繁换道
+        # 2. 处理换道决策
+        # 基于换道概率和安全条件判断是否换道
+        next_lane = lane
+        if lane_change_prob > 0.5:  # 换道阈值
+            # 检查换道安全性
+            # 原则：当前车速度较低且有相邻车道可用时换道
+            can_change_left = (lane > 0)  # 不在最左侧车道
+            can_change_right = (lane < 2)  # 假设3车道，不在最右侧
+
+            # 简化的换道决策：根据速度和车距
+            # 速度较慢时尝试换道
+            if v < 20.0:  # 速度低于20 m/s时考虑换道
+                if can_change_left and np.random.random() < lane_change_prob * 0.5:
+                    next_lane = lane - 1  # 向左换道（超车道）
+                elif can_change_right and np.random.random() < lane_change_prob * 0.3:
+                    next_lane = lane + 1  # 向右换道
 
         next_state = np.array([next_s, next_v, next_a, next_lane])
 
