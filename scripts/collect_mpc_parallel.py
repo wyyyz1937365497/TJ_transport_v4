@@ -244,15 +244,13 @@ def collect_single_episode_worker(args: Tuple) -> Dict:
     arrived_vehicles = set()
     previous_vehicles = set()
 
+    # ✅ 修复：使用环境统计而非直接traci调用
+    final_arrived_count = 0
+    final_departed_count = 0
+
     total_reward = 0.0
     step = 0
     max_steps = 3600
-
-    # Import traci for tracking
-    try:
-        import traci as traci_lib
-    except ImportError:
-        import libsumo as traci_lib
 
     # Performance tracking
     mpc_times = []
@@ -327,21 +325,22 @@ def collect_single_episode_worker(args: Tuple) -> Dict:
             next_obs_dict, reward, done, info = env.step(actions_dict)
             total_reward += reward
 
-            # Track arrived vehicles
-            try:
-                arrived = traci_lib.simulation.getArrivedIDList()
-                if arrived:
-                    arrived_vehicles.update(arrived)
-            except:
-                pass
+            # Track latest arrived/departed counts from environment
+            arrived_count = info.get('arrived_count', 0)
+            departed_count = info.get('departed_count', 0)
 
             obs_dict = next_obs_dict
 
             if done:
+                # Save final counts for OCR calculation
+                final_arrived_count = arrived_count
+                final_departed_count = departed_count
                 break
 
     except Exception as e:
         print(f"[Worker {worker_id}] Error at step {step}: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         # ========== 关键：清理环境 ==========
@@ -350,14 +349,8 @@ def collect_single_episode_worker(args: Tuple) -> Dict:
         except:
             pass
 
-        try:
-            import traci
-            traci.close()
-        except:
-            pass
-
-    # Calculate OCR
-    ocr = len(arrived_vehicles) / len(departed_vehicles) if len(departed_vehicles) > 0 else 0.0
+    # ✅ 修复：使用环境的arrived/departed统计计算OCR
+    ocr = final_arrived_count / final_departed_count if final_departed_count > 0 else 0.0
 
     episode_data = {
         'episode_id': episode_id,
@@ -366,8 +359,8 @@ def collect_single_episode_worker(args: Tuple) -> Dict:
         'ocr': ocr,
         'reward': total_reward,
         'num_steps': step + 1,
-        'departed': len(departed_vehicles),
-        'arrived': len(arrived_vehicles),
+        'departed': final_departed_count,
+        'arrived': final_arrived_count,
         'performance': {
             'avg_mpc_time_ms': np.mean(mpc_times) * 1000 if len(mpc_times) > 0 else 0,
             'avg_scorer_time_ms': np.mean(scorer_times) * 1000 if len(scorer_times) > 0 else 0

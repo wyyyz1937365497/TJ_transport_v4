@@ -91,7 +91,7 @@ mpc:
   # 车辆选择策略
   vehicle_selection:
     strategy: rule_based  # rule_based (规则) 或 random (随机)
-    k_vehicles: 50        # 控制车辆数量 (初赛优化: 从25增加到50, 利用Pint=1优势)
+    k_vehicles: 25        # 控制车辆数量 (暂时降低，MPC换道有问题)
 
 # 数据收集配置
 data_collection:

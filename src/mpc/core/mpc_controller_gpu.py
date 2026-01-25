@@ -449,7 +449,17 @@ class GPUMPCController:
         actions_dict = {}
         for i, veh_id in enumerate(target_vehicles):
             accel = float(actions_np[i, 0])
-            lane_change = float(actions_np[i, 1])
+
+            # ✅ 修复：离散化lane_change动作
+            # MPC输出连续值，需要转换为离散值：-1(左), 0(不变), +1(右)
+            lane_change_raw = float(actions_np[i, 1])
+            if lane_change_raw < -0.33:
+                lane_change = -1  # 左变道
+            elif lane_change_raw > 0.33:
+                lane_change = 1   # 右变道
+            else:
+                lane_change = 0   # 保持车道
+
             actions_dict[veh_id] = (accel, lane_change)
 
         # ========== 6. 缓存 ==========

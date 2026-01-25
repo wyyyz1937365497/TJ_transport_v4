@@ -272,13 +272,10 @@ def collect_single_episode_gpu(args: Tuple) -> Dict:
             next_obs_dict, reward, done, info = env.step(actions_dict)
             total_reward += reward
 
-            # Track arrived vehicles
-            try:
-                arrived = traci_lib.simulation.getArrivedIDList()
-                if arrived:
-                    arrived_vehicles.update(arrived)
-            except:
-                pass
+            # ✅ 修复：使用环境info获取arrived/departed统计（避免traci连接问题）
+            arrived_count = info.get('arrived_count', 0)
+            if arrived_count > len(arrived_vehicles):
+                arrived_vehicles = set(range(arrived_count))
 
             obs_dict = next_obs_dict
 

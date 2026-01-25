@@ -391,6 +391,7 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         if self._subscription_enabled and self._junction_id is not None:
             try:
                 # 使用junction订阅批量获取所有车辆数据（1次API调用）
+                self._subscription_call_count += 1  # ✅ 修复：添加计数
                 return traci_lib.junction.getContextSubscriptionResults(self._junction_id)
             except Exception as e:
                 # Junction订阅失败，回退到逐车辆订阅
@@ -414,7 +415,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         for veh_id in all_vehicle_ids:
             traci_lib.vehicle.subscribe(veh_id, var_list)
 
-        # 一次性获取所有车辆的订阅数据
+        # 一次性获取所有车辆的订阅数据（N+1次API调用）
+        self._subscription_call_count += len(all_vehicle_ids) + 1  # ✅ 修复：添加计数
         return traci_lib.vehicle.getAllSubscriptionResults()
 
     def _get_lane_angle(self, lane_id: str) -> float:
@@ -429,7 +431,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
             edge_id = lane_id.split('_')[0]
             angle = traci_lib.edge.getAngle(edge_id)
             return angle
-        except:
+        except Exception as e:
+            # ✅ 添加日志：edge角度查询失败（非致命错误）
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"Failed to get angle for lane {lane_id}: {e}")
             return 0.0
 
     def _compute_all_vehicle_scores(
@@ -488,8 +494,12 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         for veh_id in all_vehicle_ids:
             try:
                 vehicle_states[veh_id] = self._get_vehicle_state_from_traci(veh_id, traci_lib)
-            except:
-                pass
+            except Exception as e:
+                # ✅ 添加日志：车辆状态收集失败（可能是车辆已离开路网）
+                # 使用logger.warning而不是静默忽略
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Failed to get state for vehicle {veh_id}: {e}")
 
         # ========== 1. 重新评估当前ICV的重要性 ==========
         # ✅ 使用统一评分器计算所有车辆评分（一次性计算，避免重复）
@@ -622,8 +632,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         for veh_id in all_vehicle_ids:
             try:
                 vehicle_states[veh_id] = self._get_vehicle_state_from_traci(veh_id, traci_lib)
-            except:
-                pass
+            except Exception as e:
+                # ✅ 添加日志：车辆状态收集失败
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Failed to get state for vehicle {veh_id}: {e}")
 
         # ✅ 使用统一评分器计算所有车辆评分
         vehicle_scores = self._compute_all_vehicle_scores(vehicle_states, traci_lib, all_vehicle_ids)
@@ -820,7 +833,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                 if action[0] > 0:
                     self.intervention_stats['energy_consumption'] += speed * action[0] * 0.1  # dt=0.1s
 
-            except:
+            except Exception as e:
+                # ✅ 添加日志：干预统计失败（可能是车辆已离开路网）
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Failed to update intervention stats for vehicle {veh_id}: {e}")
                 continue
 
         self.intervention_stats['controlled_vehicles'] = len(actions)

@@ -293,14 +293,20 @@ class GPUSumoEnvironmentOptimized:
         try:
             newly_arrived = traci.simulation.getArrivedIDList()
             self.stats['arrived_vehicles'].update(newly_arrived)
-        except Exception:
-            pass
+        except Exception as e:
+            # ✅ 添加日志：到达车辆统计失败（关键错误）
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to get arrived vehicles: {e}")
 
         try:
             newly_departed = traci.simulation.getDepartedIDList()
             self.stats['departed_vehicles'].update(newly_departed)
-        except Exception:
-            pass
+        except Exception as e:
+            # ✅ 添加日志：出发车辆统计失败（关键错误）
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to get departed vehicles: {e}")
 
         # 获取观测（优先使用子类覆盖的方法，否则使用订阅优化）
         if hasattr(self, '_get_observation') and '_get_observation' in type(self).__dict__:
