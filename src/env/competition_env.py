@@ -41,9 +41,11 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         self,
         config: Dict[str, Any],
         use_gui: bool = False,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        port: Optional[int] = None,  # TraCI端口（用于并行）
+        disable_port_retry: bool = False  # 禁用端口重试（用于并行环境）
     ):
-        super().__init__(config, use_gui=use_gui, device=device)
+        super().__init__(config, use_gui=use_gui, device=device, port=port, disable_port_retry=disable_port_retry)
 
         # ✅ 修复：从正确的配置路径读取奖励权重
         # 配置文件中使用的是 'rewards' 而不是 'competition.reward_weights'
@@ -285,26 +287,8 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
                         self.controlled_icv_ids = icv_ids
 
         # ========== 优化: 使用Libsumo批量获取车辆状态 ==========
-        # 批量订阅所有车辆的关键属性（减少IPC调用）
-        if len(all_vehicle_ids) > 0:
-            # 定义要订阅的变量（使用traci.constants中的常量ID）
-            var_list = [
-                traci_lib.constants.VAR_SPEED,        # 0x40 - 速度
-                traci_lib.constants.VAR_ACCELERATION,  # 0x72 - 加速度
-                traci_lib.constants.VAR_ANGLE,        # 0x43 - 角度
-                traci_lib.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
-                traci_lib.constants.VAR_POSITION,     # 0x42 - 位置
-                traci_lib.constants.VAR_LANE_ID       # 0x51 - 车道ID
-            ]
-
-            # 批量订阅（Libsumo直接调用，无TCP开销）
-            for veh_id in all_vehicle_ids:
-                traci_lib.vehicle.subscribe(veh_id, var_list)
-
-            # 一次性获取所有车辆的订阅数据
-            all_subscription_results = traci_lib.vehicle.getAllSubscriptionResults()
-        else:
-            all_subscription_results = {}
+        # 优先使用父类的junction订阅（1次API调用），回退到逐车辆订阅（N+1次API调用）
+        all_subscription_results = self._get_subscription_results(traci_lib, all_vehicle_ids)
 
         # 收集车辆状态（优化的Frenet坐标系）
         for veh_id in all_vehicle_ids:
@@ -388,6 +372,50 @@ class CompetitionSumoEnv(GPUSumoEnvironment):
         }
 
         return observation
+
+    def _get_subscription_results(self, traci_lib, all_vehicle_ids) -> Dict:
+        """
+        获取车辆订阅结果（优化版）
+
+        优先使用父类的junction订阅（1次API调用/步），
+        如果不可用则回退到逐车辆订阅（N+1次API调用/步）。
+
+        Args:
+            traci_lib: TraCI/LibSUMO模块
+            all_vehicle_ids: 所有车辆ID列表
+
+        Returns:
+            all_subscription_results: {veh_id: {var_id: value}}
+        """
+        # 尝试使用父类的junction订阅（最高效：1次API调用/步）
+        if self._subscription_enabled and self._junction_id is not None:
+            try:
+                # 使用junction订阅批量获取所有车辆数据（1次API调用）
+                return traci_lib.junction.getContextSubscriptionResults(self._junction_id)
+            except Exception as e:
+                # Junction订阅失败，回退到逐车辆订阅
+                pass
+
+        # 回退到逐车辆订阅（N+1次API调用/步）
+        if len(all_vehicle_ids) == 0:
+            return {}
+
+        # 定义要订阅的变量（使用traci.constants中的常量ID）
+        var_list = [
+            traci_lib.constants.VAR_SPEED,        # 0x40 - 速度
+            traci_lib.constants.VAR_ACCELERATION,  # 0x72 - 加速度
+            traci_lib.constants.VAR_ANGLE,        # 0x43 - 角度
+            traci_lib.constants.VAR_LANE_INDEX,   # 0x52 - 车道索引
+            traci_lib.constants.VAR_POSITION,     # 0x42 - 位置
+            traci_lib.constants.VAR_LANE_ID       # 0x51 - 车道ID
+        ]
+
+        # 批量订阅（Libsumo直接调用，无TCP开销）
+        for veh_id in all_vehicle_ids:
+            traci_lib.vehicle.subscribe(veh_id, var_list)
+
+        # 一次性获取所有车辆的订阅数据
+        return traci_lib.vehicle.getAllSubscriptionResults()
 
     def _get_lane_angle(self, lane_id: str) -> float:
         """获取车道的航向角"""

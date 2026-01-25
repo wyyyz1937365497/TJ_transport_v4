@@ -11,7 +11,7 @@ environment:
   sumo_config: 仿真环境_初赛_1.0/仿真环境-初赛/sumo_train.sumocfg
 
   # ICV比例
-  icv_ratio: 0.10  # 10% ICV
+  icv_ratio: 0.25  # 25% ICV (初赛优化: 提高到比赛允许的上限)
 
   # 最大步数
   max_steps: 3600  # 6分钟 @ 0.1s/step
@@ -91,7 +91,7 @@ mpc:
   # 车辆选择策略
   vehicle_selection:
     strategy: rule_based  # rule_based (规则) 或 random (随机)
-    k_vehicles: 25        # 控制车辆数量
+    k_vehicles: 50        # 控制车辆数量 (初赛优化: 从25增加到50, 利用Pint=1优势)
 
 # 数据收集配置
 data_collection:

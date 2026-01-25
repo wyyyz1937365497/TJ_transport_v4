@@ -10,7 +10,11 @@ from .core import (
     TrafficTopology,
     MPCController,
     DistributedMPCController,
-    MPCConfig
+    MPCConfig,
+    # GPU版本
+    GPUTrafficModel,
+    BatchIDMModel,
+    GPUMPCController
 )
 
 __all__ = [
@@ -19,5 +23,8 @@ __all__ = [
     'TrafficTopology',
     'MPCController',
     'DistributedMPCController',
-    'MPCConfig'
+    'MPCConfig',
+    'GPUTrafficModel',
+    'BatchIDMModel',
+    'GPUMPCController'
 ]

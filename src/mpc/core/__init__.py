@@ -16,11 +16,20 @@ from .mpc_controller import (
     MPCConfig
 )
 
+# GPU加速版本
+from .traffic_model_gpu import GPUTrafficModel, BatchIDMModel
+from .mpc_controller_gpu import GPUMPCController
+
 __all__ = [
+    # CPU版本
     'SimplifiedTrafficModel',
     'IDMController',
     'TrafficTopology',
     'MPCController',
     'DistributedMPCController',
-    'MPCConfig'
+    'MPCConfig',
+    # GPU版本
+    'GPUTrafficModel',
+    'BatchIDMModel',
+    'GPUMPCController'
 ]

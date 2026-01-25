@@ -66,10 +66,14 @@ class GPUSumoEnvironmentOptimized:
         config: Dict[str, Any],
         use_gui: bool = False,
         device: str = 'cuda',
-        use_subscription: bool = True  # 是否启用订阅优化
+        use_subscription: bool = True,  # 是否启用订阅优化
+        port: Optional[int] = None,  # TraCI端口（用于并行）
+        disable_port_retry: bool = False  # 禁用端口重试（用于并行环境）
     ):
         self.config = config
         self.use_gui = use_gui
+        self.port = port if port is not None else 8813  # 默认端口
+        self.disable_port_retry = disable_port_retry  # 是否禁用端口重试
 
         # 确保使用单GPU（cuda:0）以避免多GPU通信开销
         if torch.cuda.is_available():
@@ -166,16 +170,28 @@ class GPUSumoEnvironmentOptimized:
             raise RuntimeError("TraCI/Libsumo未安装！")
 
         try:
-            traci.start(self.sumo_cmd)
-            self.is_connected = True
+            if LIBSUMO_AVAILABLE:
+                # LibSUMO模式：不设置端口参数（LibSUMO自动管理）
+                # 根据官方文档：LibSUMO支持多进程并行，使用multiprocessing
+                traci.start(self.sumo_cmd)  # 不传port参数
+                self.is_connected = True
+                print(f"[OK] SUMO已启动 (LibSUMO, port=auto, 订阅优化: {'启用' if self._subscription_enabled else '禁用'})")
+            else:
+                # TraCI模式：使用指定端口
+                traci.start(self.sumo_cmd, port=self.port)
+                self.is_connected = True
+                print(f"[OK] SUMO已启动 (TraCI, port={self.port}, 订阅优化: {'启用' if self._subscription_enabled else '禁用'})")
 
             # 启用订阅优化
             if self.use_subscription:
                 self._enable_subscriptions()
 
-            print(f"[OK] SUMO已启动 (订阅优化: {'启用' if self._subscription_enabled else '禁用'})")
         except Exception as e:
-            raise RuntimeError(f"SUMO启动失败: {e}")
+            if not self.disable_port_retry:
+                raise RuntimeError(f"SUMO启动失败: {e}")
+            else:
+                # 并行模式：不重试，直接抛出异常
+                raise RuntimeError(f"SUMO启动失败: {e}")
 
     def _enable_subscriptions(self):
         """启用批量订阅"""
